@@ -460,6 +460,11 @@ def check_org(name: str) -> list[Violation]:
     # every org unconditionally, even those with no ``policy.yaml``. No-op when
     # the org declares no ``sandbox/tools/tools.yaml``.
     v.extend(_validate_sandbox_tools(name))
+    # The exec-guard (declared ⇒ taken out of ``execute``) is wired through
+    # ``RoutingMiddleware``; if an org that DECLARES tools also removes routing,
+    # the guard is silently off and the dual-path re-opens. Warn (not error):
+    # an org may legitimately shed routing, but not silently while declaring tools.
+    v.extend(_validate_declared_exec_guard(name))
 
     # Rule 5: policy.yaml parses + valid schema + known sections.
     policy_path = org_dir / "policy.yaml"
@@ -680,6 +685,54 @@ def _validate_sandbox_tools(name: str) -> list[Violation]:
     for err in declared_mod.validate_declared_tools(_org_path(name) / "sandbox"):
         v.append(Violation("error", "sandbox-tools", err))
     return v
+
+
+def _declared_exec_guard_violation(
+    declares_tools: bool, routing_removed: bool, org: str,
+) -> list[Violation]:
+    """Pure core of the exec-guard contract rule (no I/O — directly testable).
+
+    Fires a WARN iff the org declares sandbox tools AND has removed the
+    ``routing`` middleware from its supervisor. The exec-guard — a declared
+    script is taken out of ``execute`` and reached via its typed
+    ``pux_sandbox_*`` tool — is wired through ``RoutingMiddleware`` (default-on
+    in ``DEFAULT_SUPERVISOR``). Removing routing silently turns the guard OFF
+    and re-opens the dual-path (a declared script callable BOTH via the typed
+    tool AND raw ``execute``), defeating the declared-tool invariant. A WARN,
+    not an error: an org may legitimately shed routing (e.g. a test profile),
+    but when it also declares tools that choice deserves to be explicit."""
+    if declares_tools and routing_removed:
+        return [Violation(
+            "warn", "declared-exec-guard",
+            f"{org}: declares sandbox tools but removes the 'routing' middleware "
+            f"from the supervisor — the exec-guard (a declared script is taken "
+            f"out of execute and reached via its typed tool) is wired through "
+            f"RoutingMiddleware, so this re-opens the dual-path. Keep routing, "
+            f"or confirm this org should allow raw exec of its declared scripts.")]
+    return []
+
+
+def _validate_declared_exec_guard(name: str) -> list[Violation]:
+    """Warn if the org declares sandbox tools but its profile removes ``routing``
+    from the supervisor stack (the exec-guard is silently off). Silent for orgs
+    that declare no tools (the guard is a no-op there) and for any org that
+    keeps routing (the default). Gathers BOTH removal paths — the harness
+    ``middleware.supervisor.remove`` block AND the deepagents ``excluded_middleware``
+    field — mirroring ``stack._normalize_overrides``."""
+    if not declared_mod.declared_tool_names(_org_path(name) / "sandbox"):
+        return []
+    removed: set[str] = set()
+    try:
+        removed |= set(profile_mod.load_middleware_overrides(name).supervisor_remove)
+    except (TypeError, ValueError):
+        pass  # profile-schema / middleware-overrides own the malformed case
+    try:
+        prof = profile_mod.load_profile(name)
+    except (TypeError, ValueError, yaml.YAMLError):
+        prof = None
+    if prof is not None and prof.excluded_middleware:
+        removed |= set(prof.excluded_middleware)
+    return _declared_exec_guard_violation(True, "routing" in removed, name)
 
 
 # --- global checks (rules 6-7) -------------------------------------------

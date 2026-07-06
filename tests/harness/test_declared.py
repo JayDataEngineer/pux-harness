@@ -361,6 +361,27 @@ def test_routing_no_redirects_is_byte_identical_to_before():
     assert ran == [True]
 
 
+def test_exec_guard_contract_rule_fires_only_when_tools_declared_and_routing_removed():
+    """The pure core of the declared-exec-guard contract rule warns ONLY when
+    the org declares tools AND removes routing. The other three combos are
+    silent — declaring nothing makes the guard a no-op (routing choice is
+    free), and keeping routing means the guard is on."""
+    from pux_harness.agent.contract import _declared_exec_guard_violation as rule
+
+    v = rule(declares_tools=True, routing_removed=True, org="acme")
+    assert len(v) == 1, v
+    assert v[0].severity == "warn"
+    assert v[0].rule == "declared-exec-guard"
+    assert "routing" in v[0].message and "acme" in v[0].message
+
+    # declares tools but routing KEPT -> silent (the guard is on; the happy path)
+    assert rule(True, False, "acme") == []
+    # no tools + routing removed -> silent (guard is a no-op there)
+    assert rule(False, True, "acme") == []
+    # no tools + routing kept -> silent
+    assert rule(False, False, "acme") == []
+
+
 # --- command serialization (the crux) --------------------------------------
 
 def _runner_tool(spec: DeclaredToolSpec, exec_client: _FakeExec) -> StructuredTool:
