@@ -1,6 +1,6 @@
 """pux_sandbox_list_skills — host-FS skill discovery (the CTO catalog).
 
-Phase 6 unification: the BODY-load path is gone. Native ``SkillsMiddleware``
+The BODY-load path is gone. Native ``SkillsMiddleware``
 (on the supervisor) advertises each skill's name + description in the prompt
 (progressive disclosure), and the agent peeks a body with the native
 ``read_file`` — the canonical deepagents path. This module keeps only the

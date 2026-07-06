@@ -1,4 +1,4 @@
-"""Tool-output sandboxing + routing enforcement middleware (Phase 10).
+"""Tool-output sandboxing + routing enforcement middleware.
 
 Intercepts tool calls and enforces routing rules:
 - Deny raw network tools (curl, wget, httpie) — suggest sandbox alternatives

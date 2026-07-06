@@ -1,4 +1,4 @@
-"""Phase 5 — org-level inheritance (``org.yaml extends:``) at the KIT layer.
+"""Org-level inheritance (``org.yaml extends:``) at the KIT layer.
 
 The portable, project_root-parameterized core (``pux_harness.kit.loaders``): NO
 Docker, NO model registry, NO pux shim. These build a real temp project root

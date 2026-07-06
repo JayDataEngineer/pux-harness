@@ -17,13 +17,13 @@ builds graphs for multiple orgs in one process -> a cross-org leak. So we reuse
 deepagents' own ``HarnessProfileConfig`` SCHEMA (faithful field set) but apply
 its three fields directly at the ``build_graph(org)`` call site — collision-free
 and server-safe. See ``graph.build_graph`` for the application, and the plan's
-Phase 16.3b for the full rationale.
+    for the full rationale.
 
 Path resolution calls ``orgs._orgs_dir()`` at runtime (via the module, not an
 import-time binding) — single source of truth, so the contract tests'
 monkeypatch of ``orgs._orgs_dir`` covers this module too.
 
-**Phase 17.B — RubricMiddleware verify-gate.** An org may add a ``rubric:``
+**RubricMiddleware verify-gate.** An org may add a ``rubric:``
 block to its ``profile.yaml`` to opt into a post-agent grader loop (deepagents'
 beta ``RubricMiddleware``). The block is peeled out of the YAML BEFORE
 ``HarnessProfileConfig.from_dict`` (which rejects unknown keys), so the
@@ -75,7 +75,7 @@ def _profile_path(org: str) -> Path:
 
 @dataclass(frozen=True)
 class RubricGate:
-    """Per-org ``RubricMiddleware`` verify-gate config (Phase 17.B).
+    """Per-org ``RubricMiddleware`` verify-gate config.
 
     An org opts into a post-agent grader loop by adding a ``rubric:`` block to
     its ``profile.yaml``. deepagents' ``RubricMiddleware`` (beta) runs the
@@ -85,7 +85,7 @@ class RubricGate:
     ``max_iterations_reached`` / ``failed`` / ``grader_error``), and the agent
     revises until ``satisfied`` or ``max_iterations`` is hit. The grader IS the
     tester + reviewer (folded into one non-skippable gate rather than a
-    subagent the CTO might skip — the Phase 17 design decision).
+    subagent the CTO might skip).
 
     The block is peeled out of the YAML BEFORE ``HarnessProfileConfig.from_dict``
     (which rejects unknown keys), so the deepagents schema stays untouched. See
@@ -108,7 +108,7 @@ class RubricGate:
 
 @dataclass(frozen=True)
 class MiddlewareOverrides:
-    """Per-org ``middleware:`` override block (Phase 21 — the stack factory).
+    """Per-org ``middleware:`` override block (the stack factory).
 
     The harness factory (``agent.stack``) resolves the middleware stack from
     DEFAULTS (in ``stack.py``) + these per-org DELTAS — the org system as an
@@ -140,7 +140,7 @@ class MiddlewareOverrides:
 
 
 def _validate_models_block(org: str, data: dict) -> None:
-    """Validate the top-level ``models:`` map (Phase 17.B.0).
+    """Validate the top-level ``models:`` map.
 
     Keys must be ⊆ ``model.ROLE_KEYS`` (``base_model`` / ``worker_model`` /
     ``multimodal_model`` / ``grader_model``); values must be non-empty strings.
@@ -264,7 +264,7 @@ def _rubric_gate_from_block(org: str, block: object) -> RubricGate:
     ``default`` a string) so a typo fails loud at load / contract time, not at
     the first invoke. Unknown keys are rejected — in particular the legacy
     ``rubric.grader_model`` (the grader model moved to the top-level ``models:``
-    map in Phase 17.B.0; surface it there as ``grader_model: <id>``). No silent
+    map; surface it there as ``grader_model: <id>``). No silent
     skip — a stale form is a real bug."""
     if not isinstance(block, dict):
         msg = (
@@ -278,7 +278,7 @@ def _rubric_gate_from_block(org: str, block: object) -> RubricGate:
         msg = (
             f"{org}/profile.yaml: rubric: unknown key(s) {sorted(unknown)}; "
             f"valid keys: {sorted(known)}. (grader_model moved to the top-level "
-            f"`models:` map in Phase 17.B.0.)"
+            f"`models:` map.)"
         )
         raise TypeError(msg)
     enabled = block.get("enabled", True)
@@ -398,7 +398,7 @@ def load_middleware_overrides(org: str) -> MiddlewareOverrides:
     disturbing the ``HarnessProfileConfig`` path. Name + scope validity is
     checked downstream by ``stack.validate_overrides``.
 
-    Phase 5 — inheritance-aware: reads the ``extends:``-chain-merged block
+    Inheritance-aware: reads the ``extends:``-chain-merged block
     (``_resolved_profile_yaml``), so a child inherits a parent's middleware
     deltas and overrides the keys it restates. For a non-extending org,
     byte-identical to the raw own read."""
@@ -413,8 +413,8 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
 
     ``None`` (no file) is the COMMON case — most orgs ship no profile and the
     ``build_graph`` path is byte-identical to today (the regression guarantee).
-    If present, the ``rubric:`` block (Phase 17.B), the ``models:`` map
-    (Phase 17.B.0), and the ``middleware:`` block (Phase 21 — the stack factory)
+    If present, the ``rubric:`` block, the ``models:`` map,
+    and the ``middleware:`` block (the stack factory)
     are PEELED out before ``HarnessProfileConfig.from_dict`` (which would
     otherwise reject them as unknown keys) — the rubric block is surfaced
     separately by ``load_rubric_gate``, the models map is read by the model-role
@@ -425,7 +425,7 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
     level raises ``TypeError`` here. No silent skip — a malformed profile is a
     real bug.
 
-    Phase 5 — inheritance-aware: reads the ``extends:``-chain-merged block
+    Inheritance-aware: reads the ``extends:``-chain-merged block
     (``_resolved_profile_yaml``), so a child inherits a parent's
     ``system_prompt_suffix`` / ``tool_description_overrides`` / ``excluded_*`` /
     ``general_purpose_subagent`` (native fields deep-merged root→child) and
@@ -437,7 +437,7 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
         return None
     # ``rubric`` / ``models`` / ``middleware`` are VALID harness blocks peeled
     # out + read by their own loaders. ``subagents`` is NOT peeled on purpose
-    # (Phase 2 fold): the legacy ``profile.yaml`` ``subagents:`` block was
+    # The legacy ``profile.yaml`` ``subagents:`` block was
     # replaced by per-agent ``extends:`` + delta frontmatter fields, so leaving
     # it in lets ``HarnessProfileConfig.from_dict`` reject it as an unknown key
     # (and the ``no-legacy-subagents-block`` contract tripwire points the operator
@@ -456,7 +456,7 @@ def load_rubric_gate(org: str) -> RubricGate | None:
     ``build_graph`` without disturbing the ``HarnessProfileConfig`` path
     (load_profile's signature stays stable → zero ripple to existing callers).
 
-    Phase 5 — inheritance-aware: reads the ``extends:``-chain-merged block
+    Inheritance-aware: reads the ``extends:``-chain-merged block
     (``_resolved_profile_yaml``); a child inherits a parent's rubric gate and
     overrides the fields it restates. For a non-extending org, byte-identical to
     the raw own read.
@@ -494,8 +494,7 @@ def validate_profile(org: str) -> HarnessProfileConfig | None:
     shape-checks.)
     """
     cfg = load_profile(org)              # raises on a malformed schema (incl. a
-                                        # legacy ``subagents:`` block — Phase 2
-                                        # fold: from_dict now rejects that key)
+                                        # legacy ``subagents:`` block — from_dict now rejects that key)
     load_rubric_gate(org)                # raises on a malformed rubric: block
     load_middleware_overrides(org)       # raises on a malformed middleware: block
     return cfg

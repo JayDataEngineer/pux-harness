@@ -3,11 +3,11 @@
 Two kinds of long-lived, queryable context live here, behind a single FTS5
 search surface:
 
-1. **Events** (Phase 8) — discrete structured records (tool calls, file edits,
+1. **Events** — discrete structured records (tool calls, file edits,
    git ops, decisions, errors, blockers) captured by the middleware layer.
    Priority tiers (P1 critical → P4 low) drive budget enforcement in the
    snapshot builder; P1 always included, P4 dropped first under the ≤2KB budget.
-2. **Blobs** (Phase 19, this unification) — the FULL verbatim text of oversized
+2. **Blobs** — the FULL verbatim text of oversized
    tool results that ``ContextMiddleware`` parked behind a ``ctx:<id>`` handle
    so they don't crowd the working context. The agent pulls a blob back on
    demand via ``ctx_recall`` (by handle) or finds it via ``ctx_search`` (BM25
@@ -18,7 +18,7 @@ This is the *proactive* complement to deepagents' reactive
 ``SummarizationMiddleware`` (which only offloads once the window has already
 overflowed): we keep large tool results out of the prompt before they accumulate.
 Modeled on ``mksglu/context-mode``'s single SessionDB. Consolidating the old
-plain-file ``CtxStore`` (Phase 7) into here means ONE queryable store, ONE
+plain-file ``CtxStore`` into here means ONE queryable store, ONE
 cleanup target (``.pux/events.sqlite``), ONE search surface — instead of two
 parallel systems (one weak substring grep, one strong FTS5).
 
@@ -186,7 +186,7 @@ class EventStore:
         # connection see a writer's committed row on another (``flush()``
         # commits), and serializes concurrent writers via ``busy_timeout``.
         # Surfaced by ``test_context_subagent`` driving the real
-        # ``create_agent.invoke`` (Phase 19 E2E) — without this, offload-by-thread-A
+        # ``create_agent.invoke`` — without this, offload-by-thread-A
         # + recall-by-thread-B raised ``ProgrammingError``.
         self._tls = threading.local()
 

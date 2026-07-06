@@ -1,6 +1,6 @@
 """PuxSandboxBackend — a deepagents ``BaseSandbox`` over a Docker exec client.
 
-Shape A (decided by probe in Phase 3): subclass
+Shape A (decided by probe): subclass
 ``deepagents.backends.sandbox.BaseSandbox`` and implement only its four
 abstract primitives — ``execute``, ``id``, ``upload_files``, ``download_files``.
 The inherited ``ls/read/write/edit/grep/glob`` (and all ``a*`` async variants)
@@ -57,7 +57,7 @@ _DOWNLOAD_PY = (
 
 
 class PuxSandboxBackend(BaseSandbox):
-    """deepagents sandbox backed by a direct ``docker exec`` (Phase 8a)."""
+    """deepagents sandbox backed by a direct ``docker exec``."""
 
     def __init__(self, exec_client: DockerExecClient):
         self._exec = exec_client

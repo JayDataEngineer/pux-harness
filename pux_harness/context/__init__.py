@@ -1,4 +1,4 @@
-"""Unified context-saving layer (Phase 19 unification).
+"""Unified context-saving layer.
 
 One store, one middleware, one search surface, every agent.
 

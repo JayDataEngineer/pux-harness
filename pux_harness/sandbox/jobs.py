@@ -1,4 +1,4 @@
-"""In-sandbox prep-job runner (Phase 14).
+"""In-sandbox prep-job runner.
 
 Runs declared ``jobs:`` from ``policy.yaml`` INSIDE the container (after
 ``create()``, before the agent loop). Each job executes a Python script via

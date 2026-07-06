@@ -1,4 +1,4 @@
-"""Phase 6 — ``supervisor_skills_roots`` is the focused set for the CTO's
+"""``supervisor_skills_roots`` is the focused set for the CTO's
 native ``SkillsMiddleware``.
 
 The kit exposes ONE function that picks the supervisor's skills roots:
@@ -82,7 +82,7 @@ def test_specialist_org_uses_specialists_path(tmp_path: Path):
 
 def test_empty_when_no_skills_dirs(tmp_path: Path):
     """A no-skills org → ``[]``. The binding turns ``[]`` into ``skills=None``
-    (no SkillsMiddleware mounted) — byte-identical to the pre-Phase-6 stack.
+    (no SkillsMiddleware mounted) — byte-identical to the previous stack.
     Proven at the orchestrator layer in ``test_skills_peek.py``."""
     out = supervisor_skills_roots("foo", tmp_path)
     assert out == []

@@ -1,4 +1,4 @@
-"""Model spec — roles resolved from a shipped ``models.yaml`` (Phase 17.B.0).
+"""Model spec — roles resolved from a shipped ``models.yaml``.
 
 The single source of truth is ``models.yaml`` next to this module: it pins the
 provider (``base_url`` + which env var holds the api key) and the role→model-id
@@ -24,7 +24,7 @@ A cloner repoints at their own provider by editing ``models.yaml`` — one file,
 no code changes, no scattered hardcodes.
 
 Historical note: pre-17.B.0 this module had a single ``DEFAULT_MODEL``/``get_model(model=None)``
-that every consumer shared; the rubric gate (Phase 17.B) needs an independent
+that every consumer shared; the rubric gate needs an independent
 grader model, which would have meant a second hardcode — the spec exists to make
 that a role resolution instead.
 """
@@ -98,9 +98,9 @@ def _org_role_override(org: str, role_key: str) -> str | None:
     """Read the ``models:`` map -> the id for ``role_key``. None when the org
     (and every ancestor) ships no profile, no ``models:`` block, or no entry for
     this role. Reuses ``profile._resolved_profile_yaml`` so the path resolution
-    + non-mapping guard apply AND org inheritance is honored (Phase 5 — a child
+    + non-mapping guard apply AND org inheritance is honored (a child
     inherits a parent's ``models:`` map and overrides the roles it restates; the
-    Phase-16 single-source-of-truth discipline — the contract tests' monkeypatch
+    single-source-of-truth discipline — the contract tests' monkeypatch
     of ``orgs._orgs_dir`` reaches here too)."""
     from pux_harness.agent import profile as _profile  # noqa: PLC0415 — avoid import cycle
     data = _profile._resolved_profile_yaml(org)

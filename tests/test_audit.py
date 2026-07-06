@@ -1,4 +1,4 @@
-"""Phase 4 — AuditMiddleware behavior (observe-only tool-call audit).
+"""AuditMiddleware behavior (observe-only tool-call audit).
 
 Owns the AuditMiddleware CLASS: every behavior contract (records ok + error
 outcomes, observe-only result passthrough, args-hashed-not-raw, dedup-defeating

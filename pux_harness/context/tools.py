@@ -13,7 +13,7 @@ recalled = lower cost per call. Both are EXEMPT from offload (the middleware's
 ``_RETRIEVAL_TOOLS``): their job is to inject content, so re-stashing their
 output would trap the agent the instant it retrieves a large stash.
 
-This replaces the old Phase-8 ``event_recent`` / ``event_query`` pair (the
+This replaces the old ``event_recent`` / ``event_query`` pair (the
 resume snapshot already gives chronological orientation; ``ctx_search`` covers
 query-based recall over both blobs and events in one tool).
 """

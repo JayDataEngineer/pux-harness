@@ -1,4 +1,4 @@
-"""The single context-layer wiring seam (Phase 19 unification).
+"""The single context-layer wiring seam.
 
 ``build_context_layer()`` returns ``(middleware, retrieval_tools)`` — the one
 tuple both the MAIN agent (``agent.graph.build_graph``) and EVERY subagent

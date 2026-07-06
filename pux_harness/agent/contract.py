@@ -46,16 +46,15 @@ Two validation tiers:
   middleware stack is built by the single ``stack.build_stack`` factory; the
   server-side runtimes share one persistent ``AsyncSqliteSaver``; and per-agent
   overrides go in the agent's own frontmatter (+ ``extends:`` for inheritance)
-  (``threads.open_thread_store``, Phase 23). A sixth tripwire
+  (``threads.open_thread_store``). A sixth tripwire
   ``no-duplicate-loaders-in-orgs`` keeps the 7 pure org/agent loaders in
-  ``orgs.py`` as thin delegates to ``pux_harness.kit.loaders`` (Phase 1
-  consolidation), so the verbatim duplication the user flagged can't return. A
+  ``orgs.py`` as thin delegates to ``pux_harness.kit.loaders``, so the verbatim duplication the user flagged can't return. A
   seventh tripwire ``kit-import-isolation`` (Stage 2 import hygiene) keeps the
   slim kit core (``pux_harness/kit/**`` + ``pux_harness/__init__.py``) free of
   heavy runtime imports (``docker``/``fastapi``/…) and sibling-subsystem
   reaches — the precondition for Stage 3 splitting the heavy deps into optional
   extras so a bare ``pip install pux-harness`` is truly slim. An eighth
-  tripwire ``no-harness-profile-registration`` (Phase 3 registry parity) keeps
+  tripwire ``no-harness-profile-registration`` (registry parity) keeps
   pux OFF the model-keyed ``_HARNESS_PROFILES`` registry — pux applies
   ``HarnessProfileConfig`` fields itself in ``build_stack`` /
   ``load_subagents``, so its middleware is never stripped by deepagents' own
@@ -114,7 +113,7 @@ _REQUIRED_AGENT_KEYS: frozenset[str] = frozenset({
 })
 
 # Optional ``orgs/<name>/policy.yaml`` top-level sections. ``host_setup`` is
-# harness-added (no Go equivalent) — the host-side prep-hook list (Phase 13).
+# harness-added (no Go equivalent) — the host-side prep-hook list.
 # ``build`` is a sub-key under ``sandbox``, NOT a top-level section.
 KNOWN_POLICY_SECTIONS: frozenset[str] = frozenset({
     "workspace", "egress", "credentials", "sandbox", "browser", "host_setup",
@@ -178,7 +177,7 @@ def _first_agent_md(slug: str, org: str) -> Path | None:
 
 
 def _agent_extends_chain_violations(slug: str, org: str) -> list[Violation]:
-    """Validate an agent's ``extends:`` chain resolves + is acyclic (Phase 2).
+    """Validate an agent's ``extends:`` chain resolves + is acyclic.
 
     Reads RAW frontmatter (NO merge) and walks the chain manually so the two
     dedicated rules fire with precise, actionable messages — independent of
@@ -224,7 +223,7 @@ def _agent_extends_chain_violations(slug: str, org: str) -> list[Violation]:
 
 
 def _org_extends_chain_violations(name: str) -> list[Violation]:
-    """Validate an org's ``extends:`` chain resolves + is acyclic (Phase 5).
+    """Validate an org's ``extends:`` chain resolves + is acyclic.
 
     Mirrors ``_agent_extends_chain_violations``: walks the chain via the RAW
     single-hop reader (``org_extends`` — reads ``org.yaml``'s ``extends:`` with
@@ -297,7 +296,7 @@ def check_org(name: str) -> list[Violation]:
             f"{name}: AGENTS.md carries YAML frontmatter — the roster must "
             f"live in orgs/{name}/org.yaml and AGENTS.md must be prose-only"))
 
-    # Phase 5 — validate the ``extends:`` chain FIRST (specific rules), before
+    # Validate the ``extends:`` chain FIRST (specific rules), before
     # the inherited-roster read below. A broken chain reports
     # ``org-extends-resolvable`` / ``org-extends-acyclic`` here; the runtime
     # ``org_agent_slugs`` is cycle-safe (falls back to ``[name]``) so it never
@@ -338,7 +337,7 @@ def check_org(name: str) -> list[Violation]:
         # No org.yaml but AGENTS.md has frontmatter — already reported above.
         slugs = _parse_list(fm.get("agents", ""))
 
-    # Phase 5 — the EFFECTIVE roster is the chain-inherited union
+    # The EFFECTIVE roster is the chain-inherited union
     # (parent ``agents:`` ∪ own) — what the runtime actually delegates to. Used
     # for agent-resolution (Rule 3) + tool-resolution (Rule 4) so an INHERITED
     # slug is validated the same as an own one. Cycle-safe: falls back to own
@@ -350,7 +349,7 @@ def check_org(name: str) -> list[Violation]:
         except Exception:
             roster = slugs
 
-    # Permanent tripwire (Phase 18.A; no-legacy-left-behind): dev-bot is the
+    # Permanent tripwire (no-legacy-left-behind): dev-bot is the
     # Claude-Code-equivalent CODING org — the CTO does all the thinking and
     # delegates only narrow execution (code-worker) / recon (dev-bot-explorer)
     # / e2e verification (web-agent). A generic catch-all subagent
@@ -368,7 +367,7 @@ def check_org(name: str) -> list[Violation]:
                 f"({bad}); the CTO does the thinking — delegate only to "
                 f"dev-bot-explorer / code-worker / web-agent"))
 
-    # Phase 1 — defense in depth via a SECOND code path. The roster rule above
+    # Defense in depth via a SECOND code path. The roster rule above
     # (``dev-bot-no-general-subagent``) reads org.yaml, so it NEVER sees the
     # ``general-purpose`` slot deepagents auto-adds to EVERY graph
     # (deepagents/graph.py:716-717) when no inline spec owns that name. This
@@ -398,13 +397,13 @@ def check_org(name: str) -> list[Violation]:
                     "(dev-bot-no-general-subagent) cannot see"))
 
     # Rule 3: every slug resolves to a valid agent .md (org-local or _shared)
-    # with required frontmatter keys + a non-empty body (system_prompt). Phase 5:
-    # iterates the INHERITED roster (``roster``), so an agent inherited from a
+    # with required frontmatter keys + a non-empty body (system_prompt).
+    # Iterates the INHERITED roster (``roster``), so an agent inherited from a
     # parent via ``extends:`` is resolved through the chain-aware search dirs
     # (child-local → each ancestor → _shared) and validated here too.
     agent_subagents: dict[str, dict[str, Any]] = {}
     for slug in roster:
-        # Phase 2: validate the ``extends:`` chain FIRST (specific rules), before
+        # Validate the ``extends:`` chain FIRST (specific rules), before
         # the recursive merge in ``_load_agent_subagent`` raises a generic
         # ``agent-resolves``. A broken chain skips the merge so the same fault
         # isn't reported twice.
@@ -488,13 +487,13 @@ def check_org(name: str) -> list[Violation]:
                                f"{name}: policy.yaml top-level must be a "
                                f"mapping, got {type(parsed).__name__}"))
 
-    # Phase 16.3b: optional per-org harness profile. Off by default — most orgs
+    # Optional per-org harness profile. Off by default — most orgs
     # ship none. If present, it must parse into HarnessProfileConfig (unknown
     # keys -> TypeError; bad shapes -> TypeError; bad excluded_middleware
     # grammar -> ValueError). Offline; no model/Docker.
     profile_path = org_dir / "profile.yaml"
     if profile_path.is_file():
-        # Phase 2 fold — permanent no-legacy gate (no-legacy-left-behind). The
+        # Permanent no-legacy gate (no-legacy-left-behind). The
         # ``profile.yaml`` ``subagents:`` block was a SECOND partial-override
         # surface with its own resolver; it was folded into per-agent
         # ``extends:`` + delta frontmatter fields. A stale block is a HARD
@@ -523,10 +522,10 @@ def check_org(name: str) -> list[Violation]:
         except (TypeError, ValueError, yaml.YAMLError) as exc:
             v.append(Violation("error", "profile-schema",
                                f"{name}: profile.yaml invalid: {exc}"))
-            # Skip Phase-2 slug validation too — a malformed profile re-reads
+            # Skip slug validation too — a malformed profile re-reads
             # below and would raise again.
         else:
-            # Phase 21: validate the ``middleware:`` override block's name + scope
+            # Validate the ``middleware:`` override block's name + scope
             # — every add/remove name must be a registered middleware
             # (``stack.MIDDLEWARE_REGISTRY``) mounted on the scope it's added to.
             # ``profile.validate_profile`` only SHAPE-checks; the registry lives in
@@ -538,7 +537,7 @@ def check_org(name: str) -> list[Violation]:
     return v
 
 
-# --- host_setup + sandbox.build validators (Phase 13, offline) ---------------
+# --- host_setup + sandbox.build validators (offline) ---------------
 
 # Allowed values in a host_setup hook's ``exports`` mapping. Mirrors the runtime
 # check in ``sandbox/host_setup.py`` — kept here (not imported) so the contract
@@ -690,7 +689,7 @@ def orphan_agents() -> list[str]:
 def _no_legacy_agent_py() -> list[Violation]:
     """No ``.py`` agent may ship, and every agent ``.md`` must be well-formed.
 
-    Permanent tripwire (Phase 15 flipped the Phase-2 form). The legacy
+    Permanent tripwire (flipped the legacy two-phase form). The legacy
     ``.pi/agents/<slug>.py`` SUBAGENT-dict module was replaced by ONE
     frontmatter+body ``<slug>.md`` per org (``orgs/<org>/agents/`` +
     ``orgs/_shared/agents/``). A re-introduced ``.py`` agent, an agent ``.md``
@@ -729,12 +728,12 @@ def _no_legacy_agent_py() -> list[Violation]:
 
 
 def _no_legacy_middleware_in_graph() -> list[Violation]:
-    """Permanent tripwire (Phase 21; no-legacy-left-behind): ``graph.py`` must
+    """Permanent tripwire (no-legacy-left-behind): ``graph.py`` must
     NOT import the deepagents middleware classes directly.
 
     The factory ``stack.build_stack`` is the SINGLE place the per-org middleware
     stack is resolved (the user's "one place to adjust defaults" goal). Before
-    Phase 21, ``graph.py`` hand-assembled the middleware list — importing
+    the factory, ``graph.py`` hand-assembled the middleware list — importing
     ``RoutingMiddleware`` / ``SessionGuideMiddleware`` / ``RubricMiddleware``
     and building them inline. That dual-read (a second, hand-maintained
     middleware list) is exactly the drift the factory killed: an override in
@@ -779,7 +778,7 @@ def _no_legacy_middleware_in_graph() -> list[Violation]:
 
 def _no_legacy_sandbox_artifacts() -> list[Violation]:
     """No ``orgs/<name>/{bootstrap.sh,docker-compose.yml,docker-compose.override.yml}``
-    may ship — the harness owns the full sandbox lifecycle now (Phase 13; the
+    may ship — the harness owns the full sandbox lifecycle now (the
     frozen bash/compose shadow lifecycle was deleted). Permanent tripwire
     (no-legacy-left-behind): a future re-introduction is a HARD failure, not a
     silent regression — mirroring ``no-legacy-agent-py`` /
@@ -802,10 +801,10 @@ def _no_legacy_sandbox_artifacts() -> list[Violation]:
 
 
 def _no_legacy_subagents_block() -> list[Violation]:
-    """Permanent tripwire (Phase 2 fold; no-legacy-left-behind): no
+    """Permanent tripwire (no-legacy-left-behind): no
     ``profile.yaml`` may ship a top-level ``subagents:`` block.
 
-    Phase 2 folded the per-subagent override surface INTO agent frontmatter —
+    The per-subagent override surface was folded INTO agent frontmatter —
     ``extends:`` + the delta fields (``tools_add`` / ``tools_remove`` /
     ``skills_add`` / ``description_append``) and the native HarnessProfileConfig
     fields (``base_system_prompt`` / ``system_prompt_suffix`` /
@@ -831,7 +830,7 @@ def _no_legacy_subagents_block() -> list[Violation]:
             v.append(Violation(
                 "error", "no-legacy-subagents-block",
                 f"{org}/profile.yaml: the top-level 'subagents:' block was "
-                f"removed in the Phase 2 fold — per-agent overrides now live "
+                f"removed — per-agent overrides now live "
                 f"in the agent's OWN frontmatter (extends: + tools_add / "
                 f"tools_remove / system_prompt_suffix / ...). Delete the block "
                 f"and move the overrides into the agent .md frontmatter."))
@@ -861,7 +860,7 @@ def _scan_runtime_for_memory_saver(src: Path) -> list[Violation]:
                     "error", "no-legacy-memory-saver",
                     f"{src}: imports MemorySaver — the server-side runtimes "
                     f"share threads.open_thread_store's persistent "
-                    f"AsyncSqliteSaver (Phase 23); an ephemeral MemorySaver "
+                    f"AsyncSqliteSaver; an ephemeral MemorySaver "
                     f"makes threads invisible across processes"))
         elif isinstance(node, ast.Call):
             func = node.func
@@ -875,17 +874,17 @@ def _scan_runtime_for_memory_saver(src: Path) -> list[Violation]:
                     "error", "no-legacy-memory-saver",
                     f"{src}: instantiates MemorySaver() — the server-side "
                     f"runtimes share threads.open_thread_store's persistent "
-                    f"AsyncSqliteSaver (Phase 23); an ephemeral MemorySaver "
+                    f"AsyncSqliteSaver; an ephemeral MemorySaver "
                     f"loses checkpoints when the process exits"))
     return v
 
 
 def _no_legacy_memory_saver_in_runtimes() -> list[Violation]:
-    """Permanent tripwire (Phase 23; no-legacy-left-behind): ``acp.py`` +
+    """Permanent tripwire (no-legacy-left-behind): ``acp.py`` +
     ``main.py`` must NOT import or instantiate ``MemorySaver``.
 
-    Phase 23 unified the server-side runtimes onto ONE persistent
-    ``AsyncSqliteSaver`` (``threads.open_thread_store``). Before it, ``acp.py``
+    The server-side runtimes were unified onto ONE persistent
+    ``AsyncSqliteSaver`` (``threads.open_thread_store``). Before the unification, ``acp.py``
     and ``main.py`` each minted an ephemeral ``MemorySaver()`` — checkpoints
     died with the process, threads were invisible to ``pux show``/``pux resume``,
     and the runtimes silently diverged. A future re-introduction (someone wires
@@ -913,11 +912,11 @@ def _no_legacy_memory_saver_in_runtimes() -> list[Violation]:
     return v
 
 
-# Phase 1 (consolidation) — the 7 ``orgs.py`` functions that must be thin
+# Consolidation — the 7 ``orgs.py`` functions that must be thin
 # delegates to ``pux_harness.kit.loaders``. ``load_root_prompt`` is INTENTIONALLY
 # exempt (PROJECT_ROOT-pinned root prompt, NOT the ``_orgs_dir()`` seam — see
 # its docstring). Re-implementing any of these here re-creates the verbatim
-# drift Phase 1 removed.
+# drift the consolidation removed.
 _DELEGATED_ORGS_LOADERS: frozenset[str] = frozenset({
     "_org_path",
     "_agent_search_dirs",
@@ -965,7 +964,7 @@ def _scan_orgs_for_duplicate_loaders(src: Path) -> list[Violation]:
         v.append(Violation(
             "error", "no-duplicate-loaders-in-orgs",
             f"{src}: no longer imports loaders from pux_harness.kit — "
-            f"the pure org/agent loaders must be delegated to it (Phase 1); "
+            f"the pure org/agent loaders must be delegated to it; "
             f"re-importing them as a verbatim copy re-creates the drift"))
         return v
 
@@ -996,20 +995,20 @@ def _scan_orgs_for_duplicate_loaders(src: Path) -> list[Violation]:
                 f"{src}: {name!r} must be a thin delegate to "
                 f"pux_harness.kit.loaders (a ``return <alias>.<method>(...)``); "
                 f"re-implementing it here re-creates the duplicated-loader "
-                f"drift Phase 1 removed"))
+                f"drift that was removed"))
     return v
 
 
 def _no_duplicate_loaders_in_orgs() -> list[Violation]:
-    """Permanent tripwire (Phase 1 consolidation; no-legacy-left-behind): the 7
+    """Permanent tripwire (consolidation; no-legacy-left-behind): the 7
     pure org/agent loaders in ``orgs.py`` must stay THIN DELEGATES to
     ``pux_harness.kit.loaders``.
 
-    Phase 1 finished the consolidation (and Stage 1 folded the kit in-tree):
+    The consolidation finished (and Stage 1 folded the kit in-tree):
     the parse/discovery/roster/prompt/spec/skills logic lives ONCE in
     ``pux_harness.kit.loaders`` (the slim in-package core), and ``orgs.py``
     forwards to it through the injectable ``_orgs_dir()`` seam
-    (``project_root = _orgs_dir().parent``). Before Phase 1
+    (``project_root = _orgs_dir().parent``). Before the consolidation
     the bodies were duplicated verbatim. A future re-paste of the old logic into ``orgs.py``
     (someone "simplifies" a delegate back into a real implementation) is a HARD
     contract failure, not a silent regression — mirroring
@@ -1177,7 +1176,7 @@ def _scan_for_profile_registration(src: Path) -> list[Violation]:
 
 
 def _no_harness_profile_registration() -> list[Violation]:
-    """Permanent tripwire (Phase 3 registry parity; no-legacy-left-behind): no
+    """Permanent tripwire (registry parity; no-legacy-left-behind): no
     file under ``pux_harness/`` may CALL deepagents' ``register_harness_profile``
     or ``register_provider_profile``.
 
@@ -1185,7 +1184,7 @@ def _no_harness_profile_registration() -> list[Violation]:
     two orgs resolved under one model would merge-collide, the long-lived server
     builds many orgs per process, and there is no ``unregister``. pux applies
     ``HarnessProfileConfig`` fields ITSELF (``build_stack`` for the supervisor,
-    ``load_subagents`` per specialist). The Phase 3 parity guarantee — pux
+    ``load_subagents`` per specialist). The parity guarantee — pux
     middleware is never stripped by deepagents' own ``_apply_excluded_middleware``
     (which only fires through a REGISTERED profile) — depends on pux NEVER
     registering. A future re-introduction (someone "fixes" a profile gap by
@@ -1206,7 +1205,7 @@ def _no_harness_profile_registration() -> list[Violation]:
 
 
 def _no_load_skill_tool() -> list[Violation]:
-    """Permanent tripwire (Phase 6 skills-peeking unification;
+    """Permanent tripwire (skills-peeking unification;
     no-legacy-left-behind): the ``pux_sandbox_load_skill`` specialist is GONE.
     Skill bodies are peeked via the native ``read_file`` — the canonical
     deepagents path, now that native ``SkillsMiddleware`` on the supervisor
@@ -1234,7 +1233,7 @@ def _no_load_skill_tool() -> list[Violation]:
 
 def _pux_namespace_resolvable() -> list[Violation]:
     """Every ``pux:`` reference resolves against the shipped library bases or
-    ``$PUX_ORG_PATHS`` (Phase 7 — the cross-project reuse contract). A dangling
+    ``$PUX_ORG_PATHS`` (the cross-project reuse contract). A dangling
     ``pux:`` is a HARD error: the namespace is the only way to pull a shipped
     org/agent without vendoring, so an unresolved one would silently fall back
     to nothing (the local search never matches a ``pux:`` token).
@@ -1302,7 +1301,7 @@ def check_harness() -> list[Violation]:
         v.append(Violation("warn", "no-orphan-agents",
                            f"agent {orphan!r} is owned by no org (not in any "
                            f"`agents:` frontmatter)"))
-    # Phase 17.B.0: the shipped ``models.yaml`` (the role-spec single source of
+    # The shipped ``models.yaml`` (the role-spec single source of
     # truth) must be present + well-formed — every model consumer resolves
     # through it, so a missing/malformed spec breaks every org at once.
     try:

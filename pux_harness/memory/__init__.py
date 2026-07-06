@@ -1,4 +1,4 @@
-"""Agent-managed persistent memory (Phase 18).
+"""Agent-managed persistent memory.
 
 Memory files live in ``.pux/memory/`` (gitignored) and are loaded into the
 system prompt at conversation start via deepagents' ``MemoryMiddleware``. The

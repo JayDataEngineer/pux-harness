@@ -12,7 +12,7 @@ is fixed at startup, not per-session.
 Org resolution (first wins): ``--org`` flag → ``$PUX_ORG`` → ``general``. An
 unknown org fails loud. The sandbox self-boots lazily on first tool use
 (``build_graph`` → ``shared_backend()`` → ``shared_exec()`` → ``ensure()``,
-Phase 8g), so — like ``pux direct`` — ``pux acp`` needs no prior
+), so — like ``pux direct`` — ``pux acp`` needs no prior
 ``pux sandbox start``.
 
 Run: ``pux acp --org invest``. Stdin/stdout are the protocol —
@@ -46,7 +46,7 @@ def _make_factory(
 ) -> Callable[[AgentSessionContext], CompiledStateGraph]:
     """Build a graph factory bound to ``org`` + the SHARED persistent saver.
 
-    Phase 23: ``saver`` is the ``AsyncSqliteSaver`` from ``open_thread_store``
+    ``saver`` is the ``AsyncSqliteSaver`` from ``open_thread_store``
     — the SAME ``.pux/agent-protocol.sqlite`` ``serve``/``direct`` use. ACP
     session checkpoints (keyed by ``thread_id=session_id``) now persist across
     ``pux acp`` process restarts instead of dying with the ephemeral
@@ -92,7 +92,7 @@ def _advertised_models(org: str) -> list[dict[str, str]]:
 class _RegisteringAgentServerACP(AgentServerACP):
     """AgentServerACP that indexes each ACP session in the ``pux_threads`` index.
 
-    Phase 23 follow-up (the deferred "session hook"). The base class keys
+    A follow-up (the deferred "session hook"). The base class keys
     checkpoints by ``thread_id=session_id`` but never tells ``pux_threads`` about
     them, so ACP sessions were invisible to ``pux resume`` / ``pux show``. The
     graph factory cannot fix this: ``AgentServerACP`` caches ONE compiled graph
@@ -125,7 +125,7 @@ async def _acp_main(org: str) -> None:
     The shared thread store is held open for the process lifetime:
     ``run_acp_agent`` blocks serving stdio until the editor disconnects, and the
     ACP server must keep writing checkpoints into ``.pux/agent-protocol.sqlite``
-    for that whole span (Phase 23 — sessions now persist across restarts)."""
+    for that whole span (sessions now persist across restarts)."""
     from pux_harness.agent.mcp_client import McpSessionManager  # noqa: PLC0415
     mcp_tools: list[BaseTool] = []
     _mcp_mgr = None

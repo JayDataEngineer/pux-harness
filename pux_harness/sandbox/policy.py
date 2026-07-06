@@ -1,11 +1,11 @@
-"""Declarative sandbox policy engine (Phase 6 — port of
+"""Declarative sandbox policy engine (port of
 ``backend/internal/policy``).
 
 Pure logic — no Docker, no container state. Loads ``orgs/<name>/policy.yaml``,
 validates credentials against the live env, resolves ``${VAR}`` mount
 placeholders, and renders the iptables egress allowlist. The harness owns
 policy *resolution*; container-side *enforcement* (binds/env/caps/egress.conf
-staging) transfers at Phase 8 once the harness owns container creation.
+staging) transfers once the harness owns container creation.
 
 Faithful 1:1 port of the Go package (``policy.go`` / ``validate.go`` /
 ``egress.go``) so behavior + the parity test gate (``tests/test_policy.py``,

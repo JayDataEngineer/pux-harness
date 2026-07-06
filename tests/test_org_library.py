@@ -1,4 +1,4 @@
-"""Phase 7 — the cross-project org library (``pux:`` namespace + PUX_ORG_PATHS).
+"""The cross-project org library (``pux:`` namespace + PUX_ORG_PATHS).
 
 Two mechanisms let a consumer app REUSE shipped library org bases (or another
 project's orgs) without vendoring:
@@ -131,7 +131,7 @@ def _make_consumer_org(root: Path, name: str, *, extends: str, body: str = "# co
 
 def test_consumer_extends_library_base_inherits_roster(tmp_path: Path):
     """A consumer org ``extends: pux:copilot-kit`` inherits the base's roster
-    (``copilot-helper``) — Phase 5 inheritance working across the library
+    (``copilot-helper``) — inheritance working across the library
     boundary. The base's agent resolves through the base's own ``agents/`` dir."""
     _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit")
     assert "copilot-helper" in org_agent_slugs("my-app", tmp_path)

@@ -1,4 +1,4 @@
-"""Model-role spec (Phase 17.B.0).
+"""Model-role spec.
 
 Proves the resolution priority stack in ``model.resolve_model_id`` /
 ``model.get_model`` (literal > org profile > env > shipped default), the

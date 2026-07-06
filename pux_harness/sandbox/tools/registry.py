@@ -19,7 +19,7 @@ Per-tool ``Requirements`` (which Docker client / backend / vision model / org
 scope a factory needs, and which sandbox capabilities — ffmpeg, xdotool — it
 expects) are DECLARED here but NOT acted on: a tool whose capability is
 unsatisfied is still registered and reports an honest error at call time (the
-Phase-18 multimodal philosophy — present + honest, never a silent drop).
+multimodal philosophy — present + honest, never a silent drop).
 """
 
 from __future__ import annotations
@@ -143,7 +143,7 @@ class ToolDeps:
 # Order is preserved by build_tools → matches the historical build order.
 
 REGISTRY: list[ToolSpec] = [
-    # python + skills. Note (Phase 6): there is no ``load_skill`` — skill bodies
+    # python + skills. Note: there is no ``load_skill`` — skill bodies
     # are peeked via the native ``read_file`` (SkillsMiddleware advertises each
     # skill's name + description). The ``skills-peek-via-read-file`` contract
     # tripwire makes a re-introduction a HARD failure.
@@ -185,7 +185,7 @@ REGISTRY: list[ToolSpec] = [
     ToolSpec("browser_select_dropdown", Category.SPECIALIST, Requirements(exec_client=True), _browser_select_dropdown_tool),
     ToolSpec("browser_save_session", Category.SPECIALIST, Requirements(exec_client=True), _browser_save_session_tool),
     ToolSpec("browser_restore_session", Category.SPECIALIST, Requirements(exec_client=True), _browser_restore_session_tool),
-    # Phase 19 — SOTA mouse/keyboard/DnD (still pure-CDP SeleniumBase, no new deps)
+    # SOTA mouse/keyboard/DnD (still pure-CDP SeleniumBase, no new deps)
     ToolSpec("browser_drag", Category.SPECIALIST, Requirements(exec_client=True), _browser_drag_tool),
     ToolSpec("browser_hover", Category.SPECIALIST, Requirements(exec_client=True), _browser_hover_tool),
     ToolSpec("browser_press", Category.SPECIALIST, Requirements(exec_client=True), _browser_press_tool),

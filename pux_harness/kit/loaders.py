@@ -101,11 +101,11 @@ def _org_path(name: str, project_root: Path) -> Path:
     return _paths.search_org_dir(name, project_root)
 
 
-# --- org inheritance (Phase 5 — ``org.yaml extends:``) ---------------------
+# --- org inheritance (``org.yaml extends:``) ---------------------
 #
 # An org may declare ``extends: <parent-org>`` in its ``org.yaml`` to inherit
 # the parent's ROSTER (``agents:``), AGENTS.md overlay, and profile.yaml. This
-# is the org-level analogue of an agent's ``extends:`` (Phase 2): the parent is
+# is the org-level analogue of an agent's ``extends:``: the parent is
 # the BASE, the child SPECIALIZES. Three things compose root→child:
 #
 # * roster — parent ``agents:`` ∪ own (``org_agent_slugs``); an inherited slug
@@ -200,17 +200,17 @@ def _agent_search_dirs(org: str, project_root: Path) -> list[Path]:
     placing a same-named ``<slug>.md`` in its own ``agents/`` dir; it specializes
     a SHARED agent the same way against ``orgs/_shared/agents``.
 
-    Phase 5 — chain-aware: walks the inheritance chain child→root
+    Chain-aware: walks the inheritance chain child→root
     (``_resolved_org_chain`` reversed), appending each ancestor's ``agents/``
     dir, so an inherited slug whose ``<slug>.md`` lives in a parent's
     ``agents/`` resolves. Cycle-safe (falls back to ``[org]``).
 
-    Phase 7 — each ancestor resolves through ``_org_path`` (the ONE resolver),
+    Each ancestor resolves through ``_org_path`` (the ONE resolver),
     so a ``pux:`` ancestor (a library base) contributes the BASE's own
     ``agents/`` dir, and a ``$PUX_ORG_PATHS`` org contributes its own. The
     ``_shared`` fallback stays PROJECT-LOCAL (the consumer app's shared agents).
     For a non-extending local org the chain is ``[org]`` → byte-identical to
-    the pre-Phase-7 list."""
+    the previous list."""
     chain = _resolved_org_chain(org, project_root)  # root→child
     local: list[Path] = []
     for ancestor in reversed(chain):  # child→root (child's agents win)
@@ -432,7 +432,7 @@ def _load_agent_spec(
 
     Returns ``None`` if no ``<slug>.md`` exists in either search dir.
 
-    Phase 2 — ``extends: <base-slug>`` (recursive, cycle-detected). When the
+    ``extends: <base-slug>`` (recursive, cycle-detected). When the
     frontmatter carries ``extends:``, the base resolves from the SAME search
     dirs (org-local then ``_shared``) and this slug's frontmatter + body merge
     ON TOP via ``_merge_extends`` (delta wins; ``tools_add`` / ``tools_remove``
@@ -441,7 +441,7 @@ def _load_agent_spec(
     base raises ``FileNotFoundError`` — both fail loud (the contract surfaces
     them as ``agent-extends-acyclic`` / ``agent-extends-resolvable``).
 
-    Phase 7 — a ``pux:``-namespaced slug (roster entry or ``extends:``) resolves
+    A ``pux:``-namespaced slug (roster entry or ``extends:``) resolves
     ONLY against the library bases' ``agents/`` dirs (``_paths.library_base_agent_dirs``),
     so a consumer app pulls a shipped agent without vendoring it. The cycle guard
     uses the namespaced slug as-is, so a ``pux:`` base cycle raises loud too.
@@ -534,7 +534,7 @@ def supervisor_skills_roots(
     only, mapped per ``workspace_root`` (host-absolute by default;
     container-absolute when the harness pins ``/sandbox/workspace``).
 
-    Phase 6 — wires native progressive disclosure on the CTO: ``SkillsMiddleware``
+    Wires native progressive disclosure on the CTO: ``SkillsMiddleware``
     injects each root's skill METADATA (name + description) into the supervisor
     prompt, and the agent then peeks a body via the native ``read_file`` (the
     canonical path — the ``pux_sandbox_load_skill`` specialist is GONE, killed by

@@ -1,5 +1,4 @@
 # The model spec — single source of truth for which model fills each role.
-# (Phase 17.B.0)
 #
 # WHY THIS FILE EXISTS
 #   No model id is hardcoded anywhere else in the harness. Every consumer asks
@@ -24,7 +23,7 @@
 #                    `model:`. Decoupled from base so an org can set base!=worker.
 #   multimodal_model vision — describe_image PRIMARY path (decoupled from base
 #                    so an org can pin a vision model != the driver).
-#   grader_model     the RubricMiddleware verify-gate grader (Phase 17.B). Runs
+#   grader_model     the RubricMiddleware verify-gate grader. Runs
 #                    up to max_iterations × per agent output, so the CHEAP model
 #                    is the right default; bump per-org where a rubric needs more
 #                    reasoning.

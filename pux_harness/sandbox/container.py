@@ -1,7 +1,7 @@
-"""The harness owns the Docker sandbox lifecycle (Phase 8g create/stop;
-Phase 13 host_setup + image build).
+"""The harness owns the Docker sandbox lifecycle (create/stop;
+host_setup + image build).
 
-Phase 13 extended ``create()`` with two pre-Docker steps run BEFORE the live
+Create extended ``create()`` with two pre-Docker steps run BEFORE the live
 container is created: ``host_setup`` hooks run on the host first
 (``sandbox/host_setup.py`` — cached uv venv at ``<project>/.pux/venvs/<name>/``,
 captured stdout → env exports, injected into ``os.environ`` BEFORE
@@ -17,7 +17,7 @@ inspect of ``orchestrator-sandbox-mcp-default`` 2026-07-03: runc, shared-infra,
 
   image        ``OPENSHELL_IMAGE`` env | ``pux-sandbox:latest`` (policy
                ``sandbox.image`` override wins); built via ``policy.sandbox.build``
-               if set + absent (Phase 13), else pulled if absent.
+               if set + absent, else pulled if absent.
   labels       ``openshell.policy`` / ``openshell.sandbox-id`` /
                ``openshell.project-path`` — the label the exec path filters on.
   binds        ``<project>:/sandbox/workspace``,
@@ -36,7 +36,7 @@ inspect of ``orchestrator-sandbox-mcp-default`` 2026-07-03: runc, shared-infra,
   caps         ``NET_ADMIN`` only when policy stages an egress allowlist.
 
 Policy enforcement — the part that was blocked while the Go binary owned the
-container (Phase 6 ported the *resolver*; the *enforcer* stayed Go because it
+container (the *resolver* was ported; the *enforcer* stayed Go because it
 mutates ``container.HostConfig`` at create) — runs here now. It mirrors
 ``backend/internal/sandbox/policy_hook.go::applyOrgPolicy`` step for step:
 load → validate required creds → resolve ``${VAR}`` mounts → inject creds/cookies

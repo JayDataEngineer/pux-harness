@@ -1,4 +1,4 @@
-"""The unified context-saving middleware (Phase 19 unification).
+"""The unified context-saving middleware.
 
 One ``AgentMiddleware`` that does BOTH jobs in a single ``wrap_tool_call``
 pass — so every tool result is read exactly once, timed once, and written
@@ -15,16 +15,16 @@ through one store:
    context window BEFORE they accumulate, complementing deepagents' reactive
    ``SummarizationMiddleware`` (which only evicts on overflow).
 
-This merges the old Phase-7 ``ContextOffloadMiddleware`` + Phase-8
-``EventCaptureMiddleware`` (two passes, two stores) into one. It rides the
+This merges the old ``ContextOffloadMiddleware`` + ``EventCaptureMiddleware``
+(two passes, two stores) into one. It rides the
 MAIN agent AND every subagent — ``build_context_layer()`` is the single seam
 both ``graph.py`` and ``orgs._build_sub`` import, so the whole agent tree
 gets capture + offload + retrieval with zero duplication.
 
 Retrieval tools (``ctx_recall`` / ``ctx_search``) are **exempt** from both
 jobs: their purpose is to inject content, so re-stashing their output would
-trap the agent the instant it retrieves a large stash (proven in the Phase 7
-E2E before the exemption), and their output needs no event preview.
+trap the agent the instant it retrieves a large stash (proven in E2E
+before the exemption), and their output needs no event preview.
 """
 from __future__ import annotations
 

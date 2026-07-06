@@ -6,10 +6,10 @@ One ``DockerExecClient`` + one ``PuxSandboxBackend`` serve the whole process
 an observation log). Per-org compiled graphs are built lazily and cached by
 the caller — building is expensive (model init + subagent assembly) and the
 only per-org variation is system_prompt + subagents + the specialist-tool
-whitelist. All 13 specialists are native Python tools (Phase 8i deleted the Go
-bridge that used to supply them over MCP).
+whitelist. All 13 specialists are native Python tools (the Go
+bridge that used to supply them over MCP was deleted).
 
-**Phase 21 — this module is THIN.** It owns the runtime DEPS (the model, the
+**This module is THIN.** It owns the runtime DEPS (the model, the
 specialist tools, the loaded profile + rubric gate, the memory backend, the
 checkpointer) and the final BINDING (``create_deep_agent``), but NO stack
 assembly — every middleware, the prompt, the tool list, and the subagents are
@@ -77,13 +77,13 @@ def build_graph(
     This function only supplies those deps + the memory backend + checkpointer
     and binds the result via ``create_deep_agent``.
 
-    Phase 18: ``store`` is an optional ``BaseStore`` for persistent memory.
+    ``store`` is an optional ``BaseStore`` for persistent memory.
     When provided, memory survives server restarts. When ``None`` (the runner
     default), ``build_memory_backend`` supplies an ephemeral ``InMemoryStore``
     — a real store is required because ``StoreBackend(store=None)`` crashes on
     the first ``download_files`` (no in-graph fallback exists).
     """
-    # Roles (Phase 17.B.0): the CTO runs on `base`; describe_image runs on
+    # Roles: the CTO runs on `base`; describe_image runs on
     # `multimodal` (decoupled so an org can pin a vision model != the driver).
     # Both resolve through models.yaml + org profile + env, never a hardcoded id.
     base_model = get_model(role="base", org=org)
@@ -106,7 +106,7 @@ def build_graph(
         mcp_tools=mcp_tools,
     )
 
-    # Phase 18: agent-managed persistent memory. The composite backend routes
+    # Agent-managed persistent memory. The composite backend routes
     # /memories/ to a StoreBackend (project-scoped namespace) and everything
     # else to the existing PuxSandboxBackend. MemoryMiddleware loads
     # /memories/AGENTS.md at startup and injects it into the system prompt.
@@ -124,10 +124,10 @@ def build_graph(
         memory=MEMORY_SOURCES,
         subagents=plan.subagents,
         middleware=plan.supervisor_middleware,
-        # Phase 6 — native SkillsMiddleware on the supervisor (progressive
+        # Native SkillsMiddleware on the supervisor (progressive
         # disclosure: skill metadata in the prompt, body via read_file).
         # ``None`` for a no-skills org (supervisor_skills == []) -> deepagents
-        # mounts no SkillsMiddleware -> byte-identical to the pre-Phase-6 build.
+        # mounts no SkillsMiddleware (byte-identical to the legacy build).
         skills=plan.supervisor_skills or None,
         backend=memory_backend,
         store=memory_store,

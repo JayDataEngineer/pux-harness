@@ -112,7 +112,7 @@ def test_resolve_skills_rejects_bad_paths(tree: Path) -> None:
         _resolve_skills("../escape", "worker", project_root=tree)
 
 
-# --- Phase 2: _merge_extends (the per-agent override vocabulary) -----------
+# --- _merge_extends (the per-agent override vocabulary) -----------
 #
 # The merge is the universal per-agent override surface — the SAME fields that
 # work org-wide via profile.yaml work per-agent via frontmatter. These unit-test
@@ -218,7 +218,7 @@ def test_merge_extends_no_delta_fields_is_base_plus_body() -> None:
     assert merged["model"] == "mimo-v2.5"
 
 
-# --- Phase 2: _load_agent_spec extends recursion (resolution + cycle) -----
+# --- _load_agent_spec extends recursion (resolution + cycle) -----
 
 def _write_agent(root: Path, slug: str, *, org: str = "_shared",
                  body: str = "BODY", fm: str = "") -> None:

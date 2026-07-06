@@ -1,4 +1,4 @@
-"""Priority-tiered structured snapshot builder (Phase 11).
+"""Priority-tiered structured snapshot builder.
 
 Reads events from the EventStore and builds a ≤2KB XML resume snapshot
 that survives compaction.  Modeled after mksglu/context-mode's

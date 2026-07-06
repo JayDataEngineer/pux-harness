@@ -35,7 +35,7 @@ def project_root() -> Path:
     return Path(os.environ.get(_PROJECT_ROOT_ENV, ".")).resolve()
 
 
-# --- cross-project org library (Phase 7) -----------------------------------
+# --- cross-project org library -----------------------------------------------
 #
 # Two mechanisms let a consumer app REUSE orgs/shipped bases without vendoring:
 #

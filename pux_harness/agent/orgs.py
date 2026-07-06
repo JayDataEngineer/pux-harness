@@ -97,13 +97,13 @@ def _org_path(name: str) -> Path:
 
 def org_extends(name: str) -> str | None:
     """This org's single-hop ``extends:`` parent (raw read of ``org.yaml``), or
-    ``None``. Phase 5 org inheritance. Thin delegate to ``pux_harness.kit.loaders``."""
+    ``None``. Org inheritance. Thin delegate to ``pux_harness.kit.loaders``."""
     return _aloaders.org_extends(name, _orgs_dir().parent)
 
 
 def org_extends_chain(name: str) -> list[str]:
     """The org's inheritance chain, root→child. RAISES on a cycle / unresolvable
-    parent. Phase 5 org inheritance. Thin delegate to ``pux_harness.kit.loaders``."""
+    parent. Org inheritance. Thin delegate to ``pux_harness.kit.loaders``."""
     return _aloaders.org_extends_chain(name, _orgs_dir().parent)
 
 
@@ -193,7 +193,7 @@ def load_org_prompt(name: str) -> str:
 def build_system_prompt(org: str) -> str:
     """root AGENTS.md + the chain-inherited org overlay + harness addendum
     (mirrors pi-mono's append-org-to-root assembly, plus the deepagents
-    terminology bridge). Phase 5: the overlay is the parent's + own AGENTS.md
+    terminology bridge). The overlay is the parent's + own AGENTS.md
     concatenated (own last) when the org ``extends:`` a parent — read via the
     kit's cycle-aware ``_chain_overlay``. For a non-extending org, byte-identical
     to ``root + own + addendum``."""
@@ -260,7 +260,7 @@ def supervisor_skills_roots(org: str) -> list[str]:
     ``SkillsMiddleware`` — the focused set (``orgs/_shared/skills`` + this org's
     own ``skills/``), existing dirs only, mapped to ``/sandbox/workspace/...``.
 
-    Phase 6 — native progressive disclosure on the CTO: the middleware injects
+    Native progressive disclosure on the CTO: the middleware injects
     each root's skill metadata (name + description) into the supervisor prompt;
     the agent peeks a body via the native ``read_file`` (the canonical path —
     ``pux_sandbox_load_skill`` is gone). ``[]`` for a no-skills org -> the graph
@@ -295,13 +295,13 @@ def _build_sub(
     ``SUBAGENT`` dict). ``system_prompt`` is passed in explicitly.
 
     Omitted ``tools`` -> inherit the main agent's tools. Model resolution
-    (Phase 17.B.0): a frontmatter ``model:`` is the agent-level override (a
+    a frontmatter ``model:`` is the agent-level override (a
     literal id); otherwise the subagent runs on the ``worker`` role — resolved
     through models.yaml + the org profile + env, decoupled from the base/CTO
     model so an org can set base!=worker. (Worker defaults to the same id as
     base, so today's orgs are byte-identical; the seam is what's new.)
 
-    Phase 21 — ``middleware`` is the FULLY RESOLVED subagent middleware list
+    ``middleware`` is the FULLY RESOLVED subagent middleware list
     handed down by the stack factory (``stack.build_stack``): the always-on
     context layer (capture + offload) PLUS any toggleable middleware the org
     added to the subagent scope via ``profile.yaml``'s ``middleware.subagent``
@@ -330,7 +330,7 @@ def _build_sub(
     return sub
 
 
-# --- per-agent frontmatter overrides (Phase 2 fold) ------------------------
+# --- per-agent frontmatter overrides ---------------------------------------
 #
 # The universal override vocabulary: the SAME ``HarnessProfileConfig`` fields
 # that work ORG-WIDE via ``profile.yaml`` work PER-AGENT via the agent's OWN
@@ -348,7 +348,7 @@ _AGENT_PROFILE_KEYS: tuple[str, ...] = (
 
 def _agent_profile_from_spec(spec: dict[str, Any]) -> HarnessProfileConfig | None:
     """Build a per-agent ``HarnessProfileConfig`` from an agent spec's OWN
-    frontmatter override fields (Phase 2 fold). ``None`` when the spec carries
+    frontmatter override fields. ``None`` when the spec carries
     none of the four fields — the common case, byte-identical (no per-agent
     rewriting). The spec is already ``extends:``-merged, so a child agent
     inherits + overrides these via the merge the same way it inherits tools."""
@@ -492,14 +492,14 @@ def load_subagents(
       ``excluded_tools`` can never strip retrieval).
 
     ``profile`` (optional ``HarnessProfileConfig`` from ``orgs/<org>/
-    profile.yaml``; Phase 16.3b) applies the ORG-WIDE overrides to EACH
+    profile.yaml) applies the ORG-WIDE overrides to EACH
     specialist: ``system_prompt_suffix`` is appended to the body, and
     ``tool_description_overrides`` + ``excluded_tools`` are applied to the
     resolved tool whitelist (so an org-wide override reaches a shared subagent
     like the browser agent, not just the CTO). The helper is imported lazily to
     avoid a module cycle (``profile.py`` imports ``orgs._orgs_dir``).
 
-    PER-AGENT overrides (Phase 2 fold — the universal pattern): the agent's OWN
+    PER-AGENT overrides (the universal pattern): the agent's OWN
     frontmatter may carry the SAME four ``HarnessProfileConfig`` fields
     (``base_system_prompt`` / ``system_prompt_suffix`` /
     ``tool_description_overrides`` / ``excluded_tools``), honored per-agent via
@@ -537,7 +537,7 @@ def load_subagents(
             slug, spec, tool_map, spec["system_prompt"], org,
             middleware=subagent_middleware,
         )
-        # Per-agent overrides from the spec's OWN frontmatter (Phase 2 fold).
+        # Per-agent overrides from the spec's OWN frontmatter.
         agent_cfg = _agent_profile_from_spec(spec)
         # Prompt precedence: body → per-agent base (replace) → org-wide suffix
         # → per-agent suffix (most-specific = last word).

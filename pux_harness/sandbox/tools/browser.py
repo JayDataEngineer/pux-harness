@@ -665,7 +665,7 @@ def _browser_restore_session_tool(exec_client: DockerExecClient) -> StructuredTo
     )
 
 
-# --- drag (Phase 19 — SOTA drag-and-drop) -----------------------------------
+# --- drag (SOTA drag-and-drop) ------------------------------------------------
 
 _BROWSER_DRAG_DESC = (
     "Drag-and-drop an element on the current page — the gap this fills vs older "

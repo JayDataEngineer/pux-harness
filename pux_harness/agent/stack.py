@@ -41,7 +41,7 @@ The context layer (``ContextMiddleware`` + ``ctx_recall``/``ctx_search``) and
 the user's "selectively remove/add middleware" request, applied uniformly. The
 context spec's coupled (middleware, retrieval-tools) pair escapes via a mutable
 ``StackCtx.emitted_tools_supervisor`` side channel (one shared ``EventStore``,
-two scope-local instances, byte-identical to the pre-Phase-3 build that called
+two scope-local instances, byte-identical to calling
 ``build_context_layer`` once per scope). ``browser_vision`` is env-gated (on for
 the multimodal mimo-v2.5 driver; off → ``None`` → clean absent-from-list) and
 listed LAST in the registry so it mounts innermost.
@@ -198,7 +198,7 @@ def _build_context(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
     retrieval-tools) pair; the tools escape via ``ctx.emitted_tools_supervisor``
     on the SUPERVISOR tier only — the subagent tree reuses the supervisor's
     ctx_tools (threaded through ``load_subagents(retrieval_tools=)``), one
-    shared store, two scope-local instances. Byte-identical to the pre-Phase-3
+    shared store, two scope-local instances. Byte-identical to the pre-factory
     build (which called ``build_context_layer`` once per scope)."""
     mw, tools = build_context_layer()
     if scope is Scope.SUPERVISOR:
@@ -257,7 +257,7 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # so it wraps the whole pipeline as an outermost observer; then context
     # outermost of the default-on layers; browser_vision innermost past rubric.
     # Default-on orgs (no audit) still emit [context, routing, session_guide,
-    # rubric?, browser_vision?] — byte-identical to the pre-Phase-3 build.
+    # rubric?, browser_vision?] — byte-identical to the pre-factory build.
     MiddlewareSpec("audit", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_audit),
     MiddlewareSpec("context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context),
     MiddlewareSpec("routing", frozenset({Scope.SUPERVISOR}), _build_routing),
@@ -407,10 +407,10 @@ class StackPlan:
     supervisor_middleware: list[AgentMiddleware]
     supervisor_prompt: str
     subagents: list[dict[str, Any]]
-    # Phase 6 — container-absolute skills-ROOT paths for the supervisor's native
+    # Container-absolute skills-ROOT paths for the supervisor's native
     # ``SkillsMiddleware`` (progressive disclosure: metadata in the prompt, body
     # via ``read_file``). ``[]`` for a no-skills org -> ``graph`` binds
-    # ``skills=None`` -> byte-identical to today (no SkillsMiddleware mounted).
+    # ``skills=None`` (no SkillsMiddleware mounted).
     supervisor_skills: list[str]
 
 
@@ -483,7 +483,7 @@ def build_stack(
         retrieval_tools=ctx_tools,
     )
 
-    # Phase 1 — own the general-purpose subagent. deepagents auto-adds a HEAVY
+    # Own the general-purpose subagent. deepagents auto-adds a HEAVY
     # ``general-purpose`` subagent to EVERY graph (deepagents/graph.py:716-717)
     # unless ``gp_profile.enabled is False`` OR a spec named ``general-purpose``
     # is already in the inline subagents. pux passes no GP kwarg AND stays off

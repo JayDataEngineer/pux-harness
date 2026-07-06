@@ -30,7 +30,7 @@ https://langchain-ai.github.io/agent-protocol/):
 LOC vs adopting an opinionated runtime), and the REST contract is identical
 either way — swapping the server impl behind these endpoints is invisible to
 clients, so the choice is reversible. SSE streaming (run lifecycle + tool +
-nested-subagent events) is deferred to Phase 9.
+nested-subagent events) is deferred.
 """
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def _agent_descriptor(org: str) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # The shared checkpointer + pux_threads index live in ONE sqlite file owned
-    # by open_thread_store() (Phase 23). server / acp / direct all share it, so a
+    # by open_thread_store(). server / acp / direct all share it, so a
     # thread created by `pux direct` is visible to `pux show` / `pux resume`.
     async with open_thread_store() as store:
         app.state.saver = store.saver
@@ -212,7 +212,7 @@ async def _require_thread(thread_id: str) -> str:
 async def _execute(org: str, thread_id: str, raw_input: Any, recursion_limit: int) -> str:
     """Run one org graph invocation on a thread; return the final answer text.
 
-    Injects the org's default rubric (Phase 17.B.4) when the caller supplied
+    Injects the org's default rubric when the caller supplied
     none — this is what arms an opted-in org's ``RubricMiddleware`` gate. A
     caller-supplied ``rubric`` key (e.g. ``--rubric`` from the CLI, flowing
     through ``_normalize_input``) wins and is left untouched."""

@@ -62,7 +62,7 @@ DCODE_CLI = DCODE_VENV / "bin" / "dcode"
 
 # Subagents ported from the org into dcode's `task` delegation surface.
 # `web-agent` is intentionally excluded: it drives pux-only browser tools
-# (browser_navigate/click/..., Phase 16/20) absent in dcode — porting it would
+# (browser_navigate/click/...) absent in dcode — porting it would
 # need a browser MCP. See ``_adapt_cto_prompt`` for how its clause is reworked.
 _PORTED_SUBAGENTS = ("code-worker", "dev-bot-explorer")
 

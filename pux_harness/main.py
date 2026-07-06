@@ -53,7 +53,7 @@ def _build_agent(
     mcp_tools: list[BaseTool] | None = None,
 ):
     """Build the per-org graph against *saver* (the shared persistent
-    checkpointer from ``open_thread_store``). Phase 23: ``pux direct`` no longer
+    checkpointer from ``open_thread_store``). ``pux direct`` no longer
     uses an ephemeral ``MemorySaver`` — it shares the same
     ``.pux/agent-protocol.sqlite`` as ``serve`` / ``acp``, so threads survive the
     process and show up in ``pux resume`` / ``pux show``."""
@@ -111,7 +111,7 @@ async def _run(
     except ValueError as exc:
         print(f"  [mcp] tool_servers resolution failed: {exc}")
     thread_id = thread or f"{org}-{uuid.uuid4().hex[:8]}"
-    # Phase 23: persistent thread store. direct shares the SAME
+    # Persistent thread store: direct shares the SAME
     # .pux/agent-protocol.sqlite as serve/acp, so a thread created here is
     # visible to `pux show <id>` / `pux resume`. The thread_id is printed to
     # stderr so stdout (the message trace) stays clean.
@@ -136,7 +136,7 @@ async def _run(
             if failed:
                 print(f"\n  {len(failed)} prep job(s) failed (continuing to agent)")
         print(f"[org] {org}   [task] {task}\n")
-        # Phase 17.B.4: arm the org's RubricMiddleware gate. An explicit ``rubric``
+        # Arm the org's RubricMiddleware gate. An explicit ``rubric``
         # (the ``--rubric`` override) wins; otherwise fall back to the org's shipped
         # default (profile.yaml ``rubric.default``). No rubric → the gate stays a
         # no-op (upstream RubricMiddleware contract).
@@ -201,7 +201,7 @@ async def _run(
 
 
 def _jobs_run(org: str, job: str | None) -> int:
-    """Run prep jobs inside the org's sandbox container (Phase 14)."""
+    """Run prep jobs inside the org's sandbox container."""
     from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
     from pux_harness.sandbox.docker_exec import DockerExecClient  # noqa: PLC0415
     from pux_harness.sandbox.jobs import run_jobs  # noqa: PLC0415
@@ -245,7 +245,7 @@ def _jobs_run(org: str, job: str | None) -> int:
 
 
 def _jobs_status(org: str) -> int:
-    """Show declared prep jobs for this org (Phase 14)."""
+    """Show declared prep jobs for this org."""
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
     from pux_harness.agent.orgs import PROJECT_ROOT  # noqa: PLC0415
 
@@ -269,7 +269,7 @@ def _jobs_status(org: str) -> int:
 
 def _check_policy(org: str) -> int:
     """Resolve + report an org's policy WITHOUT running the model — a dry-run of
-    what container-side enforcement (Phase 8) will do. Prints expanded mounts,
+    what container-side enforcement will do. Prints expanded mounts,
     credential presence (names only — never values; ``.env`` holds live keys),
     the rendered egress allowlist (DNS resolved now), and tier/image overrides.
 
@@ -327,7 +327,7 @@ def _check_policy(org: str) -> int:
 
 
 def _sandbox(cmd: str) -> int:
-    """Docker sandbox lifecycle, harness-owned (Phase 8g). Replaces the Go
+    """Docker sandbox lifecycle, harness-owned. Replaces the Go
     ``task start/stop/status`` for container boot. ``ensure`` reuses a running
     container or boots one (the path the exec client takes lazily)."""
     from pux_harness.sandbox.container import SandboxContainer, resolve_project_path
@@ -508,11 +508,11 @@ def main() -> None:
                          "exit 1 if required creds are missing. No model call.")
     ap.add_argument("--sandbox", metavar="CMD",
                     help="Docker sandbox lifecycle: start | stop | status | ensure "
-                         "(harness-owned, Phase 8g; replaces `task start/stop/status`)")
+                         "(harness-owned; replaces `task start/stop/status`)")
     ap.add_argument("--jobs-run", action="store_true",
-                    help="run prep jobs for this org inside the sandbox (Phase 14)")
+                    help="run prep jobs for this org inside the sandbox")
     ap.add_argument("--jobs-status", action="store_true",
-                    help="show declared prep jobs for this org (Phase 14)")
+                    help="show declared prep jobs for this org")
     ap.add_argument("--job", default=None,
                     help="with --jobs-run: run only this named job")
     args = ap.parse_args()

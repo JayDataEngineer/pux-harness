@@ -1,4 +1,4 @@
-"""Cross-session rehydration via Session Guide (Phase 12).
+"""Cross-session rehydration via Session Guide.
 
 When a thread resumes, this middleware:
 1. Queries recent events from the EventStore

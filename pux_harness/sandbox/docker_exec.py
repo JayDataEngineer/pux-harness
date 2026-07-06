@@ -4,8 +4,8 @@ The harness reaches the pux-sandbox container via the Docker SDK's
 ``ExecCreate``/``ExecAttach``, with no JSON-RPC hop or middleman.
 
 The container is discovered by its ``openshell.project-path`` label, decoupled
-from the Go binary's ``orchestrator-sandbox-<id>`` naming convention. Phase 8g
-moved the container *lifecycle* (create/start/stop) into the harness too
+from the Go binary's ``orchestrator-sandbox-<id>`` naming convention. The
+container *lifecycle* (create/start/stop) moved into the harness too
 (``container.py``); the exec path now **self-boots**: when no running container
 is found for the project, ``container.SandboxContainer.ensure()`` creates one
 (with this process's ``PUX_ORG`` policy applied) instead of failing. The Go
@@ -23,7 +23,7 @@ live container (8a probe): ``exec_run(['bash','-c',...], tty=False)`` returns
 Timeout: ``docker.from_env(timeout=300)`` sets the SDK's HTTP read timeout —
 a 300s ceiling carried over from the Go bridge that preceded this path. Per-command
 deadlines are enforced via a thread-based ``.result(timeout=…)`` wrapper
-(Phase 8d) — ``exec(cmd, timeout=N)`` raises ``ExecTimeout`` after ``N``
+— ``exec(cmd, timeout=N)`` raises ``ExecTimeout`` after ``N``
 seconds so callers (e.g. ``describe_image``'s 120s) can map it to a clean
 result envelope instead of hanging to the 300s socket ceiling. The Docker
 SDK is blocking and can't be interrupted, so a timed-out call keeps running
