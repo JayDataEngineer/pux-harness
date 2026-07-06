@@ -458,10 +458,10 @@ async def jobs_run(org: str, body: JobsRunRequest = JobsRunRequest()) -> dict[st
     from pux_harness.sandbox.docker_exec import DockerExecClient  # noqa: PLC0415
     from pux_harness.sandbox.jobs import run_jobs  # noqa: PLC0415
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
-    from pux_harness.agent.orgs import PROJECT_ROOT  # noqa: PLC0415
+    from pux_harness.kit._paths import project_root  # noqa: PLC0415
 
     try:
-        pol = policy_mod.load(org, PROJECT_ROOT)
+        pol = policy_mod.load(org, project_root())
     except policy_mod.NoPolicy:
         return {"org": org, "jobs": [], "message": "no policy.yaml — no jobs declared"}
 
@@ -506,10 +506,10 @@ async def jobs_status(org: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"unknown org {org!r}")
 
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
-    from pux_harness.agent.orgs import PROJECT_ROOT  # noqa: PLC0415
+    from pux_harness.kit._paths import project_root  # noqa: PLC0415
 
     try:
-        pol = policy_mod.load(org, PROJECT_ROOT)
+        pol = policy_mod.load(org, project_root())
     except policy_mod.NoPolicy:
         return {"org": org, "jobs": [], "message": "no policy.yaml"}
 

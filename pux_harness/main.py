@@ -206,10 +206,10 @@ def _jobs_run(org: str, job: str | None) -> int:
     from pux_harness.sandbox.docker_exec import DockerExecClient  # noqa: PLC0415
     from pux_harness.sandbox.jobs import run_jobs  # noqa: PLC0415
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
-    from pux_harness.agent.orgs import PROJECT_ROOT  # noqa: PLC0415
+    from pux_harness.kit._paths import project_root  # noqa: PLC0415
 
     try:
-        pol = policy_mod.load(org, PROJECT_ROOT)
+        pol = policy_mod.load(org, project_root())
     except policy_mod.NoPolicy:
         print(f"{org}: no policy.yaml — no jobs declared")
         return 0
@@ -247,10 +247,10 @@ def _jobs_run(org: str, job: str | None) -> int:
 def _jobs_status(org: str) -> int:
     """Show declared prep jobs for this org."""
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
-    from pux_harness.agent.orgs import PROJECT_ROOT  # noqa: PLC0415
+    from pux_harness.kit._paths import project_root  # noqa: PLC0415
 
     try:
-        pol = policy_mod.load(org, PROJECT_ROOT)
+        pol = policy_mod.load(org, project_root())
     except policy_mod.NoPolicy:
         print(f"{org}: no policy.yaml — no jobs declared")
         return 0
@@ -276,10 +276,10 @@ def _check_policy(org: str) -> int:
     Exits 1 if any required credential is missing — the same gate a real
     container create would enforce, so this is a usable pre-flight."""
     from pux_harness.sandbox import policy
-    from pux_harness.agent.orgs import PROJECT_ROOT
+    from pux_harness.kit._paths import project_root
 
     try:
-        p = policy.load(org, PROJECT_ROOT)
+        p = policy.load(org, project_root())
     except policy.NoPolicy:
         print(f"{org}: no policy.yaml — today's behavior "
               "(full egress, default image/tier, no required creds).")

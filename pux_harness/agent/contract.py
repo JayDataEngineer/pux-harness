@@ -88,8 +88,8 @@ from pux_harness.sandbox.tools import (
     classify_slug,
     prefixed,
 )
+from pux_harness.kit._paths import project_root
 from pux_harness.agent.orgs import (
-    PROJECT_ROOT,
     _agent_search_dirs,
     _load_agent_spec,
     _org_path,
@@ -1401,7 +1401,7 @@ def check_skill_roots() -> list[Violation]:
     """
     v: list[Violation] = []
     for root in _skill_roots():
-        rel_root = root.relative_to(PROJECT_ROOT)
+        rel_root = root.relative_to(project_root())
         for child in sorted(root.iterdir()):
             if child.is_dir():
                 v.extend(_check_skill_dir(child))

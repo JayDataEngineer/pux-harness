@@ -71,8 +71,8 @@ log = logging.getLogger("pux.container")
 # path`` label) comes from the kit's location-independent resolver — not from
 # ``__file__`` (which would point into ``pux_harness``'s install dir, not the
 # app being sandboxed). ``resolve_project_path()`` still honors ``PUX_PROJECT_PATH``
-# as the live per-deploy override.
-PROJECT_ROOT = project_root()
+# as the live per-deploy override. Resolved LIVE at use-site (no import-time
+# snapshot) via ``project_root()`` — see ``resolve_project_path`` below.
 PROJECT_LABEL = "openshell.project-path"
 SANDBOX_LABEL = "openshell.sandbox-id"
 POLICY_LABEL = "openshell.policy"
@@ -136,7 +136,7 @@ def resolve_project_path() -> str:
     ``host:container[:mode]`` parsing (``ssh://host/path`` lands the container
     path in the mode slot → "invalid mode").
     """
-    p = os.environ.get("PUX_PROJECT_PATH") or str(PROJECT_ROOT)
+    p = os.environ.get("PUX_PROJECT_PATH") or str(project_root())
     if "://" in p:  # any URL scheme — ssh://, file://, http://, ...
         raise ContainerError(
             f"sandboxes require a local filesystem path; received a URL: {p!r}"

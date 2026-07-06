@@ -53,9 +53,9 @@ class ExecTimeout(Exception):
 _EXEC_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 # Host project root whose sandbox label we filter on — injected via the kit's
-# resolver (NOT the install path). ``_resolve_project`` still honors
-# ``PUX_PROJECT_PATH`` as the live override.
-PROJECT_ROOT = project_root()
+# resolver (NOT the install path) and resolved LIVE at use-site (no import-time
+# snapshot). ``_resolve_project`` still honors ``PUX_PROJECT_PATH`` as the live
+# override.
 PROJECT_LABEL = "openshell.project-path"
 _DEFAULT_TIMEOUT = 300  # 5min socket ceiling
 
@@ -68,7 +68,7 @@ def _resolve_project() -> str:
     absolute host path (verified: the live container is labeled with the full
     ``/home/ubuntu/.../auto-developer-orchestrator`` path).
     """
-    return os.path.abspath(os.environ.get("PUX_PROJECT_PATH") or str(PROJECT_ROOT))
+    return os.path.abspath(os.environ.get("PUX_PROJECT_PATH") or str(project_root()))
 
 
 def _discover(client: docker.DockerClient, project_path: str) -> str | None:

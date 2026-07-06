@@ -19,11 +19,11 @@ log = logging.getLogger(__name__)
 
 PUX_PREFIX = "pux_sandbox_"
 PUX_GRADER_PREFIX = "pux_grader_"
-# The host app root (where ``orgs/`` lives) is injected via the kit's resolver —
-# NOT derived from this file's install path. Earlier the root was computed as
-# ``parents[N]`` (N bumped when the package split added a dir level); that was a
-# fragile coupling to the orchestrator repo layout, gone now.
-PROJECT_ROOT = project_root()
+# The host app root (where ``orgs/`` lives) is injected via the kit's resolver
+# and resolved LIVE at use-site (no import-time snapshot) — NOT derived from
+# this file's install path. Earlier the root was computed as ``parents[N]`` (N
+# bumped when the package split added a dir level); that was a fragile coupling
+# to the orchestrator repo layout, gone now.
 SKILL_FILE = "SKILL.md"
 
 
@@ -36,7 +36,7 @@ def _skills_dirs(org: str | None = None) -> list[Path]:
     sorted order, no priority. Non-existent dirs are filtered out.
 
     Scans both ``orgs/`` and ``orgs/specialists/`` for org skills dirs."""
-    orgs = PROJECT_ROOT / "orgs"
+    orgs = project_root() / "orgs"
     roots: list[Path] = []
     if org:
         for candidate in [orgs / org / "skills", orgs / "specialists" / org / "skills"]:

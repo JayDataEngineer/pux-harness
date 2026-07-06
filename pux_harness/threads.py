@@ -35,9 +35,12 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from pux_harness.kit._paths import project_root
 
-PROJECT_ROOT = project_root()
-PUX_API_DB = Path(os.environ.get(
-    "PUX_API_DB", str(PROJECT_ROOT / ".pux" / "agent-protocol.sqlite")))
+# The checkpointer DB path. ``$PUX_API_DB`` overrides; otherwise the default is
+# resolved LIVE (no import-time snapshot) from ``project_root()`` so a late
+# ``$PUX_PROJECT_ROOT`` is still honored. Kept as a module attribute so tests
+# can still monkeypatch ``pux_harness.threads.PUX_API_DB`` hermetically (read at
+# call time in ``open_thread_store``); only the project-root default is now live.
+PUX_API_DB = os.environ.get("PUX_API_DB")
 
 
 def _now() -> str:
@@ -89,7 +92,12 @@ async def open_thread_store(
     Reads the module-level :data:`PUX_API_DB` at CALL time (not import time), so
     tests can monkeypatch ``pux_harness.threads.PUX_API_DB`` hermetically.
     """
-    path = db_path if db_path is not None else PUX_API_DB
+    if db_path is not None:
+        path = Path(db_path)
+    elif PUX_API_DB:
+        path = Path(PUX_API_DB)  # env override or a test's monkeypatch
+    else:
+        path = project_root() / ".pux" / "agent-protocol.sqlite"  # live default
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = await aiosqlite.connect(str(path))
     try:

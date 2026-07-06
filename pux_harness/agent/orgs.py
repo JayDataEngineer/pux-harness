@@ -65,8 +65,6 @@ from pux_harness.kit._paths import project_root
 _parse_list = _aloaders._parse_list
 _split_frontmatter = _aloaders._split_frontmatter
 
-PROJECT_ROOT = project_root()
-
 # Container bind-mount target (container.py: ``<project>:/sandbox/workspace``).
 # Skills sources are mapped to container-absolute paths under this root for
 # deepagents' SkillsMiddleware (which resolves them against the backend).
@@ -78,7 +76,7 @@ _WORKSPACE_ROOT = "/sandbox/workspace"
 # re-exports these; the contract tests monkeypatch them at both module sites.
 
 def _orgs_dir() -> Path:
-    return PROJECT_ROOT / "orgs"
+    return project_root() / "orgs"
 
 
 def _specialists_dir() -> Path:
@@ -121,7 +119,7 @@ def _read(rel: str) -> str:
     """Read a project-relative file (used for the root ``AGENTS.md`` only —
     org/agent/skill reads go through the injectable helpers above so the loader
     is testable via monkeypatch)."""
-    return (PROJECT_ROOT / rel).read_text()
+    return (project_root() / rel).read_text()
 
 
 def discover_orgs() -> list[str]:
@@ -174,12 +172,13 @@ conflicts with the org docs above, THIS ADDENDUM wins.
 def load_root_prompt() -> str:
     """Body of the root AGENTS.md (the base 'Pux' system prompt).
 
-    Harness-local (NOT a delegate): the root prompt is pinned to ``PROJECT_ROOT``
-    via ``_read``, NOT the ``_orgs_dir()`` seam. A tempdir contract test patches
-    ``_orgs_dir`` to a throwaway tree, but the base 'Pux' prompt must stay the
-    real shipped one — so this reads through ``PROJECT_ROOT``, deliberately
-    outside the delegated seam (the kit's ``load_root_prompt`` would return ``""``
-    against a tempdir with no AGENTS.md, changing ``build_system_prompt``)."""
+    Harness-local (NOT a delegate): the root prompt is read through ``_read``,
+    which resolves ``project_root()`` LIVE — NOT the ``_orgs_dir()`` seam. A
+    tempdir contract test patches ``_orgs_dir`` to a throwaway tree, but the base
+    'Pux' prompt must stay the real shipped one — so this reads through
+    ``project_root()``, deliberately outside the delegated seam (the kit's
+    ``load_root_prompt`` would return ``""`` against a tempdir with no AGENTS.md,
+    changing ``build_system_prompt``)."""
     return _aloaders._split_frontmatter(_read("AGENTS.md"))[1]
 
 

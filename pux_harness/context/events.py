@@ -51,10 +51,11 @@ from typing import Any
 from pux_harness.kit._paths import project_root
 
 # The app root (where ``.pux/`` lives) is injected, not derived from the
-# install path — see the kit's ``_paths.project_root`` for the resolution rule.
-PROJECT_ROOT = project_root()
-
-EVENTS_DB = PROJECT_ROOT / ".pux" / "events.sqlite"
+# install path — resolved LIVE (no import-time snapshot) via the kit's
+# ``_paths.project_root`` so a late ``$PUX_PROJECT_ROOT`` is still honored.
+def _events_db() -> Path:
+    """``<project>/.pux/events.sqlite`` — the events store path, live-resolved."""
+    return project_root() / ".pux" / "events.sqlite"
 
 # Path-safe blob handle: ``ctx:<hex>``. Hex-only, fixed-ish length range — no
 # path separators, no dots — so a handle can never escape the blob lookup.
@@ -810,5 +811,5 @@ def shared_event_store() -> EventStore:
     """One process-wide event store at ``<project>/.pux/events.sqlite``."""
     global _store
     if _store is None:
-        _store = EventStore(EVENTS_DB)
+        _store = EventStore(_events_db())
     return _store

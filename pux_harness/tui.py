@@ -49,11 +49,11 @@ from pux_harness.tui_branding import get_branding, get_pux_banner
 # wherever the harness is installed — the orchestrator layout today, the
 # standalone pux-harness repo after the split.
 HARNESS_ROOT = Path(__file__).resolve().parents[1]
-# PROJECT_ROOT = the APP root (``orgs/`` + ``.pux/`` + ``AGENTS.md``), injected
-# via the kit's resolver — NOT the install path. ``bin/pux`` exports
-# ``PUX_PROJECT_ROOT=$REPO`` before exec, so this resolves to the orchestrator
-# root and the TUI finds the orgs.
-PROJECT_ROOT = project_root()
+# The APP root (``orgs/`` + ``.pux/`` + ``AGENTS.md``) is injected via the kit's
+# resolver — NOT the install path. ``bin/pux`` exports ``PUX_PROJECT_ROOT=$REPO``
+# before exec, so this resolves to the orchestrator root and the TUI finds the
+# orgs. Resolved LIVE at each use-site (no import-time snapshot) via
+# ``project_root()`` — the ONE shared resolver.
 
 # dcode uv-tool venv layout.
 DCODE_VENV = Path.home() / ".local" / "share" / "uv" / "tools" / "deepagents-code"
@@ -120,7 +120,7 @@ def _running_under_dcode(dcode_py: Path) -> bool:
 def _discover_orgs() -> list[str]:
     """Sorted names of every org dir containing ``AGENTS.md``."""
     orgs: list[str] = []
-    for root in [PROJECT_ROOT / "orgs", PROJECT_ROOT / "orgs" / "specialists"]:
+    for root in [project_root() / "orgs", project_root() / "orgs" / "specialists"]:
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
@@ -131,8 +131,8 @@ def _discover_orgs() -> list[str]:
 
 def _resolve_org(name: str) -> Path:
     """Return the org dir for *name* (``orgs/`` then ``orgs/specialists/``)."""
-    for cand in [PROJECT_ROOT / "orgs" / name,
-                 PROJECT_ROOT / "orgs" / "specialists" / name]:
+    for cand in [project_root() / "orgs" / name,
+                 project_root() / "orgs" / "specialists" / name]:
         if cand.is_dir() and (cand / "AGENTS.md").is_file():
             return cand
     print(f"pux tui: unknown org {name!r}. Available: {', '.join(_discover_orgs())}",
@@ -145,7 +145,7 @@ def _resolve_agent_md(org_dir: Path, slug: str) -> Path | None:
     local = org_dir / "agents" / f"{slug}.md"
     if local.is_file():
         return local
-    shared = PROJECT_ROOT / "orgs" / "_shared" / "agents" / f"{slug}.md"
+    shared = project_root() / "orgs" / "_shared" / "agents" / f"{slug}.md"
     return shared if shared.is_file() else None
 
 
@@ -300,7 +300,7 @@ def _run_in_process(
 ) -> None:
     """Install persona, patch banner, and call dcode's cli_main in-process."""
     org_dir = _resolve_org(org)
-    rel = org_dir.relative_to(PROJECT_ROOT)
+    rel = org_dir.relative_to(project_root())
     print(f"pux tui: installing ~/.deepagents/{org}/ from {rel}", file=sys.stderr)
     _install_agent(org, org_dir)
     _patch_banner(org)

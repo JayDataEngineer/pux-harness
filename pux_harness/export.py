@@ -43,7 +43,6 @@ from typing import Any
 import yaml
 
 from pux_harness.agent.orgs import (
-    PROJECT_ROOT,
     _load_agent_spec,
     _org_path,
     _orgs_dir,
@@ -51,6 +50,7 @@ from pux_harness.agent.orgs import (
     discover_orgs,
     org_agent_slugs,
 )
+from pux_harness.kit._paths import project_root as _default_project_root
 
 
 def _collect_org_files(org_dir: Path) -> dict[str, Path]:
@@ -117,8 +117,14 @@ def _resolve_shared_agents(org: str) -> dict[str, Path]:
     return files
 
 
-def _resolve_shared_skills(org: str) -> dict[str, Path]:
-    """Shared skills referenced by agents' ``skills:`` frontmatter."""
+def _resolve_shared_skills(
+    org: str, project_root: Path | None = None,
+) -> dict[str, Path]:
+    """Shared skills referenced by agents' ``skills:`` frontmatter.
+
+    ``project_root`` defaults to the kit's LIVE resolver (no import-time
+    snapshot) — per-call overridable so ``export_org`` can thread a tmp root."""
+    root = project_root if project_root is not None else _default_project_root()
     files: dict[str, Path] = {}
     shared_skills = _orgs_dir() / "_shared" / "skills"
     if not shared_skills.is_dir():
@@ -133,7 +139,7 @@ def _resolve_shared_skills(org: str) -> dict[str, Path]:
             # raw is project-relative like "orgs/_shared/skills"
             if not isinstance(raw, str) or "_shared" not in raw:
                 continue
-            skills_root = PROJECT_ROOT / raw
+            skills_root = root / raw
             if not skills_root.is_dir():
                 continue
             for skill_dir in sorted(skills_root.iterdir()):
@@ -141,7 +147,7 @@ def _resolve_shared_skills(org: str) -> dict[str, Path]:
                     continue
                 skill_md = skill_dir / "SKILL.md"
                 if skill_md.is_file():
-                    rel = skill_md.relative_to(PROJECT_ROOT)
+                    rel = skill_md.relative_to(root)
                     files[str(rel)] = skill_md
                 # Include references/ and scripts/ subdirs
                 for sub in ("references", "scripts"):
@@ -149,14 +155,19 @@ def _resolve_shared_skills(org: str) -> dict[str, Path]:
                     if sub_dir.is_dir():
                         for f in sorted(sub_dir.rglob("*")):
                             if f.is_file():
-                                rel = f.relative_to(PROJECT_ROOT)
+                                rel = f.relative_to(root)
                                 files[str(rel)] = f
 
     return files
 
 
-def _resolve_shared_sandbox(org: str) -> dict[str, Path]:
-    """Shared sandbox helpers referenced by policy host_setup hooks."""
+def _resolve_shared_sandbox(
+    org: str, project_root: Path | None = None,
+) -> dict[str, Path]:
+    """Shared sandbox helpers referenced by policy host_setup hooks.
+
+    ``project_root`` defaults to the kit's LIVE resolver — per-call overridable."""
+    root = project_root if project_root is not None else _default_project_root()
     files: dict[str, Path] = {}
     org_dir = _org_path(org)
     policy_path = org_dir / "policy.yaml"
@@ -187,7 +198,7 @@ def _resolve_shared_sandbox(org: str) -> dict[str, Path]:
         # script is project-relative like "orgs/_shared/sandbox/extract_browser_cookies.py"
         if "_shared" not in script:
             continue
-        script_path = PROJECT_ROOT / script
+        script_path = root / script
         if script_path.is_file():
             files[str(Path(script).parent / script_path.name)] = script_path
 
@@ -201,7 +212,7 @@ def _resolve_shared_sandbox(org: str) -> dict[str, Path]:
                 continue
             if "from" in content and ("clients" in content or "_shared" in content):
                 for client_file in sorted(shared_clients.glob("*.py")):
-                    rel = client_file.relative_to(PROJECT_ROOT)
+                    rel = client_file.relative_to(root)
                     files[str(rel)] = client_file
                 break  # one check is enough to decide we need clients
 
@@ -214,7 +225,7 @@ def _resolve_shared_sandbox(org: str) -> dict[str, Path]:
                 continue
             if "from" in content and "sandbox" in content:
                 for helper in sorted(shared_sandbox.glob("*.py")):
-                    rel = helper.relative_to(PROJECT_ROOT)
+                    rel = helper.relative_to(root)
                     files[str(rel)] = helper
                 break
 
@@ -307,11 +318,15 @@ def _build_manifest(
 def export_org(
     org: str,
     output: Path | None = None,
+    project_root: Path | None = None,
 ) -> Path:
     """Export an org as a self-contained ``.tar.gz`` archive.
 
-    Returns the path to the written archive.
+    ``project_root`` defaults to the kit's LIVE resolver (``$PUX_PROJECT_ROOT``
+    or the CWD) — per-call overridable, mirroring ``kit.compile_org``. Returns
+    the path to the written archive.
     """
+    root = project_root if project_root is not None else _default_project_root()
     if org not in discover_orgs():
         raise FileNotFoundError(
             f"org {org!r} not found; discovered: {discover_orgs()}")
@@ -319,7 +334,7 @@ def export_org(
     org_dir = _org_path(org)
 
     # 1. Root AGENTS.md (base prompt)
-    root_agents_md = PROJECT_ROOT / "AGENTS.md"
+    root_agents_md = root / "AGENTS.md"
     files: dict[str, Path] = {}
     if root_agents_md.is_file():
         files["AGENTS.md"] = root_agents_md
@@ -329,8 +344,8 @@ def export_org(
 
     # 3. Shared dependencies
     files.update(_resolve_shared_agents(org))
-    files.update(_resolve_shared_skills(org))
-    files.update(_resolve_shared_sandbox(org))
+    files.update(_resolve_shared_skills(org, root))
+    files.update(_resolve_shared_sandbox(org, root))
     files.update(_resolve_tool_servers(org))
 
     # 4. Build manifest
