@@ -1,19 +1,21 @@
-"""CompositeBackend factory for memory routing.
+"""CompositeBackend instance for memory routing.
 
 Routes ``/memories/*`` to a ``StoreBackend`` (persistent, agent-managed) and
 everything else to the existing ``PuxSandboxBackend`` (sandbox fs/shell).
 
-The ``CompositeBackend`` is constructed as a *factory* (``lambda rt: ...``) so
-that ``StoreBackend`` receives the runtime context needed to resolve the
-namespace. This matches the deepagents pattern where ``backend=`` can be a
-callable that takes ``Runtime`` and returns a ``BackendProtocol``.
+``CompositeBackend`` is built ONCE here (a ``BackendProtocol`` instance) and
+passed as ``backend=`` to ``create_deep_agent()``. ``StoreBackend`` takes the
+namespace as a *factory* (``namespace=``) it resolves per-access, so no
+``Runtime`` is needed at construction — the backend is stateless path-prefix
+routing over the shared sandbox backend. (The old callable-factory form
+re-invoked construction on every fs op and tripped deepagents' 0.7.0
+deprecation: ``backend=`` must be an instance, not a callable.)
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from deepagents.backends.composite import CompositeBackend
-from deepagents.backends.state import StateBackend
 
 if TYPE_CHECKING:
     from langgraph.store.base import BaseStore
@@ -27,12 +29,13 @@ def build_memory_backend(
     org: str,
     default_backend: PuxSandboxBackend,
     store: BaseStore | None = None,
-) -> tuple[callable, BaseStore]:
+) -> tuple[CompositeBackend, BaseStore]:
     """Build the composite backend and store for memory.
 
     Returns:
-        ``(backend_factory, store)`` — the factory is passed as ``backend=``
-        to ``create_deep_agent()``; the store is passed as ``store=``. Both
+        ``(backend, store)`` — the ``CompositeBackend`` instance is passed as
+        ``backend=`` to ``create_deep_agent()``; the store is passed as
+        ``store=``. Both
         share the SAME store object so the graph's store and the
         ``StoreBackend``'s store are one and the same.
 
@@ -53,22 +56,25 @@ def build_memory_backend(
         store = InMemoryStore()
     namespace_fn = memory_namespace(org)
 
-    def _backend_factory(rt):
-        """Resolve composite backend at graph execution time.
+    # Build the composite backend INSTANCE once, at graph-build time.
+    # ``StoreBackend`` takes the namespace as a *factory* (``namespace=``) that
+    # it calls per-access with the runtime context — it does NOT need the
+    # ``Runtime`` at construction. So unlike the old callable-factory form
+    # (which deepagents re-invoked on every fs op), this instance is built
+    # once and reused. ``CompositeBackend`` is stateless path-prefix routing
+    # over the shared ``default_backend`` + the per-access namespace factory,
+    # so a single instance is correct. This also clears deepagents' 0.7.0
+    # deprecation: ``backend=`` must be a ``BackendProtocol`` instance, not a
+    # callable (the old ``_backend_factory(rt)`` ignored ``rt`` anyway).
+    from deepagents.backends.store import StoreBackend  # noqa: PLC0415
 
-        ``StoreBackend`` needs the runtime to resolve the namespace factory.
-        The store is the one resolved above (caller-supplied or the
-        ephemeral InMemoryStore default) — never None.
-        """
-        from deepagents.backends.store import StoreBackend
+    memory_store_be = StoreBackend(
+        store=store,
+        namespace=namespace_fn,
+    )
+    backend = CompositeBackend(
+        default=default_backend,
+        routes={"/memories/": memory_store_be},
+    )
 
-        memory_store = StoreBackend(
-            store=store,
-            namespace=namespace_fn,
-        )
-        return CompositeBackend(
-            default=default_backend,
-            routes={"/memories/": memory_store},
-        )
-
-    return _backend_factory, store
+    return backend, store
