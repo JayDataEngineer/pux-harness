@@ -102,18 +102,120 @@ def _org_path(name: str, project_root: Path) -> Path:
     raise FileNotFoundError(f"org {name!r} not found in orgs/ or orgs/specialists/")
 
 
-def _agent_search_dirs(org: str, project_root: Path) -> list[Path]:
-    """Directories searched for an agent ``<slug>.md``, org-local first then
-    shared. An org specializes a shared agent by placing a same-named
-    ``<slug>.md`` in its own ``agents/`` dir (first hit wins).
+# --- org inheritance (Phase 5 — ``org.yaml extends:``) ---------------------
+#
+# An org may declare ``extends: <parent-org>`` in its ``org.yaml`` to inherit
+# the parent's ROSTER (``agents:``), AGENTS.md overlay, and profile.yaml. This
+# is the org-level analogue of an agent's ``extends:`` (Phase 2): the parent is
+# the BASE, the child SPECIALIZES. Three things compose root→child:
+#
+# * roster — parent ``agents:`` ∪ own (``org_agent_slugs``); an inherited slug
+#   resolves through the child's agent dirs FIRST (``_agent_search_dirs`` is
+#   chain-aware), so a child specializes an inherited agent by dropping a
+#   same-named ``<slug>.md`` in its own ``agents/``.
+# * AGENTS.md overlay — parent + own concatenated own-last (``_chain_overlay``).
+# * profile.yaml — deep-merged root→child (``profile._resolved_profile_yaml``).
+#
+# ``policy.yaml`` is NEVER inherited (security — each org owns its egress); the
+# contract warns on a policy-less child (Safeguard S6).
+#
+# Cycle-safety: ``org_extends_chain`` RAISES on a cycle / unresolvable parent
+# (mirrors ``_load_agent_spec``'s agent-extends recursion); the runtime loaders
+# use the cycle-safe ``_resolved_org_chain`` (falls back to ``[name]``), and the
+# contract walks RAW (``contract._org_extends_chain_violations``) for precise
+# ``org-extends-resolvable`` / ``org-extends-acyclic`` messages. Two walkers, one
+# pattern — exactly the agent-extends split (``_load_agent_spec`` raises vs
+# ``_agent_extends_chain_violations`` reports).
 
-    Checks both ``orgs/<org>/agents`` and ``orgs/specialists/<org>/agents`` for
-    the org-local dir (the latter holds orgs nested under ``specialists/``)."""
+
+def org_extends(name: str, project_root: Path) -> str | None:
+    """This org's single-hop ``extends:`` parent (a raw read of ``org.yaml``), or
+    ``None``. ``None`` when the org ships no ``org.yaml``, no ``extends`` key, or
+    a non-string ``extends``. The RAW reader the contract's chain walker +
+    ``org_extends_chain`` build on (no recursion, no merge — single hop only)."""
+    manifest = _org_path(name, project_root) / "org.yaml"
+    if not manifest.is_file():
+        return None
+    data = yaml.safe_load(manifest.read_text()) or {}
+    if not isinstance(data, dict):
+        return None
+    parent = data.get("extends")
+    if not isinstance(parent, str) or not parent.strip():
+        return None
+    return parent.strip()
+
+
+def org_extends_chain(name: str, project_root: Path) -> list[str]:
+    """The org's inheritance chain, ROOT→CHILD (``[grandparent, parent, child]``),
+    walking ``extends:`` recursively. RAISES on a broken chain so the fault
+    surfaces loudly:
+
+    * ``ValueError`` — a cycle (``a extends b extends a``).
+    * ``FileNotFoundError`` — an unresolvable parent (no such org dir, or the
+      parent dir has no ``AGENTS.md`` — an org without one is not a valid base).
+
+    Mirrors ``_load_agent_spec``'s agent-extends recursion. Runtime loaders use
+    the cycle-safe ``_resolved_org_chain``; the contract walks RAW via
+    ``_org_extends_chain_violations`` for precise, actionable messages."""
+    upward: list[str] = []  # built child→root, reversed before return
+    visited: set[str] = set()
+    cur = name
+    while True:
+        if cur in visited:
+            cycle = " -> ".join([*upward, cur])
+            msg = f"org {name!r}: extends cycle ({cycle})"
+            raise ValueError(msg)
+        visited.add(cur)
+        upward.append(cur)
+        parent = org_extends(cur, project_root)
+        if parent is None:
+            break  # chain terminates cleanly
+        try:
+            pdir = _org_path(parent, project_root)
+        except FileNotFoundError as exc:
+            msg = f"org {name!r}: extends {parent!r} -> no such org"
+            raise FileNotFoundError(msg) from exc
+        if not (pdir / "AGENTS.md").is_file():
+            msg = f"org {name!r}: extends {parent!r} -> no AGENTS.md (not a valid base org)"
+            raise FileNotFoundError(msg)
+        cur = parent
+    upward.reverse()  # root→child
+    return upward
+
+
+def _resolved_org_chain(name: str, project_root: Path) -> list[str]:
+    """Cycle-safe inheritance chain, ROOT→CHILD. Falls back to ``[name]`` on a
+    broken chain (cycle / unresolvable parent) so runtime loaders NEVER crash —
+    the contract's ``org-extends-*`` rules report the real fault offline. For an
+    org with no ``extends:`` this is just ``[name]`` (byte-identical to today)."""
+    try:
+        return org_extends_chain(name, project_root)
+    except (ValueError, FileNotFoundError):
+        return [name]
+
+
+def _agent_search_dirs(org: str, project_root: Path) -> list[Path]:
+    """Directories searched for an agent ``<slug>.md``, child-local first then
+    each ancestor's, then shared. First hit wins, so an org specializes an
+    INHERITED agent (one it got from a parent's roster via ``extends:``) by
+    placing a same-named ``<slug>.md`` in its own ``agents/`` dir; it specializes
+    a SHARED agent the same way against ``orgs/_shared/agents``.
+
+    Phase 5 — chain-aware: walks the inheritance chain child→root
+    (``_resolved_org_chain`` reversed), appending each ancestor's ``agents/``
+    dir, so an inherited slug whose ``<slug>.md`` lives in a parent's
+    ``agents/`` resolves. Cycle-safe (falls back to ``[org]``). Checks both
+    ``orgs/<org>/agents`` and ``orgs/specialists/<org>/agents`` per org (the
+    latter holds orgs nested under ``specialists/``). For a non-extending org
+    the chain is ``[org]`` → byte-identical to the pre-Phase-5 list."""
     orgs = _orgs_dir(project_root)
+    chain = _resolved_org_chain(org, project_root)  # root→child
     local: list[Path] = []
-    for candidate in [orgs / org / "agents", _specialists_dir(project_root) / org / "agents"]:
-        if candidate.is_dir():
-            local.append(candidate)
+    for ancestor in reversed(chain):  # child→root (child's agents win)
+        for candidate in (orgs / ancestor / "agents",
+                          _specialists_dir(project_root) / ancestor / "agents"):
+            if candidate.is_dir():
+                local.append(candidate)
     return [*local, orgs / "_shared" / "agents"]
 
 
@@ -133,9 +235,13 @@ def discover_orgs(project_root: Path) -> list[str]:
     )
 
 
-def org_agent_slugs(name: str, project_root: Path) -> list[str]:
-    """The specialist slugs this org delegates to, read from
-    ``orgs/<name>/org.yaml``."""
+def _own_org_agent_slugs(name: str, project_root: Path) -> list[str]:
+    """This org's OWN roster (``org.yaml agents:``) — NO inheritance. Raises
+    ``ValueError`` on a malformed ``org.yaml`` (non-mapping top level). Returns
+    ``[]`` when the org ships no ``org.yaml`` (valid for a CTO-only org).
+
+    Factored out of ``org_agent_slugs`` so the chain-aware reader can call it per
+    ancestor without re-implementing the parse."""
     org_dir = _org_path(name, project_root)
     manifest = org_dir / "org.yaml"
     if not manifest.is_file():
@@ -145,6 +251,25 @@ def org_agent_slugs(name: str, project_root: Path) -> list[str]:
         msg = f"{name}/org.yaml: top level must be a mapping, got {type(data).__name__}"
         raise ValueError(msg)
     return _parse_list(data.get("agents"))
+
+
+def org_agent_slugs(name: str, project_root: Path) -> list[str]:
+    """The specialist slugs this org delegates to — the chain-INHERITED roster
+    (parent ``agents:`` ∪ own, walked root→child; a slug in both appears once at
+    the parent's position, own redeclarations specialized via the child's local
+    ``agents/`` dir). Cycle-safe: a broken ``extends:`` chain falls back to
+    ``[name]`` (the contract's ``org-extends-*`` rules report the fault).
+
+    For a non-extending org the chain is ``[name]`` → byte-identical to reading
+    just its own ``org.yaml``."""
+    seen: set[str] = set()
+    roster: list[str] = []
+    for org in _resolved_org_chain(name, project_root):  # root→child
+        for slug in _own_org_agent_slugs(org, project_root):
+            if slug not in seen:
+                seen.add(slug)
+                roster.append(slug)
+    return roster
 
 
 # --- prompt assembly -------------------------------------------------------
@@ -164,11 +289,29 @@ def load_org_prompt(name: str, project_root: Path) -> str:
     return _split_frontmatter((_org_path(name, project_root) / "AGENTS.md").read_text())[1]
 
 
+def _chain_overlay(org: str, project_root: Path) -> str:
+    """Concatenated ``AGENTS.md`` overlays across the inheritance chain,
+    root→child (own LAST). Cycle-safe. Each ancestor's overlay is read by
+    ``load_org_prompt`` (frontmatter stripped, body only). A child extends a
+    parent's CTO prose the same way an agent extends a base prompt — by
+    APPENDING. For a non-extending org this is just its own overlay
+    (byte-identical)."""
+    parts: list[str] = []
+    for ancestor in _resolved_org_chain(org, project_root):  # root→child
+        body = load_org_prompt(ancestor, project_root)
+        if body:
+            parts.append(body)
+    return "\n\n".join(parts)
+
+
 def build_system_prompt(org: str, *, project_root: Path, addendum: str = "") -> str:
-    """root ``AGENTS.md`` + org overlay + ``addendum``. The kit default addendum
-    is empty; the pux harness passes its own ``/sandbox/workspace`` addendum."""
+    """root ``AGENTS.md`` + the chain-inherited org overlay + ``addendum``. The
+    overlay is the parent's + own AGENTS.md concatenated (own last) when the org
+    ``extends:`` a parent; otherwise just the org's own. The kit default
+    addendum is empty; the pux harness passes its own ``/sandbox/workspace``
+    addendum."""
     root = load_root_prompt(project_root)
-    overlay = load_org_prompt(org, project_root)
+    overlay = _chain_overlay(org, project_root)
     head = f"{root}\n\n{overlay}" if root else overlay
     return f"{head}{addendum}"
 

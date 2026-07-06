@@ -174,14 +174,15 @@ def _validate_models_block(org: str, data: dict) -> None:
 
 
 def _read_profile_yaml(org: str) -> dict | None:
-    """Read + parse ``orgs/<org>/profile.yaml`` -> mapping; ``None`` if absent.
+    """Read + parse THIS org's OWN ``profile.yaml`` -> mapping; ``None`` if absent.
 
-    Shared by ``load_profile``, ``load_rubric_gate``, and the model-role
-    resolver (``model._org_role_override``) so the file is read under ONE shape
-    contract. Validates the top-level ``models:`` map (``_validate_models_block``)
-    so a bad role key fails every reader, not just the model one. A non-mapping
-    top level (e.g. a bare list) raises ``TypeError`` — no silent skip; a
-    malformed profile is a real bug."""
+    The RAW single-hop reader — no inheritance. Shared by the contract's raw
+    per-file checks (``_no_legacy_subagents_block``) and as the building block
+    for ``_resolved_profile_yaml`` (the inheritance-aware reader the runtime
+    loaders use). Validates the top-level ``models:`` map
+    (``_validate_models_block``) so a bad role key fails every reader, not just
+    the model one. A non-mapping top level (e.g. a bare list) raises
+    ``TypeError`` — no silent skip; a malformed profile is a real bug."""
     path = _profile_path(org)
     if not path.is_file():
         return None
@@ -194,6 +195,66 @@ def _read_profile_yaml(org: str) -> dict | None:
         raise TypeError(msg)
     _validate_models_block(org, data)
     return data
+
+
+def _deep_merge_profile(base: Any, delta: Any) -> Any:
+    """Deep-merge two parsed ``profile.yaml`` dicts root→child (``delta`` = child
+    wins). ONE universal rule that happens to be correct for EVERY field — the
+    native ``HarnessProfileConfig`` merge semantics + the pux blocks:
+
+    * dicts merge per-key (recurse) — so ``tool_description_overrides``,
+      ``general_purpose_subagent``, ``models``, and ``middleware``'s scope
+      sub-blocks all compose key-by-key with the child winning each key it sets;
+    * lists UNION (dedup, base order preserved) — so ``excluded_tools``,
+      ``excluded_middleware``, and ``middleware.{scope}.{add,remove}`` accumulate
+      down the chain;
+    * scalars: ``delta`` wins — so ``base_system_prompt`` / ``system_prompt_suffix``
+      (child replaces) and every leaf in ``rubric`` / ``models`` (child wins).
+
+    Type-mismatch (dict vs list vs scalar) falls back to ``delta`` wins — the
+    child explicitly restated it, which is the honest resolution. Pure +
+    recursive; no knowledge of which key is which (the rule is the same
+    everywhere, which is what makes it universal)."""
+    if isinstance(base, dict) and isinstance(delta, dict):
+        out = dict(base)
+        for key, dval in delta.items():
+            out[key] = _deep_merge_profile(out[key], dval) if key in out else dval
+        return out
+    if isinstance(base, list) and isinstance(delta, list):
+        merged = list(base)
+        for item in delta:
+            if item not in merged:
+                merged.append(item)
+        return merged
+    return delta
+
+
+def _resolved_profile_yaml(org: str) -> dict | None:
+    """Read + merge this org's ``profile.yaml`` WITH its ``extends:`` chain
+    (root→child, deepest-ancestor first). ``None`` when the org AND every
+    ancestor ships no profile. Each ancestor's OWN block is read +
+    ``models``-validated by ``_read_profile_yaml``; the merged dict is composed
+    by ``_deep_merge_profile``.
+
+    This is the inheritance-aware reader the RUNTIME loaders
+    (``load_profile`` / ``load_rubric_gate`` / ``load_middleware_overrides`` /
+    ``model._org_role_override``) route through, so a child inherits a parent's
+    ``system_prompt_suffix`` / ``models`` / ``middleware`` deltas while overriding
+    the keys it restates. Cycle-safe: a broken chain falls back to ``[org]``
+    (``_read_profile_yaml(org)`` alone) — the contract's ``org-extends-*`` rules
+    report the real fault offline. For a non-extending org the chain is ``[org]``
+    → byte-identical to the raw own read."""
+    try:
+        chain = _orgs_mod.org_extends_chain(org)  # root→child
+    except (ValueError, FileNotFoundError):
+        chain = [org]
+    merged: dict | None = None
+    for ancestor in chain:
+        own = _read_profile_yaml(ancestor)
+        if own is None:
+            continue
+        merged = own if merged is None else _deep_merge_profile(merged, own)
+    return merged
 
 
 def _rubric_gate_from_block(org: str, block: object) -> RubricGate:
@@ -335,8 +396,13 @@ def load_middleware_overrides(org: str) -> MiddlewareOverrides:
     raises on a malformed entry). Read independently of ``load_profile`` so the
     factory (``stack.build_stack``) can resolve the middleware stack without
     disturbing the ``HarnessProfileConfig`` path. Name + scope validity is
-    checked downstream by ``stack.validate_overrides``."""
-    data = _read_profile_yaml(org)
+    checked downstream by ``stack.validate_overrides``.
+
+    Phase 5 — inheritance-aware: reads the ``extends:``-chain-merged block
+    (``_resolved_profile_yaml``), so a child inherits a parent's middleware
+    deltas and overrides the keys it restates. For a non-extending org,
+    byte-identical to the raw own read."""
+    data = _resolved_profile_yaml(org)
     if data is None or "middleware" not in data:
         return MiddlewareOverrides()
     return _middleware_overrides_from_block(org, data["middleware"])
@@ -358,8 +424,15 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
     ``excluded_middleware`` grammar raises ``ValueError``. A non-mapping top
     level raises ``TypeError`` here. No silent skip — a malformed profile is a
     real bug.
+
+    Phase 5 — inheritance-aware: reads the ``extends:``-chain-merged block
+    (``_resolved_profile_yaml``), so a child inherits a parent's
+    ``system_prompt_suffix`` / ``tool_description_overrides`` / ``excluded_*`` /
+    ``general_purpose_subagent`` (native fields deep-merged root→child) and
+    overrides the keys it restates. For a non-extending org, byte-identical to
+    the raw own read.
     """
-    data = _read_profile_yaml(org)
+    data = _resolved_profile_yaml(org)
     if data is None:
         return None
     # ``rubric`` / ``models`` / ``middleware`` are VALID harness blocks peeled
@@ -382,8 +455,13 @@ def load_rubric_gate(org: str) -> RubricGate | None:
     entry). Read independently of ``load_profile`` so the gate can be wired in
     ``build_graph`` without disturbing the ``HarnessProfileConfig`` path
     (load_profile's signature stays stable → zero ripple to existing callers).
+
+    Phase 5 — inheritance-aware: reads the ``extends:``-chain-merged block
+    (``_resolved_profile_yaml``); a child inherits a parent's rubric gate and
+    overrides the fields it restates. For a non-extending org, byte-identical to
+    the raw own read.
     """
-    data = _read_profile_yaml(org)
+    data = _resolved_profile_yaml(org)
     if data is None or "rubric" not in data:
         return None
     return _rubric_gate_from_block(org, data["rubric"])

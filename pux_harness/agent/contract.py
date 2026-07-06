@@ -97,6 +97,7 @@ from pux_harness.agent.orgs import (
     _split_frontmatter,
     discover_orgs,
     org_agent_slugs,
+    org_extends,
 )
 # ``_orgs_dir`` / ``_agent_search_dirs`` / ``_load_agent_spec`` are re-exported
 # here (bound into THIS module's namespace by the import) so the contract tests
@@ -220,6 +221,52 @@ def _agent_extends_chain_violations(slug: str, org: str) -> list[Violation]:
         cur = parent
 
 
+def _org_extends_chain_violations(name: str) -> list[Violation]:
+    """Validate an org's ``extends:`` chain resolves + is acyclic (Phase 5).
+
+    Mirrors ``_agent_extends_chain_violations``: walks the chain via the RAW
+    single-hop reader (``org_extends`` — reads ``org.yaml``'s ``extends:`` with
+    NO recursion, NO merge) so the two dedicated rules fire with precise,
+    actionable messages, independent of ``org_extends_chain``'s own recursion
+    (which raises + would surface as a generic crash in the cycle-safe runtime
+    loaders). A parent that is no org, or an org without ``AGENTS.md`` (not a
+    valid base), fires ``org-extends-resolvable``; a cycle fires
+    ``org-extends-acyclic``. Returns ``[]`` for an org with no ``extends:``
+    (the common case). Callers skip the inherited-roster read when this returns
+    non-empty so a broken chain doesn't double-report through ``org_agent_slugs``
+    (which falls back to ``[name]`` anyway)."""
+    v: list[Violation] = []
+    chain: list[str] = [name]
+    visited: set[str] = {name}
+    cur = name
+    while True:
+        parent = org_extends(cur)
+        if parent is None:
+            return v  # chain terminates cleanly (no extends)
+        if parent in visited:
+            v.append(Violation(
+                "error", "org-extends-acyclic",
+                f"{name}: extends cycle detected ({' -> '.join(chain)} -> {parent})"))
+            return v
+        try:
+            pdir = _org_path(parent)
+        except FileNotFoundError:
+            v.append(Violation(
+                "error", "org-extends-resolvable",
+                f"{name}: extends {parent!r} -> no such org "
+                f"(chain: {' -> '.join(chain)} -> {parent})"))
+            return v
+        if not (pdir / "AGENTS.md").is_file():
+            v.append(Violation(
+                "error", "org-extends-resolvable",
+                f"{name}: extends {parent!r} -> {parent}/AGENTS.md missing "
+                f"(not a valid base org; chain: {' -> '.join(chain)} -> {parent})"))
+            return v
+        chain.append(parent)
+        visited.add(parent)
+        cur = parent
+
+
 def check_org(name: str) -> list[Violation]:
     """Validate one org's bundle — fully offline (no server, no tokens).
 
@@ -248,8 +295,28 @@ def check_org(name: str) -> list[Violation]:
             f"{name}: AGENTS.md carries YAML frontmatter — the roster must "
             f"live in orgs/{name}/org.yaml and AGENTS.md must be prose-only"))
 
+    # Phase 5 — validate the ``extends:`` chain FIRST (specific rules), before
+    # the inherited-roster read below. A broken chain reports
+    # ``org-extends-resolvable`` / ``org-extends-acyclic`` here; the runtime
+    # ``org_agent_slugs`` is cycle-safe (falls back to ``[name]``) so it never
+    # crashes — this walker surfaces the real fault with a precise message.
+    v.extend(_org_extends_chain_violations(name))
+
+    # Safeguard S6 — policy.yaml is NEVER inherited (each org owns its egress;
+    # security boundary). A child that ``extends:`` a parent but ships no OWN
+    # policy.yaml runs with NO egress ACL — surprising + a likely footgun. Warn
+    # (not error): an org legitimately MAY run wide-open by choice; this just
+    # forces the choice to be explicit. Skipped when the child has no parent.
+    if org_extends(name) is not None and not (org_dir / "policy.yaml").is_file():
+        v.append(Violation(
+            "warn", "org-extends-policy",
+            f"{name}: extends a parent but ships no own policy.yaml — policy "
+            f"is NOT inherited (each org owns its egress). Add a policy.yaml, "
+            f"or confirm this org should run with no egress ACL."))
+
     # Read slugs from org.yaml (the only valid roster source).
     org_yaml = org_dir / "org.yaml"
+    shape_ok = True
     if org_yaml.is_file():
         data = yaml.safe_load(org_yaml.read_text()) or {}
         if not isinstance(data, dict):
@@ -257,6 +324,7 @@ def check_org(name: str) -> list[Violation]:
                 "error", "org-yaml-shape",
                 f"{name}: org.yaml top-level must be a mapping, "
                 f"got {type(data).__name__}"))
+            shape_ok = False
             slugs: list[str] = []
         else:
             slugs = _parse_list(data.get("agents"))
@@ -267,6 +335,18 @@ def check_org(name: str) -> list[Violation]:
     else:
         # No org.yaml but AGENTS.md has frontmatter — already reported above.
         slugs = _parse_list(fm.get("agents", ""))
+
+    # Phase 5 — the EFFECTIVE roster is the chain-inherited union
+    # (parent ``agents:`` ∪ own) — what the runtime actually delegates to. Used
+    # for agent-resolution (Rule 3) + tool-resolution (Rule 4) so an INHERITED
+    # slug is validated the same as an own one. Cycle-safe: falls back to own
+    # ``slugs`` on a broken chain or malformed org.yaml (both already reported).
+    roster: list[str] = slugs
+    if shape_ok:
+        try:
+            roster = org_agent_slugs(name)
+        except Exception:
+            roster = slugs
 
     # Permanent tripwire (Phase 18.A; no-legacy-left-behind): dev-bot is the
     # Claude-Code-equivalent CODING org — the CTO does all the thinking and
@@ -316,9 +396,12 @@ def check_org(name: str) -> list[Violation]:
                     "(dev-bot-no-general-subagent) cannot see"))
 
     # Rule 3: every slug resolves to a valid agent .md (org-local or _shared)
-    # with required frontmatter keys + a non-empty body (system_prompt).
+    # with required frontmatter keys + a non-empty body (system_prompt). Phase 5:
+    # iterates the INHERITED roster (``roster``), so an agent inherited from a
+    # parent via ``extends:`` is resolved through the chain-aware search dirs
+    # (child-local → each ancestor → _shared) and validated here too.
     agent_subagents: dict[str, dict[str, Any]] = {}
-    for slug in slugs:
+    for slug in roster:
         # Phase 2: validate the ``extends:`` chain FIRST (specific rules), before
         # the recursive merge in ``_load_agent_subagent`` raises a generic
         # ``agent-resolves``. A broken chain skips the merge so the same fault

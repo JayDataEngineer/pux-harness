@@ -95,6 +95,18 @@ def _org_path(name: str) -> Path:
     return _aloaders._org_path(name, _orgs_dir().parent)
 
 
+def org_extends(name: str) -> str | None:
+    """This org's single-hop ``extends:`` parent (raw read of ``org.yaml``), or
+    ``None``. Phase 5 org inheritance. Thin delegate to ``pux_harness.kit.loaders``."""
+    return _aloaders.org_extends(name, _orgs_dir().parent)
+
+
+def org_extends_chain(name: str) -> list[str]:
+    """The org's inheritance chain, root→child. RAISES on a cycle / unresolvable
+    parent. Phase 5 org inheritance. Thin delegate to ``pux_harness.kit.loaders``."""
+    return _aloaders.org_extends_chain(name, _orgs_dir().parent)
+
+
 def _agent_search_dirs(org: str) -> list[Path]:
     """Directories searched for an agent ``<slug>.md``, org-local first then
     shared. Single source of truth — ``contract.py`` re-exports / monkeypatches
@@ -176,9 +188,14 @@ def load_org_prompt(name: str) -> str:
 
 
 def build_system_prompt(org: str) -> str:
-    """root AGENTS.md + org overlay + harness addendum (mirrors pi-mono's
-    append-org-to-root assembly, plus the deepagents terminology bridge)."""
-    return f"{load_root_prompt()}\n\n{load_org_prompt(org)}{_ADDENDUM}"
+    """root AGENTS.md + the chain-inherited org overlay + harness addendum
+    (mirrors pi-mono's append-org-to-root assembly, plus the deepagents
+    terminology bridge). Phase 5: the overlay is the parent's + own AGENTS.md
+    concatenated (own last) when the org ``extends:`` a parent — read via the
+    kit's cycle-aware ``_chain_overlay``. For a non-extending org, byte-identical
+    to ``root + own + addendum``."""
+    overlay = _aloaders._chain_overlay(org, _orgs_dir().parent)
+    return f"{load_root_prompt()}\n\n{overlay}{_ADDENDUM}"
 
 
 def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:

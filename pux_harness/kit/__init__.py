@@ -37,6 +37,8 @@ from .loaders import (
     load_org_prompt,
     load_root_prompt,
     org_agent_slugs,
+    org_extends,
+    org_extends_chain,
 )
 
 __all__ = [
@@ -44,6 +46,8 @@ __all__ = [
     "load_subagents",
     "discover_orgs",
     "org_agent_slugs",
+    "org_extends",
+    "org_extends_chain",
     "load_root_prompt",
     "load_org_prompt",
     "build_system_prompt",
