@@ -77,6 +77,7 @@ from typing import Any
 import yaml
 
 from pux_harness.sandbox import policy as policy_mod
+from pux_harness.kit import _paths
 from pux_harness.agent import profile as profile_mod
 from pux_harness.agent import model as model_mod
 from pux_harness.agent import stack as stack_mod
@@ -1231,6 +1232,62 @@ def _no_load_skill_tool() -> list[Violation]:
     return []
 
 
+def _pux_namespace_resolvable() -> list[Violation]:
+    """Every ``pux:`` reference resolves against the shipped library bases or
+    ``$PUX_ORG_PATHS`` (Phase 7 — the cross-project reuse contract). A dangling
+    ``pux:`` is a HARD error: the namespace is the only way to pull a shipped
+    org/agent without vendoring, so an unresolved one would silently fall back
+    to nothing (the local search never matches a ``pux:`` token).
+
+    Scans three surfaces for ``pux:`` tokens:
+
+    1. each org's ``org.yaml extends:`` — a ``pux:<base>`` library base parent
+       (must resolve to ``kit/bases/<base>/``);
+    2. each org's effective roster ``agents:`` — a ``pux:<slug>`` library agent
+       (must resolve to some base's ``agents/<slug>.md``);
+    3. each agent ``.md`` frontmatter ``extends:`` — a ``pux:<slug>`` base agent
+       (same resolution).
+
+    The org-extends case (1) is ALSO caught by ``org-extends-resolvable`` with a
+    generic message; this rule adds the precise namespace diagnosis + covers the
+    agent-slug cases (2/3) no other rule reaches."""
+    v: list[Violation] = []
+    bases = _paths.library_bases_dir()
+    # (1) + (2): org extends + roster agent slugs.
+    for org in discover_orgs():
+        parent = org_extends(org)
+        if _paths.is_pux_namespace(parent) and not (bases / _paths.strip_namespace(parent)).is_dir():
+            v.append(Violation(
+                "error", "pux-namespace-resolvable",
+                f"{org}: extends {parent!r} -> no such library base "
+                f"(kit/bases/{_paths.strip_namespace(parent)}/ not found)"))
+        for slug in org_agent_slugs(org):
+            if _paths.is_pux_namespace(slug) and _paths.resolve_library_agent(slug) is None:
+                v.append(Violation(
+                    "error", "pux-namespace-resolvable",
+                    f"{org}: roster agent {slug!r} -> no such library agent "
+                    f"(no kit/bases/*/agents/{_paths.strip_namespace(slug)}.md)"))
+    # (3): agent frontmatter extends — scan every agent source file.
+    agent_dirs = [_orgs_dir() / "_shared" / "agents"]
+    for org in discover_orgs():
+        try:
+            agent_dirs.append(_org_path(org) / "agents")
+        except FileNotFoundError:
+            continue
+    for adir in agent_dirs:
+        if not adir.is_dir():
+            continue
+        for md in sorted(adir.glob("*.md")):
+            fm, _ = _split_frontmatter(md.read_text())
+            ext = fm.get("extends")
+            if _paths.is_pux_namespace(ext) and _paths.resolve_library_agent(ext) is None:
+                v.append(Violation(
+                    "error", "pux-namespace-resolvable",
+                    f"{md.name}: extends {ext!r} -> no such library agent "
+                    f"(no kit/bases/*/agents/{_paths.strip_namespace(ext)}.md)"))
+    return v
+
+
 def check_harness() -> list[Violation]:
     """Rule 6 (no hardcoded org->agent manifest) + rule 7 (no orphan agents)
     + permanent legacy tripwires. Global — not per-org."""
@@ -1262,6 +1319,7 @@ def check_harness() -> list[Violation]:
     v.extend(_kit_import_isolation())
     v.extend(_no_harness_profile_registration())
     v.extend(_no_load_skill_tool())
+    v.extend(_pux_namespace_resolvable())
     return v
 
 

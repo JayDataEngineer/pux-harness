@@ -1,0 +1,10 @@
+# Sensible default profile for the co-pilot kit base.
+#
+# Inherited via Phase 5 deep-merge (root→child; own wins). A child org's
+# profile.yaml is deep-merged on top of this, so a consumer only overrides the
+# keys it wants to change. policy.yaml is NEVER inherited (security — each org
+# owns its egress); a consumer must ship its own.
+system_prompt_suffix: |
+  Use the `copilot-helper` specialist for any concrete coding task (read,
+  edit, run, verify). Delegate with a sharp definition of done; read the
+  evidence it returns before you report the task complete.

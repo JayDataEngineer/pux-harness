@@ -31,6 +31,8 @@ from typing import Any
 
 import yaml
 
+from . import _paths
+
 
 # --- pure helpers ----------------------------------------------------------
 
@@ -91,15 +93,12 @@ def _specialists_dir(project_root: Path) -> Path:
 
 
 def _org_path(name: str, project_root: Path) -> Path:
-    """Resolve an org's directory — top-level ``orgs/`` first, then
-    ``orgs/specialists/``. Raises ``FileNotFoundError`` if neither exists."""
-    top = _orgs_dir(project_root) / name
-    if top.is_dir():
-        return top
-    spec = _specialists_dir(project_root) / name
-    if spec.is_dir():
-        return spec
-    raise FileNotFoundError(f"org {name!r} not found in orgs/ or orgs/specialists/")
+    """Resolve an org's directory across ALL roots — the ONE org-directory
+    resolver. Delegates to ``_paths.search_org_dir`` so a ``pux:<base>`` name
+    resolves against the shipped library bases and a bare name searches the
+    project's ``orgs/`` (top-level, then ``specialists/``) plus every
+    ``$PUX_ORG_PATHS`` root. Raises ``FileNotFoundError`` if no root has it."""
+    return _paths.search_org_dir(name, project_root)
 
 
 # --- org inheritance (Phase 5 — ``org.yaml extends:``) ---------------------
@@ -204,19 +203,24 @@ def _agent_search_dirs(org: str, project_root: Path) -> list[Path]:
     Phase 5 — chain-aware: walks the inheritance chain child→root
     (``_resolved_org_chain`` reversed), appending each ancestor's ``agents/``
     dir, so an inherited slug whose ``<slug>.md`` lives in a parent's
-    ``agents/`` resolves. Cycle-safe (falls back to ``[org]``). Checks both
-    ``orgs/<org>/agents`` and ``orgs/specialists/<org>/agents`` per org (the
-    latter holds orgs nested under ``specialists/``). For a non-extending org
-    the chain is ``[org]`` → byte-identical to the pre-Phase-5 list."""
-    orgs = _orgs_dir(project_root)
+    ``agents/`` resolves. Cycle-safe (falls back to ``[org]``).
+
+    Phase 7 — each ancestor resolves through ``_org_path`` (the ONE resolver),
+    so a ``pux:`` ancestor (a library base) contributes the BASE's own
+    ``agents/`` dir, and a ``$PUX_ORG_PATHS`` org contributes its own. The
+    ``_shared`` fallback stays PROJECT-LOCAL (the consumer app's shared agents).
+    For a non-extending local org the chain is ``[org]`` → byte-identical to
+    the pre-Phase-7 list."""
     chain = _resolved_org_chain(org, project_root)  # root→child
     local: list[Path] = []
     for ancestor in reversed(chain):  # child→root (child's agents win)
-        for candidate in (orgs / ancestor / "agents",
-                          _specialists_dir(project_root) / ancestor / "agents"):
-            if candidate.is_dir():
-                local.append(candidate)
-    return [*local, orgs / "_shared" / "agents"]
+        try:
+            adir = _org_path(ancestor, project_root) / "agents"
+        except FileNotFoundError:
+            continue  # ancestor doesn't resolve (minimal fixture / broken chain)
+        if adir.is_dir():
+            local.append(adir)
+    return [*local, _orgs_dir(project_root) / "_shared" / "agents"]
 
 
 def _read(rel: str, project_root: Path) -> str:
@@ -227,12 +231,16 @@ def _read(rel: str, project_root: Path) -> str:
 # --- org discovery + roster ------------------------------------------------
 
 def discover_orgs(project_root: Path) -> list[str]:
-    """Sorted names of every org dir containing ``AGENTS.md``. Scans both
-    ``orgs/`` (top-level orgs) and ``orgs/specialists/`` (nested orgs)."""
-    return sorted(
-        _scan_orgs(_orgs_dir(project_root))
-        + _scan_orgs(_specialists_dir(project_root))
-    )
+    """Sorted names of every org dir containing ``AGENTS.md``. Scans the
+    project's ``orgs/`` (top-level) + ``orgs/specialists/`` (nested), then each
+    ``$PUX_ORG_PATHS`` root (top-level + its ``specialists/``). Library bases
+    (``pux:``) are NOT auto-discovered — they're opt-in via the namespace, so a
+    consumer app's org list stays its own. De-duped + sorted."""
+    names: list[str] = []
+    for root in [_orgs_dir(project_root), *_paths.extra_org_roots()]:
+        names.extend(_scan_orgs(root))
+        names.extend(_scan_orgs(root / "specialists"))
+    return sorted(set(names))
 
 
 def _own_org_agent_slugs(name: str, project_root: Path) -> list[str]:
@@ -432,9 +440,20 @@ def _load_agent_spec(
     are the delta vocabulary). A cycle raises ``ValueError``; an unresolvable
     base raises ``FileNotFoundError`` — both fail loud (the contract surfaces
     them as ``agent-extends-acyclic`` / ``agent-extends-resolvable``).
+
+    Phase 7 — a ``pux:``-namespaced slug (roster entry or ``extends:``) resolves
+    ONLY against the library bases' ``agents/`` dirs (``_paths.library_base_agent_dirs``),
+    so a consumer app pulls a shipped agent without vendoring it. The cycle guard
+    uses the namespaced slug as-is, so a ``pux:`` base cycle raises loud too.
     ``_chain`` is the ordered recursion guard (internal — not for callers)."""
-    for d in _agent_search_dirs(org, project_root):
-        path = d / f"{slug}.md"
+    pux = _paths.is_pux_namespace(slug)
+    look = _paths.strip_namespace(slug) if pux else slug
+    search_dirs = (
+        _paths.library_base_agent_dirs() if pux
+        else _agent_search_dirs(org, project_root)
+    )
+    for d in search_dirs:
+        path = d / f"{look}.md"
         if path.is_file():
             fm, body = _split_frontmatter(path.read_text())
             extends = fm.pop("extends", None)
@@ -452,8 +471,13 @@ def _load_agent_spec(
                     raise ValueError(msg)
                 base = _load_agent_spec(extends, org, project_root, (*_chain, slug))
                 if base is None:
-                    searched = [str(p / f"{extends}.md")
-                                for p in _agent_search_dirs(org, project_root)]
+                    base_dirs = (
+                        _paths.library_base_agent_dirs()
+                        if _paths.is_pux_namespace(extends)
+                        else _agent_search_dirs(org, project_root)
+                    )
+                    searched = [str(p / f"{_paths.strip_namespace(extends)}.md")
+                                for p in base_dirs]
                     msg = (
                         f"agent {slug!r}: extends {extends!r} -> no such agent "
                         f"(searched {searched})"
