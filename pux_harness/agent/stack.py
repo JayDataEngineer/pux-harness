@@ -80,7 +80,11 @@ from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
 from pux_harness.context.session_guide import SessionGuideMiddleware
 from pux_harness.sandbox.tools import build_grader_tools
-from pux_harness.sandbox.tools.declared import build_declared_tools
+from pux_harness.sandbox.tools.declared import (
+    build_declared_tools,
+    build_script_redirects,
+    load_declared_specs,
+)
 
 __all__ = [
     "Scope",
@@ -175,8 +179,33 @@ class StackCtx:
 # order (routing, then session_guide; rubric is appended after the baseline).
 
 
-def _build_routing(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
-    return RoutingMiddleware()
+def _build_routing(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
+    """RoutingMiddleware, fed the org's declared-script redirects so a script
+    exposed as a typed ``pux_sandbox_*`` tool is taken OUT of the agent's exec
+    surface (the exec-guard). The model that declares a tool must reach it via
+    the typed tool — not a raw ``execute("python3 <script> …")`` — so context
+    carries ONE representation of the capability and the weak-model reliability
+    bridge is enforced, not optional.
+
+    Empty for orgs that declare nothing → byte-identical routing behavior.
+    ``routing`` is default-on for every supervisor (``DEFAULT_SUPERVISOR``) and
+    scoped SUPERVISOR-only (where declared tools live), so the guard is
+    automatic and needs no per-org opt-in. The declared tool's own ``func``
+    exec's in-container DIRECTLY (not a tool call), so it is never intercepted —
+    agent-via-execute is blocked, declared-tool-internal-exec runs.
+
+    Constructed with no args then configured post-hoc (NOT via the constructor)
+    so the many stack/profile tests that stub ``stack.RoutingMiddleware`` as a
+    zero-arg ``lambda: "ROUTE"`` sentinel keep working unchanged — the
+    ``hasattr`` guard skips the config when the symbol was substituted (a real
+    RoutingMiddleware always carries ``declared_redirects`` from ``__init__``).
+    The real config path is exercised by the routing-guard tests + the live
+    proof, so a future attribute rename is caught there, not silently here."""
+    mw = RoutingMiddleware()
+    if hasattr(mw, "declared_redirects"):
+        specs = load_declared_specs(_org_path(ctx.org) / "sandbox")
+        mw.declared_redirects = build_script_redirects(specs)
+    return mw
 
 
 def _build_session_guide(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:

