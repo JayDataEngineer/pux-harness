@@ -1,0 +1,107 @@
+"""Unified thread store — the ONE owner of the persistent checkpointer.
+
+Every server-side runtime (``serve`` / ``acp`` / ``direct``) builds its per-org
+graph with the checkpointer from :func:`open_thread_store`, so a thread created
+by ``pux direct`` is visible to ``pux show`` / ``pux resume`` (the server), and
+an ACP session's checkpoints survive a process restart. All share the SAME
+``.pux/agent-protocol.sqlite`` + the ``pux_threads(thread_id, org, metadata,
+created_at)`` index that maps a thread_id → the org whose graph owns it.
+
+**Critical detail (verified from
+``langgraph/checkpoint/sqlite/aio.py``):** ``AsyncSqliteSaver.from_conn_string``
+opens its OWN aiosqlite connection. A ``PRAGMA busy_timeout`` set on a SEPARATE
+``pux_threads`` connection would NOT apply to the saver's writes — so two
+processes (``pux direct`` + ``pux serve``) hitting the same DB would intermittently
+raise ``database is locked``. :func:`open_thread_store` opens ONE connection,
+sets WAL + ``busy_timeout=5000`` on it, then constructs ``AsyncSqliteSaver(conn)``
+(the documented raw form) so the saver and the index share the same hardened
+connection. ``tests/test_threads.py`` proves the multi-process case.
+
+The TUI (``pux tui`` / dcode) is intentionally NOT a consumer — it owns its own
+``~/.deepagents/`` state and cannot be pointed at an external server.
+"""
+from __future__ import annotations
+
+import json
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from pux_harness.kit._paths import project_root
+
+PROJECT_ROOT = project_root()
+PUX_API_DB = Path(os.environ.get(
+    "PUX_API_DB", str(PROJECT_ROOT / ".pux" / "agent-protocol.sqlite")))
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class ThreadStore:
+    """The shared checkpointer + the ``pux_threads`` index, one connection.
+
+    ``saver`` is the langgraph checkpointer every graph is built against.
+    ``db`` is the SAME aiosqlite connection the saver holds (the raw
+    ``AsyncSqliteSaver(conn)`` form), so the WAL + ``busy_timeout`` pragmas set
+    at open cover both the saver's writes and the index's.
+    """
+
+    saver: AsyncSqliteSaver
+    db: aiosqlite.Connection
+
+    async def register_thread(
+        self, thread_id: str, org: str, metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a thread in the ``pux_threads`` index.
+
+        Idempotent on ``thread_id`` (``INSERT OR IGNORE``) so a caller resuming
+        an existing thread (``pux direct --thread <id>``) can re-register it
+        without a duplicate-key failure.
+        """
+        await self.db.execute(
+            "INSERT OR IGNORE INTO pux_threads (thread_id, org, metadata, created_at) "
+            "VALUES (?,?,?,?)",
+            (thread_id, org, json.dumps(metadata or {}), _now()),
+        )
+        await self.db.commit()
+
+
+@asynccontextmanager
+async def open_thread_store(
+    db_path: Path | None = None,
+) -> AsyncIterator[ThreadStore]:
+    """Open the ONE shared checkpointer + thread index.
+
+    Opens a single aiosqlite connection, sets ``WAL`` + ``busy_timeout=5000`` on
+    it, runs ``saver.setup()`` (creates the ``checkpoints`` / ``writes`` /
+    ``migration`` tables), creates the ``pux_threads`` index table, then yields a
+    :class:`ThreadStore` sharing that connection. The connection closes on
+    context exit.
+
+    Reads the module-level :data:`PUX_API_DB` at CALL time (not import time), so
+    tests can monkeypatch ``pux_harness.threads.PUX_API_DB`` hermetically.
+    """
+    path = db_path if db_path is not None else PUX_API_DB
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = await aiosqlite.connect(str(path))
+    try:
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA busy_timeout=5000")
+        saver = AsyncSqliteSaver(conn)
+        await saver.setup()
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS pux_threads ("
+            "thread_id TEXT PRIMARY KEY, org TEXT, metadata TEXT, created_at TEXT)"
+        )
+        await conn.commit()
+        yield ThreadStore(saver=saver, db=conn)
+    finally:
+        await conn.close()

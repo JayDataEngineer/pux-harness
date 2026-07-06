@@ -1,0 +1,46 @@
+# The model spec — single source of truth for which model fills each role.
+# (Phase 17.B.0)
+#
+# WHY THIS FILE EXISTS
+#   No model id is hardcoded anywhere else in the harness. Every consumer asks
+#   `get_model(role=..., org=...)` (harness/pux_harness/agent/model.py) and this
+#   file decides which concrete model id that role resolves to. A cloner
+#   repoints at their own provider by editing THIS FILE (or overriding per-org
+#   in orgs/<name>/profile.yaml under `models:`, or per-subagent in an agent's
+#   frontmatter `model:`). One file, no code edits, no scattered hardcodes.
+#
+# RESOLUTION ORDER for a role (highest priority first)
+#   1. subagent frontmatter `model:`   — agent-level (subagents only; a literal id)
+#   2. org profile.yaml `models:` map  — org-level role override
+#   3. env PUX_<ROLE>_MODEL             — deployment-level (e.g. PUX_GRADER_MODEL)
+#   4. `roles:` below                   — these shipped defaults
+#
+# THE ROLES
+#   base_model       the primary driving agent (the CTO). The shipped default is
+#                    mimo-v2.5 (cheap, capable) so a cloner gets a working agent
+#                    with no edits; bump to a heavier reasoning model (e.g.
+#                    glm-5.2) here if your driving agent should think harder.
+#   worker_model     default for subagents/specialists whose frontmatter omits
+#                    `model:`. Decoupled from base so an org can set base!=worker.
+#   multimodal_model vision — describe_image PRIMARY path (decoupled from base
+#                    so an org can pin a vision model != the driver).
+#   grader_model     the RubricMiddleware verify-gate grader (Phase 17.B). Runs
+#                    up to max_iterations × per agent output, so the CHEAP model
+#                    is the right default; bump per-org where a rubric needs more
+#                    reasoning.
+
+provider:
+  # OpenAI-compatible endpoint. Override per-deployment with OPENCODE_BASE_URL.
+  base_url: https://opencode.ai/zen/go/v1
+  # Name of the env var that holds the api key (read at call time, never persisted).
+  api_key_env: OPENCODE_API_KEY
+  # Generation defaults applied to every role. Override per-deployment with
+  # PUX_MAX_TOKENS / PUX_TEMPERATURE.
+  max_tokens: 8192
+  temperature: 0.2
+
+roles:
+  base_model: mimo-v2.5
+  worker_model: mimo-v2.5
+  multimodal_model: mimo-v2.5
+  grader_model: mimo-v2.5

@@ -1,0 +1,179 @@
+"""BrowserVisionMiddleware — surface post-action screenshots as native image
+blocks so a multimodal driver (the shipped default, mimo-v2.5) can SEE the page
+after each action and decide the next step. This is the vision-in-the-loop
+"look → reason → act → look" loop the SOTA browser agents (computer-use,
+browser-use) run.
+
+THE BLOCK
+    deepagents' canonical image ContentBlock is ``{"type":"image","base64":...,
+    "mime_type":...}`` — the same shape ``read_file`` emits and
+    ``_media._media_content_block`` builds. ``ChatOpenAI`` translates it to the
+    provider ``image_url`` form. We reuse that EXACT shape.
+
+WHY A COMPANION HumanMessage, NOT AN IMAGE IN THE ToolMessage
+    The OpenAI-style tool-result role accepts a STRING content widely, but
+    MULTIMODAL tool-result content is provider/gateway-dependent: the shipped
+    OpenCode-Zen-Go gateway upstream-rejects (HTTP 400) an ``image_url`` block
+    inside a tool-role message, even though it accepts the SAME image block in
+    a user-role message (proven live against mimo-v2.5: it reads example.com
+    correctly from a HumanMessage image, 400s from a ToolMessage image). So we
+    keep the ToolMessage text-only (the tool_call still gets its paired result)
+    and emit a SECOND message — a HumanMessage carrying the image — right after
+    it. The model sees ``[...tool_result(text), human(screenshot)]``, which the
+    gateway accepts and the model reads. This is the universally-compatible
+    form (images-in-user-messages work on every vision provider); image-in-tool
+    does not.
+
+THE SEAM
+    ``wrap_tool_call(request, handler)`` runs AFTER the framework bound the
+    correct ``tool_call_id`` to the result ``ToolMessage``. We return a
+    ``Command(update={"messages": [text_tool_message, human_image_message]})``
+    — the canonical "tool emits multiple messages" shape
+    (deepagents/middleware/subagents.py::_return_command_with_state_update).
+    The text ToolMessage keeps its tool_call_id so the reducer still pairs it
+    with the pending tool call; the HumanMessage is appended after. A Command
+    is not a text ToolMessage, so ``ContextMiddleware._is_text_tm`` returns
+    False and it passes through offload untouched. For the same reason this
+    middleware mounts INNERMOST (last in the stack): ``handler(request)`` then
+    returns the RAW tool string before ``ContextMiddleware`` could offload it,
+    so ``screenshot_path`` is still inline to find.
+
+DATA-DRIVEN
+    We attach iff the tool's JSON result carries a ``screenshot_path`` — every
+    page-mutating browser endpoint already returns one. No per-tool allowlist.
+
+HONEST FAILURE
+    A fetch failure leaves the ORIGINAL text ToolMessage in place (no Command,
+    no image). The image is an enhancement, never a replacement; a missing
+    image is honest, never a silent fallback that pretends vision works.
+
+GATING
+    Default ON — the shipped ``base_model`` is mimo-v2.5 (multimodal). A cloner
+    who pins a TEXT-only driver sets ``PUX_BROWSER_VISION=0``.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+from typing import Any
+
+from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.messages import HumanMessage, ToolMessage
+from langgraph.types import Command
+
+# Every browser specialist tool is named ``pux_sandbox_browser_<slug>``.
+_BROWSER_PREFIX = "pux_sandbox_browser_"
+
+# Cap the fetch so a pathological path can't hang the agent — a screenshot over
+# this is dropped (text result still ships).
+_MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024  # 4 MiB
+
+
+def _screenshot_b64(exec_client: Any, path: str) -> str | None:
+    """Read ``path`` out of the sandbox container as base64.
+
+    ``base64 -w0`` (coreutils, always present in the image) streams the file to
+    stdout with no line wrapping; the host decodes nothing here — the gateway
+    wants the raw base64 in the image block. Returns ``None`` on any failure so
+    the caller skips the image honestly."""
+    if not path or not isinstance(path, str):
+        return None
+    try:
+        out, code = exec_client.exec(f"base64 -w0 {shlex.quote(path)}")
+    except Exception:
+        return None
+    if code:
+        return None
+    b64 = (out or "").strip()
+    if not b64:
+        return None
+    # base64 inflates ~1.33×; reject anything decoding past the cap.
+    if len(b64) > _MAX_SCREENSHOT_BYTES * 4 // 3:
+        return None
+    return b64
+
+
+def _mime_for(path: str) -> str:
+    p = path.lower()
+    if p.endswith(".jpg") or p.endswith(".jpeg"):
+        return "image/jpeg"
+    if p.endswith(".webp"):
+        return "image/webp"
+    return "image/png"  # sb_server only ever writes .png screenshots
+
+
+class BrowserVisionMiddleware(AgentMiddleware):
+    """Attach each browser tool's screenshot as a native image block, delivered
+    as a companion HumanMessage alongside the text ToolMessage result."""
+
+    def __init__(self, exec_client: Any, *, enabled: bool = True) -> None:
+        self.exec_client = exec_client
+        self.enabled = enabled
+
+    # request is langchain's ToolCallRequest (or a SimpleNamespace stand-in in
+    # tests) — read tool_call defensively, mirroring ContextMiddleware.
+    @staticmethod
+    def _tool_name(request: Any) -> str:
+        tc = getattr(request, "tool_call", None) or {}
+        if isinstance(tc, dict):
+            name = tc.get("name")
+            return str(name) if name is not None else "tool"
+        return "tool"
+
+    def _enrich(self, result: Any) -> Any:
+        """Return ``Command([text_tool_message, human_image_message])`` iff
+        ``result`` is a browser ToolMessage whose JSON carries a screenshot_path
+        we can fetch. Otherwise return ``result`` unchanged."""
+        if not isinstance(result, ToolMessage):
+            return result
+        if isinstance(result.content, list):
+            return result  # already multimodal — another layer enriched it
+        content = result.content if isinstance(result.content, str) else ""
+        if not content:
+            return result
+        try:
+            payload = json.loads(content)
+        except (ValueError, TypeError):
+            return result  # not JSON (e.g. an error string) — no image to attach
+        if not isinstance(payload, dict):
+            return result
+        path = payload.get("screenshot_path")
+        if not isinstance(path, str) or not path:
+            return result
+        b64 = _screenshot_b64(self.exec_client, path)
+        if not b64:
+            return result  # fetch failed — ship the text result unchanged
+        # The companion HumanMessage: a short label + the native image block.
+        # Label names the tool_call so the model reads this as "the screenshot
+        # that tool produced", not a fresh user interjection.
+        human = HumanMessage(content=[
+            {"type": "text",
+             "text": f"[screenshot result for {result.name} tool_call {result.tool_call_id}]"},
+            {"type": "image", "base64": b64, "mime_type": _mime_for(path)},
+        ])
+        # Keep the text ToolMessage (tool_call_id paired) THEN append the image.
+        return Command(update={"messages": [result, human]})
+
+    def wrap_tool_call(self, request, handler):  # type: ignore[no-untyped-def]
+        if (
+            not self.enabled
+            or not self._tool_name(request).startswith(_BROWSER_PREFIX)
+        ):
+            return handler(request)
+        return self._enrich(handler(request))
+
+    async def awrap_tool_call(self, request, handler):  # type: ignore[no-untyped-def]
+        if (
+            not self.enabled
+            or not self._tool_name(request).startswith(_BROWSER_PREFIX)
+        ):
+            return await handler(request)
+        result = await handler(request)
+        return self._enrich(result)
+
+
+def browser_vision_enabled() -> bool:
+    """Default ON (mimo-v2.5 is the shipped driver and is multimodal). A cloner
+    with a text-only driver sets ``PUX_BROWSER_VISION=0``."""
+    return os.getenv("PUX_BROWSER_VISION", "1") != "0"

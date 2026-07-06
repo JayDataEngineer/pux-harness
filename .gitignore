@@ -1,0 +1,30 @@
+# Dependencies / venvs
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Python bytecode
+*.pyc
+__pycache__/
+*.pyo
+
+# Test / type caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+
+# Environment / secrets
+.env*
+!.env.example
+
+# Harness runtime state (the consumer app owns ``.pux/``; never the library)
+.pux/

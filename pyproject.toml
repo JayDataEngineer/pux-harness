@@ -1,0 +1,47 @@
+[project]
+name = "pux-harness"
+version = "0.1.0"
+description = "deepagents-based Pux harness — the org+skill compiler (slim kit) + the Docker sandbox runtimes."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "deepagents",
+    "deepagents-acp>=0.0.8",
+    "docker>=7.1.0",
+    "fastapi>=0.139.0",
+    "httpx>=0.28.1",
+    "langchain-openai",
+    "langchain-mcp-adapters>=0.3.0",
+    "langgraph-checkpoint-sqlite>=3.1.0",
+    "pyyaml",
+    "uvicorn[standard]>=0.49.0",
+    "copilotkit",
+    "ag-ui-langgraph",
+    "fastmcp>=3.4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+pux = "pux_harness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pux_harness"]
+
+[dependency-groups]
+dev = ["pytest", "ruff", "mypy"]
+
+[tool.pytest.ini_options]
+# The harness repo's own suite: the slim-kit compiler + the org-agnostic
+# machinery (registry, browser-JS, reasoning adapter, model resolver). Tests
+# that need a real ``orgs/`` tree live in the CONSUMER repo (the orchestrator),
+# which installs pux-harness and exercises it against real orgs.
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
