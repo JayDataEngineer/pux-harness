@@ -1,10 +1,17 @@
-"""pux_sandbox_list_skills / pux_sandbox_load_skill — host-FS skill discovery."""
+"""pux_sandbox_list_skills — host-FS skill discovery (the CTO catalog).
+
+Phase 6 unification: the BODY-load path is gone. Native ``SkillsMiddleware``
+(on the supervisor) advertises each skill's name + description in the prompt
+(progressive disclosure), and the agent peeks a body with the native
+``read_file`` — the canonical deepagents path. This module keeps only the
+host-side ``list_skills`` CATALOG (a discovery aid that complements the
+middleware's focused metadata injection by spanning EVERY org's skills, not
+just the active org's + shared). ``pux_sandbox_load_skill`` was removed; the
+``skills-peek-via-read-file`` contract tripwire makes a re-introduction a
+HARD failure.
+"""
 
 from __future__ import annotations
-
-from pathlib import Path
-
-from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
@@ -35,11 +42,12 @@ def _parse_skill(raw: str) -> tuple[str, str]:
 
 _LIST_SKILLS_DESC = (
     "List SKILL.md files under the project's skills roots (the active org's "
-    "skills first, then orgs/_shared/skills). Each skill is operator-authored "
-    "markdown with model-facing instructions (debugging recipes, codebase "
-    "conventions, domain knowledge). Call this when starting work on a project "
-    "to see what specialized guidance is available; then call load_skill to "
-    "read the ones that apply."
+    "skills first, then orgs/_shared/skills, then every other org's skills). "
+    "Each skill is operator-authored markdown with model-facing instructions "
+    "(debugging recipes, codebase conventions, domain knowledge). Call this "
+    "when starting work on a project to see what specialized guidance is "
+    "available; then read_file the ones that apply (the 'path' each entry "
+    "gives is the SKILL.md body)."
 )
 
 
@@ -62,39 +70,4 @@ def _list_skills_tool(org: str | None = None) -> StructuredTool:
     return StructuredTool(
         name=PUX_PREFIX + "list_skills", description=_LIST_SKILLS_DESC,
         args_schema=_NoArgs, func=_run,
-    )
-
-
-class _LoadSkillArgs(BaseModel):
-    name: str = Field(..., description="Skill name (the 'name' field from list_skills)")
-
-
-_LOAD_SKILL_DESC = (
-    "Load one skill's full markdown body by name (use list_skills first to "
-    "discover names). Returns name, description, source path, and the markdown "
-    "content. Read the content carefully — it carries operator-authored "
-    "instructions specific to this project."
-)
-
-
-def _load_skill_tool(org: str | None = None) -> StructuredTool:
-    def _run(name: str) -> str:
-        if not name:
-            return _result({"success": False, "error": "missing required parameter 'name'"})
-        md: Path | None = None
-        for root in _skills_dirs(org):
-            candidate = root / name / SKILL_FILE
-            if candidate.is_file():
-                md = candidate
-                break
-        if md is None:
-            return _result({"success": False, "error": f"skill {name!r} not found"})
-        raw = md.read_text()
-        nm, desc = _parse_skill(raw)
-        body = raw.split("---", 2)[2].strip() if raw.startswith("---") else raw.strip()
-        return _result({"name": nm or name, "description": desc, "path": str(md), "content": body})
-
-    return StructuredTool(
-        name=PUX_PREFIX + "load_skill", description=_LOAD_SKILL_DESC,
-        args_schema=_LoadSkillArgs, func=_run,
     )

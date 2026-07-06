@@ -83,6 +83,7 @@ from pux_harness.agent import stack as stack_mod
 from pux_harness.agent import tool_servers as tool_servers_mod
 from pux_harness.sandbox.tools import (
     NATIVE_FS_TOOLS,
+    SPECIALIST_TOOL_NAMES,
     Category,
     classify_slug,
     prefixed,
@@ -1203,6 +1204,33 @@ def _no_harness_profile_registration() -> list[Violation]:
     return v
 
 
+def _no_load_skill_tool() -> list[Violation]:
+    """Permanent tripwire (Phase 6 skills-peeking unification;
+    no-legacy-left-behind): the ``pux_sandbox_load_skill`` specialist is GONE.
+    Skill bodies are peeked via the native ``read_file`` — the canonical
+    deepagents path, now that native ``SkillsMiddleware`` on the supervisor
+    advertises each skill's name + description (progressive disclosure). The
+    host-side ``pux_sandbox_list_skills`` stays as a CTO discovery catalog; it
+    COMPLEMENTS the middleware, it does not duplicate the body-load.
+
+    A re-introduction (someone re-adds a ``ToolSpec("load_skill", ...)`` to the
+    ``REGISTRY``) is a HARD contract failure, not a silent regression. The check
+    reads ``SPECIALIST_TOOL_NAMES`` — the frozenset of PREFIXED names
+    (``pux_sandbox_*``) DERIVED from the registry — so it fires the instant
+    ``load_skill`` re-enters the registry without a source scan or AST (the
+    registry IS the single source of tool truth; a tool not in it is not a
+    specialist surface)."""
+    if "pux_sandbox_load_skill" in SPECIALIST_TOOL_NAMES:
+        return [Violation(
+            "error", "skills-peek-via-read-file",
+            "pux_sandbox_load_skill was re-added to the tool REGISTRY — skill "
+            "bodies are peeked via the native read_file now (SkillsMiddleware "
+            "advertises name+description; list_skills is the catalog). Remove "
+            "the load_skill ToolSpec.",
+        )]
+    return []
+
+
 def check_harness() -> list[Violation]:
     """Rule 6 (no hardcoded org->agent manifest) + rule 7 (no orphan agents)
     + permanent legacy tripwires. Global — not per-org."""
@@ -1233,6 +1261,7 @@ def check_harness() -> list[Violation]:
     v.extend(_no_duplicate_loaders_in_orgs())
     v.extend(_kit_import_isolation())
     v.extend(_no_harness_profile_registration())
+    v.extend(_no_load_skill_tool())
     return v
 
 

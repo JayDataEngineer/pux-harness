@@ -500,3 +500,35 @@ def _resolve_skills(
             f"{workspace_root}/{p}" if workspace_root else str(project_root / p)
         )
     return out
+
+
+def supervisor_skills_roots(
+    org: str, project_root: Path, workspace_root: str | None = None,
+) -> list[str]:
+    """Skills-ROOT paths for the SUPERVISOR's ``SkillsMiddleware`` — the focused
+    set (``orgs/_shared/skills`` + THIS org's own ``skills/``), existing dirs
+    only, mapped per ``workspace_root`` (host-absolute by default;
+    container-absolute when the harness pins ``/sandbox/workspace``).
+
+    Phase 6 — wires native progressive disclosure on the CTO: ``SkillsMiddleware``
+    injects each root's skill METADATA (name + description) into the supervisor
+    prompt, and the agent then peeks a body via the native ``read_file`` (the
+    canonical path — the ``pux_sandbox_load_skill`` specialist is GONE, killed by
+    the ``skills-peek-via-read-file`` contract tripwire). This is a FOCUSED set —
+    the org's own + shared — NOT the broad every-org catalog
+    ``pux_sandbox_list_skills`` exposes; that tool is a discovery aid that
+    COMPLEMENTS the middleware, it does not duplicate it.
+
+    Reuses ``_resolve_skills``'s validate+map (the candidate dirs are
+    pre-filtered to existing, so the ``KeyError`` never fires). Returns ``[]``
+    when neither root exists — a no-skills org gets ``skills=None`` at the
+    binding and is byte-identical to today (no SkillsMiddleware mounted)."""
+    candidates = [
+        "orgs/_shared/skills",
+        f"orgs/{org}/skills",
+        f"orgs/specialists/{org}/skills",
+    ]
+    existing = [c for c in candidates if (project_root / c).is_dir()]
+    return _resolve_skills(
+        existing, "supervisor", project_root=project_root, workspace_root=workspace_root,
+    )

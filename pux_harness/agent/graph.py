@@ -124,6 +124,11 @@ def build_graph(
         memory=MEMORY_SOURCES,
         subagents=plan.subagents,
         middleware=plan.supervisor_middleware,
+        # Phase 6 — native SkillsMiddleware on the supervisor (progressive
+        # disclosure: skill metadata in the prompt, body via read_file).
+        # ``None`` for a no-skills org (supervisor_skills == []) -> deepagents
+        # mounts no SkillsMiddleware -> byte-identical to the pre-Phase-6 build.
+        skills=plan.supervisor_skills or None,
         backend=memory_backend,
         store=memory_store,
         checkpointer=checkpointer,

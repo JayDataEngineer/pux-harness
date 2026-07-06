@@ -34,7 +34,7 @@ from pux_harness.sandbox.docker_exec import DockerExecClient
 from pux_harness.sandbox.backend import PuxSandboxBackend
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, PUX_GRADER_PREFIX
 from pux_harness.sandbox.tools.python import _python_tool
-from pux_harness.sandbox.tools.skills import _list_skills_tool, _load_skill_tool
+from pux_harness.sandbox.tools.skills import _list_skills_tool
 from pux_harness.sandbox.tools.describe_image import _describe_image_tool
 from pux_harness.sandbox.tools.multimodal import _multimodal_tool, _multimodal_mega_tool
 from pux_harness.sandbox.tools.browser import (
@@ -143,10 +143,12 @@ class ToolDeps:
 # Order is preserved by build_tools → matches the historical build order.
 
 REGISTRY: list[ToolSpec] = [
-    # python + skills
+    # python + skills. Note (Phase 6): there is no ``load_skill`` — skill bodies
+    # are peeked via the native ``read_file`` (SkillsMiddleware advertises each
+    # skill's name + description). The ``skills-peek-via-read-file`` contract
+    # tripwire makes a re-introduction a HARD failure.
     ToolSpec("python", Category.SPECIALIST, Requirements(exec_client=True), _python_tool),
     ToolSpec("list_skills", Category.SPECIALIST, Requirements(org=True), _list_skills_tool),
-    ToolSpec("load_skill", Category.SPECIALIST, Requirements(org=True), _load_skill_tool),
 
     # media (model-primary, declare their caps)
     ToolSpec("describe_image", Category.SPECIALIST,

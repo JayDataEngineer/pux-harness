@@ -62,6 +62,7 @@ from pux_harness.agent.orgs import (
     _build_general_purpose_sub,
     build_system_prompt,
     load_subagents,
+    supervisor_skills_roots,
 )
 from pux_harness.agent.profile import (
     HarnessProfileConfig,
@@ -406,6 +407,11 @@ class StackPlan:
     supervisor_middleware: list[AgentMiddleware]
     supervisor_prompt: str
     subagents: list[dict[str, Any]]
+    # Phase 6 — container-absolute skills-ROOT paths for the supervisor's native
+    # ``SkillsMiddleware`` (progressive disclosure: metadata in the prompt, body
+    # via ``read_file``). ``[]`` for a no-skills org -> ``graph`` binds
+    # ``skills=None`` -> byte-identical to today (no SkillsMiddleware mounted).
+    supervisor_skills: list[str]
 
 
 def build_stack(
@@ -514,6 +520,7 @@ def build_stack(
         supervisor_middleware=supervisor_middleware,
         supervisor_prompt=prompt,
         subagents=subagents,
+        supervisor_skills=supervisor_skills_roots(org),
     )
 
 

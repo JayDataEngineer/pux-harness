@@ -38,17 +38,18 @@ _EXEC = "DUMMY-EXEC"
 
 
 def test_registry_is_non_empty_and_partitioned():
-    """50 tools: 40 specialist + 7 native + 3 grader. Catches an accidental
+    """49 tools: 39 specialist + 7 native + 3 grader. Catches an accidental
     add/drop in any one partition. (Phase 19 added 7 browser specialists:
-    drag/hover/press/click_at/scroll_into_view/a11y/iframe.)"""
+    drag/hover/press/click_at/scroll_into_view/a11y/iframe. Phase 6 REMOVED
+    ``load_skill`` — skill bodies peek via native read_file now.)"""
     counts = {c: 0 for c in Category}
     for spec in REGISTRY:
         assert isinstance(spec, ToolSpec)
         counts[spec.category] += 1
         assert spec.slug, f"empty slug in {spec!r}"
-    assert len(REGISTRY) == 50, counts
+    assert len(REGISTRY) == 49, counts
     assert counts == {
-        Category.SPECIALIST: 40,
+        Category.SPECIALIST: 39,
         Category.NATIVE: 7,
         Category.GRADER: 3,
     }, counts

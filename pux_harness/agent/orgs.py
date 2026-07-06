@@ -162,9 +162,12 @@ conflicts with the org docs above, THIS ADDENDUM wins.
   -> `glob`; `pux_sandbox_file_grep` -> `grep`; and so on. Specialist
   capabilities remain under `pux_sandbox_*` (`pux_sandbox_python`,
   `pux_sandbox_browser_*`, `pux_sandbox_desktop_*`, `pux_sandbox_describe_image`,
-  `pux_sandbox_list_skills`, `pux_sandbox_load_skill`). The workspace is at
-  `/sandbox/workspace/` inside the sandbox container — the project root,
-  bind-mounted. You and every subagent share this same surface.
+  `pux_sandbox_list_skills`). Skill BODIES are peeked with the native
+  `read_file` (the ``SkillsMiddleware`` advertises each skill's name +
+  description in your prompt; `list_skills` is the host-side catalog) — there is
+  no `pux_sandbox_load_skill`. The workspace is at `/sandbox/workspace/` inside
+  the sandbox container — the project root, bind-mounted. You and every
+  subagent share this same surface.
 """
 
 
@@ -249,6 +252,24 @@ def _resolve_skills(raw: Any, slug: str) -> list[str]:
     """
     return _aloaders._resolve_skills(
         raw, slug, project_root=_orgs_dir().parent, workspace_root=_WORKSPACE_ROOT,
+    )
+
+
+def supervisor_skills_roots(org: str) -> list[str]:
+    """Container-absolute skills-ROOT paths for the SUPERVISOR's
+    ``SkillsMiddleware`` — the focused set (``orgs/_shared/skills`` + this org's
+    own ``skills/``), existing dirs only, mapped to ``/sandbox/workspace/...``.
+
+    Phase 6 — native progressive disclosure on the CTO: the middleware injects
+    each root's skill metadata (name + description) into the supervisor prompt;
+    the agent peeks a body via the native ``read_file`` (the canonical path —
+    ``pux_sandbox_load_skill`` is gone). ``[]`` for a no-skills org -> the graph
+    binds ``skills=None`` -> byte-identical to today (no SkillsMiddleware).
+
+    Thin delegate to ``pux_harness.kit.loaders``; project root from
+    ``_orgs_dir()``, workspace root pinned to the harness ``_WORKSPACE_ROOT``."""
+    return _aloaders.supervisor_skills_roots(
+        org, _orgs_dir().parent, _WORKSPACE_ROOT,
     )
 
 
