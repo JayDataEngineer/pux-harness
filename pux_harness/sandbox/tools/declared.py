@@ -265,6 +265,60 @@ def build_declared_tools(org_sandbox_dir: Path, exec_client: Any) -> list[Struct
     return tools
 
 
+# --- exec-guard redirect map (declared ⇒ taken out of `execute`) -----------
+# The invariant this section serves: once a script is exposed as a typed
+# ``pux_sandbox_<name>`` tool, the agent must reach it ONLY through that tool —
+# NOT via a raw ``execute("python3 <script> <subcommand> …")`` shell. The typed
+# path is schema-validated, runs in-container, and is audited; the raw path is
+# none of those and taxes the weak default model (mimo-v2.5) on arg-quoting /
+# CLI-recall. ``build_script_redirects`` produces the (pattern, target) pairs
+# ``RoutingMiddleware`` matches intercepted ``execute``/bash commands against —
+# a match returns a redirect ``ToolMessage`` naming the typed tool WITHOUT
+# running the command. The declared tool's OWN ``func`` calls
+# ``exec_client.exec(cmd)`` directly (not a tool call), so it is never
+# intercepted: agent-via-``execute`` → blocked; declared-tool-internal-exec →
+# runs in-container. That distinction is the seam, and it is free at the
+# middleware layer (verified by reading ``_make_runner``).
+#
+# Pure: returns plain ``(re.Pattern, str)`` tuples so ``RoutingMiddleware``
+# consumes it with NO import of this module — the agent layer wires the two.
+
+
+def build_script_redirects(
+    specs: "list[DeclaredToolSpec]",
+) -> "list[tuple[re.Pattern[str], str]]":
+    """Compile each declared spec into a ``(pattern, target_tool)`` redirect.
+
+    Per-``(script, subcommand)`` matching — the correctness subtlety: block
+    ONLY the invocation a declared tool exposes, not the whole script.
+    ``scan_signals`` wraps ``signals.py score``, so block
+    ``python3 … signals.py score`` but leave ``signals.py rank`` / ``validate``
+    (un-exposed subcommands) exec-able — the agent has no typed alternative for
+    those. A spec with no ``subcommand`` blocks any ``python3 … <script>``
+    invocation (the whole script is the tool's surface).
+
+    Pattern shape: ``\\bpython3?\\b[^\\n]*\\b<script>\\b(\\s+<subcommand>\\b)?``.
+    The ``python3?`` anchor keeps this about SCRIPT invocation (not a doc
+    mention of the bare filename); ``[^\\n]*`` tolerates a ``cd … && python3 …``
+    prefix and an absolute/relative path before the basename; ``\\b`` word
+    boundaries stop ``signals.py`` matching ``my_signals.py`` and stop
+    ``score`` matching ``scoreboard``.
+
+    Returns ``[]`` for an empty spec list (orgs that declare nothing redirect
+    nothing — byte-identical routing behavior). Pure: no routing import, no I/O.
+    """
+    redirects: list[tuple[re.Pattern[str], str]] = []
+    for spec in specs:
+        script = re.escape(spec.script)
+        if spec.subcommand:
+            sub = re.escape(spec.subcommand)
+            pattern = re.compile(rf"\bpython3?\b[^\n]*\b{script}\b\s+{sub}\b")
+        else:
+            pattern = re.compile(rf"\bpython3?\b[^\n]*\b{script}\b")
+        redirects.append((pattern, PUX_PREFIX + spec.name))
+    return redirects
+
+
 # --- validation (offline contract body; no exec_client) --------------------
 
 def _name_taken(full_name: str) -> bool:

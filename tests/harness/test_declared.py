@@ -33,6 +33,7 @@ from pux_harness.sandbox.tools.declared import (
     ArgSpec,
     DeclaredToolSpec,
     build_declared_tools,
+    build_script_redirects,
     declared_tool_names,
     load_declared_specs,
     validate_declared_tools,
@@ -141,6 +142,98 @@ tools:
     # required propagates to the JSON schema
     required = tool.args_schema.model_json_schema().get("required", [])
     assert "ticker" in required and "rank" not in required
+
+
+# --- exec-guard redirect map (declared ⇒ taken out of `execute`) -----------
+# ``build_script_redirects`` compiles each declared spec into a (pattern, target)
+# pair ``RoutingMiddleware`` matches intercepted ``execute``/bash commands
+# against. The correctness crux is per-(script, subcommand) scoping: a declared
+# ``scan_signals`` (wraps ``signals.py score``) must block raw exec of
+# ``signals.py score`` but LEAVE ``signals.py rank``/``validate`` exec-able.
+
+
+def test_redirects_empty_for_no_specs():
+    """No declared tools -> no redirects (byte-identical routing for orgs that
+    declare nothing)."""
+    assert build_script_redirects([]) == []
+
+
+def test_redirects_target_is_prefixed_tool_name():
+    """Each redirect's target is ``pux_sandbox_<name>`` — the typed tool the
+    agent should call instead of the raw script."""
+    redirs = build_script_redirects([_spec(name="scan_signals", subcommand="score")])
+    assert len(redirs) == 1
+    pattern, target = redirs[0]
+    assert target == PUX_PREFIX + "scan_signals"
+    assert pattern.search("python3 signals.py score --ticker AAPL") is not None
+
+
+def test_redirects_match_real_command_shapes():
+    """The pattern tolerates the shapes the model actually emits via ``execute``:
+    a ``cd <dir> && python3 …`` prefix, an absolute/relative path before the
+    basename, flags after the subcommand, and the bare ``python3 … script`` form."""
+    redirs = build_script_redirects([_spec(subcommand="score")])
+    pattern, _ = redirs[0]
+    for cmd in (
+        "python3 signals.py score --ticker AAPL",
+        "cd /sandbox/workspace/orgs/x/sandbox && python3 signals.py score --ticker AAPL",
+        "python3 orgs/specialists/invest/sandbox/signals.py score --ticker AAPL",
+        "python3 ./signals.py score",
+    ):
+        assert pattern.search(cmd) is not None, f"should match: {cmd!r}"
+
+
+def test_redirects_do_not_match_a_different_subcommand():
+    """Per-(script, subcommand) scoping: ``signals.py rank``/``validate`` are
+    NOT exposed by ``scan_signals`` (which wraps only ``score``), so they stay
+    exec-able — the agent has no typed alternative for those."""
+    pattern, _ = build_script_redirects([_spec(subcommand="score")])[0]
+    assert pattern.search("python3 signals.py rank") is None
+    assert pattern.search("python3 signals.py validate") is None
+    assert pattern.search("python3 signals.py") is None  # no subcommand at all
+
+
+def test_redirects_do_not_match_a_different_script():
+    """A redirect for ``signals.py`` must not match ``portfolio.py`` even with
+    the same subcommand — the pattern is anchored on the script filename."""
+    pattern, _ = build_script_redirects([_spec(subcommand="score")])[0]
+    assert pattern.search("python3 portfolio.py score") is None
+
+
+def test_redirects_word_boundaries_stop_false_matches():
+    """``\\b`` keeps the redirect surgical: ``my_signals.py`` is not ``signals.py``
+    (the ``_`` before ``signals`` is a word char → no boundary), and ``score``
+    is not ``scoreboard`` (no boundary after ``score``)."""
+    pattern, _ = build_script_redirects([_spec(subcommand="score")])[0]
+    assert pattern.search("python3 my_signals.py score") is None
+    assert pattern.search("python3 signals.py scoreboard") is None
+
+
+def test_redirects_no_subcommand_blocks_whole_script():
+    """A spec with no ``subcommand`` exposes the whole script, so EVERY
+    ``python3 … <script>`` invocation is redirected — including subcommand-style
+    calls, since the tool owns the script's entire surface."""
+    pattern, _ = build_script_redirects([_spec(subcommand=None)])[0]
+    assert pattern.search("python3 signals.py --ticker AAPL") is not None
+    assert pattern.search("python3 signals.py rank") is not None
+    assert pattern.search("cd x && python3 signals.py") is not None
+
+
+def test_redirects_one_per_spec_and_order_preserved():
+    """Multiple declared tools -> one redirect each, in declaration order (the
+    order ``RoutingMiddleware`` iterates; first match wins in practice but order
+    is deterministic for the redirect message)."""
+    specs = [
+        _spec(name="scan_signals", script="signals.py", subcommand="score"),
+        _spec(name="rank_tickers", script="ranker.py", subcommand=None),
+    ]
+    redirs = build_script_redirects(specs)
+    assert [t for _, t in redirs] == [
+        PUX_PREFIX + "scan_signals",
+        PUX_PREFIX + "rank_tickers",
+    ]
+    # the second spec (no subcommand) still matches its own script.
+    assert redirs[1][0].search("python3 ranker.py --top 10") is not None
 
 
 # --- command serialization (the crux) --------------------------------------
