@@ -35,13 +35,16 @@ hands ``create_deep_agent`` a RESOLVED stack; deepagents' own
 honor that field OURSELVES here (it was a dead path before — see
 ``_resolve_toggles``).
 
-The context layer (``ContextMiddleware`` + ``ctx_recall``/``ctx_search``) is the
-one NON-toggleable base: it's a coupled (middleware, retrieval-tools) seam built
-per-scope (one instance for the supervisor, one for the subagent tree, both
-bound to the shared ``EventStore`` — byte-identical to the pre-factory build).
-It's listed in this module's docstring for "one place" visibility but an org
-can't drop it via overrides (turning off capture/offload is rarely wanted; that
-knob can be added later if ever needed). Everything ELSE is toggleable.
+The context layer (``ContextMiddleware`` + ``ctx_recall``/``ctx_search``) and
+``BrowserVisionMiddleware`` are FIRST-CLASS registry specs (``context`` /
+``browser_vision``), default-on and removable like every other middleware —
+the user's "selectively remove/add middleware" request, applied uniformly. The
+context spec's coupled (middleware, retrieval-tools) pair escapes via a mutable
+``StackCtx.emitted_tools_supervisor`` side channel (one shared ``EventStore``,
+two scope-local instances, byte-identical to the pre-Phase-3 build that called
+``build_context_layer`` once per scope). ``browser_vision`` is env-gated (on for
+the multimodal mimo-v2.5 driver; off → ``None`` → clean absent-from-list) and
+listed LAST in the registry so it mounts innermost.
 """
 from __future__ import annotations
 
@@ -130,15 +133,18 @@ class MiddlewareSpec:
     """One selectable middleware, declared once. The unit of the middleware
     surface (sibling of the tool ``ToolSpec``).
 
-    ``build`` receives a ``StackCtx`` and returns the instance, a list of
-    instances, or ``None`` (``None`` => skip — used by ``rubric`` when no gate is
-    armed, so the name can stay in the default list without forcing
-    construction).
+    ``build`` receives the ``StackCtx`` AND the ``Scope`` it's being resolved
+    for, and returns the instance, a list of instances, or ``None`` (``None``
+    => skip — used by ``rubric`` when no gate is armed and ``browser_vision``
+    when the driver is text-only, so the name can stay in the default list
+    without forcing construction). The scope arg lets one spec build differently
+    per tier (``context`` emits retrieval tools on the supervisor, not the
+    subagent).
     """
 
     name: str
     scope: frozenset[Scope]
-    build: Callable[["StackCtx"], AgentMiddleware | list[AgentMiddleware] | None]
+    build: Callable[["StackCtx", Scope], AgentMiddleware | list[AgentMiddleware] | None]
 
 
 @dataclass(frozen=True)
@@ -149,6 +155,15 @@ class StackCtx:
     facts: RuntimeFacts
     rubric_gate: Any | None    # profile.RubricGate | None
     exec_client: Any           # DockerExecClient — for the grader's evidence tools
+    # Side-effect channel for the ``context`` spec: ``build_context_layer``
+    # returns the coupled (middleware, retrieval-tools) pair, but a spec's
+    # ``build`` returns only middleware. The supervisor context build deposits
+    # its retrieval tools (ctx_recall/ctx_search) here, and ``build_stack`` reads
+    # them AFTER the resolver runs, threading them into supervisor_tools + every
+    # subagent whitelist (one shared EventStore). The field REFERENCE is frozen;
+    # the list itself is mutable — specs extend it. Fresh per ``build_stack``
+    # call (a new ``StackCtx`` each time), so no cross-org leakage.
+    emitted_tools_supervisor: list = field(default_factory=list)
 
 
 # --- THE registry ---------------------------------------------------------
@@ -156,12 +171,39 @@ class StackCtx:
 # order (routing, then session_guide; rubric is appended after the baseline).
 
 
-def _build_routing(_ctx: StackCtx) -> AgentMiddleware:
+def _build_routing(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     return RoutingMiddleware()
 
 
-def _build_session_guide(_ctx: StackCtx) -> AgentMiddleware:
+def _build_session_guide(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     return SessionGuideMiddleware()
+
+
+def _build_context(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
+    """The ContextMiddleware (capture + offload into the shared ``EventStore``)
+    for ONE tier. ``build_context_layer`` returns the coupled (middleware,
+    retrieval-tools) pair; the tools escape via ``ctx.emitted_tools_supervisor``
+    on the SUPERVISOR tier only — the subagent tree reuses the supervisor's
+    ctx_tools (threaded through ``load_subagents(retrieval_tools=)``), one
+    shared store, two scope-local instances. Byte-identical to the pre-Phase-3
+    build (which called ``build_context_layer`` once per scope)."""
+    mw, tools = build_context_layer()
+    if scope is Scope.SUPERVISOR:
+        ctx.emitted_tools_supervisor.extend(tools)
+    return mw
+
+
+def _build_browser_vision(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
+    """``BrowserVisionMiddleware`` when the multimodal driver is on (default for
+    mimo-v2.5); ``None`` (skip) when ``PUX_BROWSER_VISION=0`` — clean
+    absent-from-list, not mounted-but-off. Listed LAST in the registry so it
+    mounts INNERMOST: the raw tool string is still inline before
+    ContextMiddleware offloads it (so ``screenshot_path`` stays findable).
+    No-op for every non-``pux_sandbox_browser_*`` tool, so it costs nothing on
+    the rest of the surface. One instance per scope mirrors the context spec."""
+    if not browser_vision_enabled():
+        return None
+    return BrowserVisionMiddleware(ctx.exec_client)
 
 
 def _log_rubric_evaluation(ev: dict) -> None:
@@ -179,7 +221,7 @@ def _log_rubric_evaluation(ev: dict) -> None:
     print(f"[grader] iter={ev.get('iteration')} result={result} :: {explanation}")
 
 
-def _build_rubric(ctx: StackCtx) -> AgentMiddleware | None:
+def _build_rubric(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     """``RubricMiddleware`` ONLY when the org's rubric gate is present + enabled;
     ``None`` otherwise (so a no-gate org is byte-identical to today — no
     construction, no-op). The grader model resolves through the ``grader`` role
@@ -197,23 +239,33 @@ def _build_rubric(ctx: StackCtx) -> AgentMiddleware | None:
 
 
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
+    # Canonical mount ORDER — ``_resolve_toggles`` emits in this order, so a
+    # spec's registry position IS its mount position (context outermost,
+    # browser_vision innermost past rubric). This is what makes the stack
+    # byte-identical to the pre-Phase-3 build: [context, routing, session_guide,
+    # rubric?, browser_vision?] on the supervisor.
+    MiddlewareSpec("context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context),
     MiddlewareSpec("routing", frozenset({Scope.SUPERVISOR}), _build_routing),
     MiddlewareSpec("session_guide", frozenset({Scope.SUPERVISOR}), _build_session_guide),
     MiddlewareSpec("rubric", frozenset({Scope.SUPERVISOR}), _build_rubric),
+    MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
 ]
 
 
 # --- defaults (the "one place") -------------------------------------------
 
-# The toggleable supervisor baseline. ``rubric`` is appended at resolve time
-# ONLY when the org's gate is armed (a runtime fact, not an org override) —
-# matches the pre-factory behavior exactly.
-DEFAULT_SUPERVISOR: list[str] = ["routing", "session_guide"]
+# The default-on supervisor baseline. ``rubric`` is gate-driven (added to the
+# on-set iff the org's gate is armed) so it's NOT in the default list but still
+# lands at its registry position when armed. ``context`` + ``browser_vision``
+# are now selectable specs (default-on, removable via ``middleware.supervisor.
+# remove``) — the user's "selectively remove/add middleware" request, applied
+# uniformly to the formerly-non-toggleable layers too.
+DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "browser_vision"]
 
-# Subagents get the always-on context layer only; no toggleable middleware by
-# default (RubricMiddleware is a supervisor-level gate; routing/session are
-# supervisor concerns). An org MAY add one via ``middleware.subagent.add``.
-DEFAULT_SUBAGENT: list[str] = []
+# Subagents get the context layer + browser_vision by default; routing /
+# session_guide / rubric are supervisor concerns. An org MAY add a subagent
+# middleware via ``middleware.subagent.add``.
+DEFAULT_SUBAGENT: list[str] = ["context", "browser_vision"]
 
 
 def middleware_names() -> list[str]:
@@ -260,47 +312,46 @@ def _resolve_toggles(
     adds: list[str],
     removes: set[str],
 ) -> list[AgentMiddleware]:
-    """Resolve the toggleable middleware for one scope: defaults + gate-driven
-    rubric − removes + adds, then build each in order. Validate every name +
-    scope. Returns the built instances (skipping any ``build`` that returns
-    ``None``, e.g. rubric with no gate)."""
+    """Resolve the toggleable middleware for one scope.
+
+    The on-set is composed in the order that makes org overrides win: defaults +
+    gate-driven ``rubric`` (supervisor only), then the runtime-facts rules seam,
+    then removes, then adds — so an add wins a same-named remove. Every on-set
+    name is validated (registered + in-scope) BEFORE building. The built list is
+    emitted in REGISTRY order — a spec's mount position is its registry position,
+    not insertion order — so the stack is byte-identical regardless of which
+    names are defaults vs adds (e.g. ``browser_vision`` always lands innermost
+    past ``rubric``). A ``build`` returning ``None`` is skipped (``rubric`` with
+    no gate, ``browser_vision`` with a text-only driver)."""
     by_name = _specs_by_name()
 
-    # Start from defaults; append gate-driven rubric (supervisor only).
-    names: list[str] = list(default_names)
+    # defaults + gate-driven rubric → rules → removes → adds (add wins over remove).
+    on: set[str] = set(default_names)
     if scope is Scope.SUPERVISOR and ctx.rubric_gate is not None and ctx.rubric_gate.enabled:
-        if "rubric" not in names:
-            names.append("rubric")
+        on.add("rubric")
+    on = set(_apply_rules(ctx.facts, scope, list(on)))
+    on -= set(removes)
+    on |= set(adds)
 
-    # Apply the rules seam BEFORE org overrides (rules see the default set).
-    names = _apply_rules(ctx.facts, scope, names)
-
-    # Org overrides: remove first, then add (an add wins a same-named remove).
-    names = [n for n in names if n not in removes]
-    for n in adds:
-        if n not in names:
-            names.append(n)
-
-    # Validate every name + scope before building — fail loud, no silent skip.
-    unknown = [n for n in names if n not in by_name]
+    # Validate the FULL on-set — fail loud on an unknown add, a rule typo, or a
+    # scope mismatch. (Remove-name typos are caught offline by validate_overrides.)
+    unknown = sorted(n for n in on if n not in by_name)
     if unknown:
-        msg = (
-            f"{ctx.org}: unknown middleware name(s) {sorted(set(unknown))}; "
-            f"registered: {sorted(by_name)}"
-        )
-        raise ValueError(msg)
-    for n in names:
+        raise ValueError(
+            f"{ctx.org}: unknown middleware name(s) {unknown}; "
+            f"registered: {sorted(by_name)}")
+    for n in on:
         spec = by_name[n]
         if scope not in spec.scope:
-            msg = (
+            raise ValueError(
                 f"{ctx.org}: middleware {n!r} is not allowed in the {scope.value} "
-                f"scope (allowed scopes: {sorted(s.value for s in spec.scope)})"
-            )
-            raise ValueError(msg)
+                f"scope (allowed scopes: {sorted(s.value for s in spec.scope)})")
 
+    # Emit in REGISTRY order (canonical mount position) + build each.
+    names = [s.name for s in MIDDLEWARE_REGISTRY if s.name in on]
     out: list[AgentMiddleware] = []
     for n in names:
-        built = by_name[n].build(ctx)
+        built = by_name[n].build(ctx, scope)
         if built is None:
             continue
         if isinstance(built, list):
@@ -362,8 +413,9 @@ def build_stack(
 
     Byte-identical to the pre-factory build when the org ships no profile AND no
     ``middleware:`` block AND no ``mcp_tools``: same middleware order (context +
-    routing + session_guide, + rubric iff gate), same tools (specialists +
-    retrieval), same prompt (root + org + addendum)."""
+    routing + session_guide, + rubric iff gate, + browser_vision iff the driver
+    is multimodal), same tools (specialists + retrieval), same prompt (root +
+    org + addendum)."""
     if facts is None:
         facts = RuntimeFacts(tool_servers_active=bool(mcp_tools))
     ctx = StackCtx(
@@ -375,35 +427,20 @@ def build_stack(
     overrides = load_middleware_overrides(org)
     scoped = _normalize_overrides(profile, overrides)
 
-    # Context layer — built per scope (one instance for the supervisor, one for
-    # the subagent tree), both bound to the shared EventStore. The supervisor's
-    # call also yields the retrieval tools (ctx_recall/ctx_search), reused for
-    # every subagent whitelist below — byte-identical to the pre-factory build.
-    ctx_mw_sup, ctx_tools = build_context_layer()
-    ctx_mw_sub, _ = build_context_layer()
-
-    # Toggleable middleware resolved via the registry.
+    # The WHOLE middleware stack — context + routing + session_guide + rubric +
+    # browser_vision — flows through the registry now. ``context`` is a spec,
+    # so it (and browser_vision) is selectable like every other middleware; its
+    # retrieval tools escape via ctx.emitted_tools_supervisor as a build-time
+    # side effect (one shared EventStore, two scope-local instances).
     sup_add, sup_remove = scoped[Scope.SUPERVISOR]
     sub_add, sub_remove = scoped[Scope.SUBAGENT]
-    supervisor_toggles = _resolve_toggles(
+    supervisor_middleware: list[AgentMiddleware] = _resolve_toggles(
         ctx, Scope.SUPERVISOR, DEFAULT_SUPERVISOR, sup_add, sup_remove,
     )
-    subagent_toggles = _resolve_toggles(
+    subagent_middleware: list[AgentMiddleware] = _resolve_toggles(
         ctx, Scope.SUBAGENT, DEFAULT_SUBAGENT, sub_add, sub_remove,
     )
-
-    # BrowserVision mounts INNERMOST (last): handler(request) then returns the
-    # RAW tool string before ContextMiddleware offloads it, so screenshot_path
-    # is still inline to find. Default ON (mimo-v2.5 driver is multimodal); a
-    # cloner with a text-only driver sets PUX_BROWSER_VISION=0 and it is NOT
-    # mounted at all (clean absent-from-list semantics, not mounted-but-off).
-    # No-op for every non-pux_sandbox_browser_* tool, so it costs nothing on the
-    # rest of the surface. One instance per scope mirrors ContextMiddleware.
-    supervisor_middleware: list[AgentMiddleware] = [*ctx_mw_sup, *supervisor_toggles]
-    subagent_middleware: list[AgentMiddleware] = [*ctx_mw_sub, *subagent_toggles]
-    if browser_vision_enabled():
-        supervisor_middleware.append(BrowserVisionMiddleware(exec_client))
-        subagent_middleware.append(BrowserVisionMiddleware(exec_client))
+    ctx_tools = list(ctx.emitted_tools_supervisor)
 
     # Tools: MCP tools first (so profile overrides can shape them), then every
     # specialist + the retrieval surface.

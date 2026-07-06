@@ -54,7 +54,13 @@ Two validation tiers:
   slim kit core (``pux_harness/kit/**`` + ``pux_harness/__init__.py``) free of
   heavy runtime imports (``docker``/``fastapi``/…) and sibling-subsystem
   reaches — the precondition for Stage 3 splitting the heavy deps into optional
-  extras so a bare ``pip install pux-harness`` is truly slim.
+  extras so a bare ``pip install pux-harness`` is truly slim. An eighth
+  tripwire ``no-harness-profile-registration`` (Phase 3 registry parity) keeps
+  pux OFF the model-keyed ``_HARNESS_PROFILES`` registry — pux applies
+  ``HarnessProfileConfig`` fields itself in ``build_stack`` /
+  ``load_subagents``, so its middleware is never stripped by deepagents' own
+  ``_apply_excluded_middleware`` (which only fires through a registered
+  profile).
 
 Rule 4 resolves through ``classify_slug`` (the single source of truth shared
 with ``orgs._resolve_tools`` and ``graph.py`` via the ``REGISTRY``), so a
@@ -1055,6 +1061,65 @@ def _kit_import_isolation() -> list[Violation]:
     return v
 
 
+def _scan_for_profile_registration(src: Path) -> list[Violation]:
+    """AST-scan ONE source file for a CALL to ``register_harness_profile`` /
+    ``register_provider_profile``. Pure + path-parameterised so the tripwire's
+    provocation test can drive it against a temp file without touching the real
+    package. Returns one ``Violation`` per offending call node."""
+    v: list[Violation] = []
+    banned = {"register_harness_profile", "register_provider_profile"}
+    try:
+        tree = ast.parse(src.read_text())
+    except SyntaxError as exc:  # pragma: no cover - package modules parse
+        v.append(Violation(
+            "error", "no-harness-profile-registration",
+            f"{src}: does not parse: {exc}"))
+        return v
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else (
+            func.attr if isinstance(func, ast.Attribute) else None)
+        if name in banned:
+            v.append(Violation(
+                "error", "no-harness-profile-registration",
+                f"{src}: calls {name}() — pux stays off the model-keyed "
+                f"_HARNESS_PROFILES registry (multi-org server collision; no "
+                f"unregister). Apply HarnessProfileConfig fields directly in "
+                f"stack.build_stack / orgs.load_subagents instead."))
+    return v
+
+
+def _no_harness_profile_registration() -> list[Violation]:
+    """Permanent tripwire (Phase 3 registry parity; no-legacy-left-behind): no
+    file under ``pux_harness/`` may CALL deepagents' ``register_harness_profile``
+    or ``register_provider_profile``.
+
+    pux deliberately stays OFF the model-keyed ``_HARNESS_PROFILES`` registry:
+    two orgs resolved under one model would merge-collide, the long-lived server
+    builds many orgs per process, and there is no ``unregister``. pux applies
+    ``HarnessProfileConfig`` fields ITSELF (``build_stack`` for the supervisor,
+    ``load_subagents`` per specialist). The Phase 3 parity guarantee — pux
+    middleware is never stripped by deepagents' own ``_apply_excluded_middleware``
+    (which only fires through a REGISTERED profile) — depends on pux NEVER
+    registering. A future re-introduction (someone "fixes" a profile gap by
+    registering) is a HARD contract failure, not a silent regression — mirroring
+    ``no-legacy-middleware-in-graph`` / ``no-duplicate-loaders-in-orgs``.
+
+    Mechanism: AST-scan (via ``_scan_for_profile_registration``) every
+    ``pux_harness/**/*.py`` for a CALL whose function name (bare or attribute) is
+    one of the banned names. AST (not regex) so a docstring/comment mention
+    doesn't trip a false positive, and an aliased import
+    (``from x import register_harness_profile as reg``) still trips because the
+    CALL node's name is what's matched."""
+    pkg_root = Path(__file__).resolve().parent.parent  # .../pux_harness/
+    v: list[Violation] = []
+    for src in sorted(pkg_root.rglob("*.py")):
+        v.extend(_scan_for_profile_registration(src))
+    return v
+
+
 def check_harness() -> list[Violation]:
     """Rule 6 (no hardcoded org->agent manifest) + rule 7 (no orphan agents)
     + permanent legacy tripwires. Global — not per-org."""
@@ -1084,6 +1149,7 @@ def check_harness() -> list[Violation]:
     v.extend(_no_legacy_subagents_block())
     v.extend(_no_duplicate_loaders_in_orgs())
     v.extend(_kit_import_isolation())
+    v.extend(_no_harness_profile_registration())
     return v
 
 
