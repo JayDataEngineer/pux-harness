@@ -29,8 +29,8 @@ _U_PUX: list[str] = [
     "██║  ██║",  # U row 2
     "██║  ██║",  # U row 3
     "██║  ██║",  # U row 4
-    " █████╔╝ ",  # U row 5
-    " ╚════╝",  # U row 6
+    " █████╔╝",  # U row 5
+    " ╚════╝ ",  # U row 6
 ]
 
 _X_PUX: list[str] = [
