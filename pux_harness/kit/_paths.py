@@ -45,7 +45,7 @@ def project_root() -> Path:
 # * the ``pux:`` namespace — a name prefixed ``pux:<base>`` resolves ONLY
 #   against the shipped library bases (``pux_harness/kit/bases/<base>/``), the
 #   escape-hatch to a base even when a local namesake exists. Used in
-#   ``extends: pux:copilot-kit`` (org inheritance) and roster / agent
+#   ``extends: pux:`` (org inheritance) and roster / agent
 #   ``extends: pux:<slug>`` (a library agent). The contract rule
 #   ``pux-namespace-resolvable`` makes every ``pux:`` reference resolve or fail
 #   loud.

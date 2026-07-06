@@ -1,7 +1,7 @@
 """The cross-project org library (``pux:`` namespace + PUX_ORG_PATHS).
 
-Two mechanisms let a consumer app REUSE shipped library org bases (or another
-project's orgs) without vendoring:
+Two mechanisms let a consumer app REUSE org bases (or another project's orgs)
+without vendoring:
 
 * ``$PUX_ORG_PATHS`` — colon-separated extra ``orgs/``-shaped roots. Org
   resolution + ``discover_orgs`` search the project's ``orgs/`` first, then
@@ -32,36 +32,47 @@ from pux_harness.kit.loaders import (
 from pux_harness.kit.loaders import _org_path  # the ONE resolver delegate
 
 
-# --- the shipped copilot-kit base ------------------------------------------
+# --- helper: create a test-library base in a temp dir ------------------------
 
 
-def test_library_bases_dir_ships_copilot_kit():
-    """``kit/bases/copilot-kit/`` ships in the package — AGENTS.md + org.yaml +
-    a roster agent — so any consumer can ``extends: pux:copilot-kit``."""
-    base = _paths.library_bases_dir() / "copilot-kit"
-    assert base.is_dir(), "kit/bases/copilot-kit/ missing from the package"
-    assert (base / "AGENTS.md").is_file()
-    assert (base / "org.yaml").is_file()
-    assert (base / "agents" / "copilot-helper.md").is_file()
+TEST_BASE = "test-base"
+TEST_AGENT = "test-helper"
 
 
-def test_library_base_ships_in_installed_package():
-    """The base is reachable through the INSTALLED package (importlib.resources),
-    not just the source tree — i.e. it ships in the wheel. A consumer app that
-    pip-installs pux-harness finds it without a local checkout."""
-    import importlib.resources
+def _install_test_base(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Create a minimal library base in ``tmp_path/bases/test-base/`` and
+    monkeypatch ``_paths.library_bases_dir`` to point at ``tmp_path/bases/``.
 
-    pkg_root = Path(importlib.resources.files("pux_harness.kit"))
-    base = pkg_root / "bases" / "copilot-kit" / "AGENTS.md"
-    assert base.is_file(), f"copilot-kit base not packaged: {base}"
+    Returns the base directory.
+    """
+    base = tmp_path / "bases" / TEST_BASE
+    (base / "agents").mkdir(parents=True)
+
+    (base / "AGENTS.md").write_text(
+        "# test-base\n\nYou are the test base.\n"
+    )
+    (base / "org.yaml").write_text(
+        f"agents:\n  - {TEST_AGENT}\n"
+    )
+    (base / "agents" / f"{TEST_AGENT}.md").write_text(
+        "---\n"
+        f"name: {TEST_AGENT}\n"
+        "description: A test helper agent.\n"
+        "---\n"
+        "You are the test helper.\n"
+    )
+
+    monkeypatch.setattr(_paths, "library_bases_dir", lambda: tmp_path / "bases")
+    return base
 
 
 # --- search_org_dir: the namespace + multi-root resolver -------------------
 
 
-def test_search_org_dir_pux_resolves_library_base(tmp_path: Path):
-    """``pux:copilot-kit`` resolves to the shipped library base dir."""
-    assert _org_path("pux:copilot-kit", tmp_path) == _paths.library_bases_dir() / "copilot-kit"
+def test_search_org_dir_pux_resolves_library_base(monkeypatch, tmp_path: Path):
+    """``pux:test-base`` resolves to the library base dir."""
+    _install_test_base(monkeypatch, tmp_path)
+    assert _org_path(f"pux:{TEST_BASE}", tmp_path) == tmp_path / "bases" / TEST_BASE
 
 
 def test_search_org_dir_pux_dangling_raises(tmp_path: Path):
@@ -70,16 +81,17 @@ def test_search_org_dir_pux_dangling_raises(tmp_path: Path):
         _org_path("pux:totally-made-up", tmp_path)
 
 
-def test_search_org_dir_local_wins_over_pux_namespace(tmp_path: Path):
+def test_search_org_dir_local_wins_over_pux_namespace(monkeypatch, tmp_path: Path):
     """A LOCAL org wins over the library base on a bare-name collision — but
     ``pux:`` is the escape-hatch that ALWAYS means the library base."""
-    # Local org namesaked "copilot-kit" (a consumer override).
-    local = tmp_path / "orgs" / "copilot-kit"
+    _install_test_base(monkeypatch, tmp_path)
+    # Local org namesaked "test-base" (a consumer override).
+    local = tmp_path / "orgs" / TEST_BASE
     local.mkdir(parents=True)
     (local / "AGENTS.md").write_text("# local override\n")
     # Bare name -> local; pux: -> library.
-    assert _org_path("copilot-kit", tmp_path) == local
-    assert _org_path("pux:copilot-kit", tmp_path) == _paths.library_bases_dir() / "copilot-kit"
+    assert _org_path(TEST_BASE, tmp_path) == local
+    assert _org_path(f"pux:{TEST_BASE}", tmp_path) == tmp_path / "bases" / TEST_BASE
 
 
 # --- $PUX_ORG_PATHS ---------------------------------------------------------
@@ -129,78 +141,84 @@ def _make_consumer_org(root: Path, name: str, *, extends: str, body: str = "# co
     return d
 
 
-def test_consumer_extends_library_base_inherits_roster(tmp_path: Path):
-    """A consumer org ``extends: pux:copilot-kit`` inherits the base's roster
-    (``copilot-helper``) — inheritance working across the library
-    boundary. The base's agent resolves through the base's own ``agents/`` dir."""
-    _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit")
-    assert "copilot-helper" in org_agent_slugs("my-app", tmp_path)
+def test_consumer_extends_library_base_inherits_roster(monkeypatch, tmp_path: Path):
+    """A consumer org ``extends: pux:test-base`` inherits the base's roster
+    — inheritance working across the library boundary."""
+    _install_test_base(monkeypatch, tmp_path)
+    _make_consumer_org(tmp_path, "my-app", extends=f"pux:{TEST_BASE}")
+    assert TEST_AGENT in org_agent_slugs("my-app", tmp_path)
 
 
-def test_consumer_extends_library_base_inherits_prompt(tmp_path: Path):
+def test_consumer_extends_library_base_inherits_prompt(monkeypatch, tmp_path: Path):
     """The base's AGENTS.md overlay lands in the consumer's assembled prompt
     (parent + own concatenated own-last)."""
-    _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit",
+    _install_test_base(monkeypatch, tmp_path)
+    _make_consumer_org(tmp_path, "my-app", extends=f"pux:{TEST_BASE}",
                        body="# my-app\n\nMy own CTO prose.\n")
     prompt = build_system_prompt("my-app", project_root=tmp_path)
-    assert "co-pilot kit" in prompt.lower()  # inherited from the base
+    assert "test-base" in prompt.lower()  # inherited from the base
     assert "My own CTO prose." in prompt      # own overlay (own-last)
 
 
-def test_consumer_specializes_inherited_library_agent(tmp_path: Path):
-    """A consumer drops a same-named ``copilot-helper.md`` in its own
+def test_consumer_specializes_inherited_library_agent(monkeypatch, tmp_path: Path):
+    """A consumer drops a same-named ``test-helper.md`` in its own
     ``agents/`` dir to SPECIALIZE the inherited library agent (own wins,
     child-local-first resolution)."""
-    _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit")
+    _install_test_base(monkeypatch, tmp_path)
+    _make_consumer_org(tmp_path, "my-app", extends=f"pux:{TEST_BASE}")
     adir = tmp_path / "orgs" / "my-app" / "agents"
     adir.mkdir(parents=True)
-    (adir / "copilot-helper.md").write_text(
-        "---\nname: copilot-helper\ndescription: specialized\n---\n"
+    (adir / f"{TEST_AGENT}.md").write_text(
+        f"---\nname: {TEST_AGENT}\ndescription: specialized\n---\n"
         "I am the CONSUMER's specialized helper.\n"
     )
-    spec = _load_agent_spec("copilot-helper", "my-app", tmp_path)
+    spec = _load_agent_spec(TEST_AGENT, "my-app", tmp_path)
     assert spec is not None
     assert "CONSUMER's specialized" in spec["system_prompt"]
 
 
-def test_consumer_extends_chain_walks_through_library_base(tmp_path: Path):
+def test_consumer_extends_chain_walks_through_library_base(monkeypatch, tmp_path: Path):
     """The inheritance chain walks through the ``pux:`` base: a consumer that
-    extends ``pux:copilot-kit`` has the base at the chain ROOT, and a child
+    extends ``pux:test-base`` has the base at the chain ROOT, and a child
     ``extends:`` from the consumer still works (multi-level across the
     boundary)."""
+    _install_test_base(monkeypatch, tmp_path)
     from pux_harness.kit.loaders import org_extends_chain
-    _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit")
+    _make_consumer_org(tmp_path, "my-app", extends=f"pux:{TEST_BASE}")
     chain = org_extends_chain("my-app", tmp_path)  # root→child
-    assert chain[0] == "pux:copilot-kit"
+    assert chain[0] == f"pux:{TEST_BASE}"
     assert chain[-1] == "my-app"
 
 
 # --- pux: agent slugs (roster + agent-extends) ------------------------------
 
 
-def test_pux_agent_slug_resolves_library_agent(tmp_path: Path):
-    """A roster entry ``pux:copilot-helper`` pulls the library agent directly
+def test_pux_agent_slug_resolves_library_agent(monkeypatch, tmp_path: Path):
+    """A roster entry ``pux:test-helper`` pulls the library agent directly
     (searches the library bases' ``agents/`` dirs, stripped of the prefix)."""
-    _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit")
+    _install_test_base(monkeypatch, tmp_path)
+    _make_consumer_org(tmp_path, "my-app", extends=f"pux:{TEST_BASE}")
     # Override the roster to reference the library agent by pux: slug.
     (tmp_path / "orgs" / "my-app" / "org.yaml").write_text(
-        "agents: [pux:copilot-helper]\n"
+        f"agents: [pux:{TEST_AGENT}]\n"
     )
-    spec = _load_agent_spec("pux:copilot-helper", "my-app", tmp_path)
+    spec = _load_agent_spec(f"pux:{TEST_AGENT}", "my-app", tmp_path)
     assert spec is not None
-    assert spec["name"] == "copilot-helper"
+    assert spec["name"] == TEST_AGENT
 
 
-def test_pux_agent_slug_dangling_returns_none(tmp_path: Path):
+def test_pux_agent_slug_dangling_returns_none(monkeypatch, tmp_path: Path):
     """An unknown ``pux:`` agent slug resolves to None (the loader's contract);
     the harness contract surfaces it as ``pux-namespace-resolvable``."""
-    _make_consumer_org(tmp_path, "my-app", extends="pux:copilot-kit")
+    _install_test_base(monkeypatch, tmp_path)
+    _make_consumer_org(tmp_path, "my-app", extends=f"pux:{TEST_BASE}")
     assert _load_agent_spec("pux:no-such-agent", "my-app", tmp_path) is None
     assert _paths.resolve_library_agent("pux:no-such-agent") is None
 
 
-def test_resolve_library_agent_accepts_bare_or_namespaced():
+def test_resolve_library_agent_accepts_bare_or_namespaced(monkeypatch, tmp_path: Path):
     """``resolve_library_agent`` is idempotent on the prefix — namespaced or
     bare both find the shipped agent."""
-    assert _paths.resolve_library_agent("pux:copilot-helper") is not None
-    assert _paths.resolve_library_agent("copilot-helper") is not None
+    _install_test_base(monkeypatch, tmp_path)
+    assert _paths.resolve_library_agent(f"pux:{TEST_AGENT}") is not None
+    assert _paths.resolve_library_agent(TEST_AGENT) is not None

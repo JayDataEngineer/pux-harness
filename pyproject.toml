@@ -14,7 +14,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3.1.0",
     "pyyaml",
     "uvicorn[standard]>=0.49.0",
-    "copilotkit",
+    "deepagents-code",
     "ag-ui-langgraph",
     "fastmcp>=3.4.2",
 ]

@@ -30,7 +30,7 @@ my_app/
 
 ## Quick start
 
-Install the core (Stage 3 will split docker/fastapi/copilotkit out into optional extras so the bare install is truly slim; today they're still hard install-time deps, but importing the kit pulls **none** of them):
+Install the core (Stage 3 will split docker/fastapi out into optional extras so the bare install is truly slim; today they're still hard install-time deps, but importing the kit pulls **none** of them):
 
 ```bash
 pip install pux-harness

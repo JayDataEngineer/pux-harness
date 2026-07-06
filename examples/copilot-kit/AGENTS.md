@@ -18,6 +18,6 @@ verify the result before declaring done.
 - **Keep it simple.** Smaller surface, fewer moving parts, clearer names. Reject
   cleverness that the next reader would have to puzzle out.
 
-This is a **library base org** — extend it (`extends: pux:copilot-kit`) to add
-your own specialists, prompt, or policy without forking. Everything here is
-inherited: roster, this prompt, and profile.
+This is an **example base org** — extend it to add your own specialists, prompt,
+or policy without forking. Everything here is inherited: roster, this prompt,
+and profile.

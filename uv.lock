@@ -28,11 +28,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/62/c0/32fea8de7ac50a90ea150f999318f4d121cd22d58e446c8fdb420fc2a11e/ag_ui_langgraph-0.0.42-py3-none-any.whl", hash = "sha256:4fd19f0da6d0e16d727ec89e99b692916cbba2b0302f96aba2497043cbfec5db", size = 37969, upload-time = "2026-06-19T15:07:00.517Z" },
 ]
 
-[package.optional-dependencies]
-fastapi = [
-    { name = "fastapi" },
-]
-
 [[package]]
 name = "ag-ui-protocol"
 version = "0.1.19"
@@ -326,25 +321,6 @@ wheels = [
 ]
 
 [[package]]
-name = "copilotkit"
-version = "0.1.94"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "ag-ui-langgraph", extra = ["fastapi"] },
-    { name = "ag-ui-protocol" },
-    { name = "fastapi" },
-    { name = "langchain" },
-    { name = "langgraph" },
-    { name = "partialjson" },
-    { name = "pydantic-core" },
-    { name = "toml" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/68/e3/d40a7f8698e29efaa5eeb2064a68c1d8a51f1346390021d5cc76fc08d8a2/copilotkit-0.1.94.tar.gz", hash = "sha256:a60a56aeba8127f3eb382337e5799a9bc4b31fb506bc308045c0050abc6a4488", size = 49487, upload-time = "2026-06-04T17:41:36.766Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/48/b22f4cbd7f8a6e2f3e80260e6aef06d845fa38f469ac4dd1bf2e14e44766/copilotkit-0.1.94-py3-none-any.whl", hash = "sha256:424e657118bebc055d5f89d1e93290773ff33c05860a3da242653ed8446affa8", size = 58434, upload-time = "2026-06-04T17:41:35.479Z" },
-]
-
-[[package]]
 name = "cryptography"
 version = "49.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -425,6 +401,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d4/4e/586cf7a70161e3eb0c3596ec9513f8249c0739283c2abe08b0c10537197e/deepagents_acp-0.0.8.tar.gz", hash = "sha256:9fb5cecfe9e9238de27e69ac76e7b0bc80a31cbff268c542bf5c9f4727dde1f4", size = 13010377, upload-time = "2026-06-03T18:08:17.321Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/05/5cc23022dcf59543d5d26c5564754cdc8158866feba403d7527ddc788486/deepagents_acp-0.0.8-py3-none-any.whl", hash = "sha256:0380c8e804a5d5c0fa245a5b1d7dfde8a867f7a9a17ef54749a69da31ed341cf", size = 17630, upload-time = "2026-06-03T18:08:15.879Z" },
+]
+
+[[package]]
+name = "deepagents-code"
+version = "0.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/ce/a9a57d233747784d01b8689b965b9757cb0fbaca42e822d178b4f04a89f9/deepagents_code-0.0.1.tar.gz", hash = "sha256:146144870584697354fa4fdc5765f8b43a9a2f816f59f32a79942febe84d7187", size = 48552, upload-time = "2026-04-30T00:21:11.045Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a2/5c/1f832ab2fd0af635b072deefa21b7b063515be37ba00782a6fa133f32305/deepagents_code-0.0.1-py3-none-any.whl", hash = "sha256:ddc5201f08e9601ca07eeeb0202bbbfbb7e28820f39e7de116a7c0d1e860c565", size = 1951, upload-time = "2026-04-30T00:21:09.845Z" },
 ]
 
 [[package]]
@@ -1345,15 +1330,6 @@ wheels = [
 ]
 
 [[package]]
-name = "partialjson"
-version = "0.0.8"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5d/b2/59669fdc3ecbc724a077c598c1c9b4068549af0cd8c3b5add9337bd4d93a/partialjson-0.0.8.tar.gz", hash = "sha256:91217e19a15049332df534477f56420065ad1729cedee7d8c7433e1d2acc7dca", size = 4142, upload-time = "2024-08-03T18:03:15.798Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8a/fb/453af21468774dbd0954853735a4fc7841544c3022ff86e5d93252d7ea72/partialjson-0.0.8-py3-none-any.whl", hash = "sha256:22c6c60944137f931a7033fa0eeee2d74b49114f3d45c25a560b07a6ebf22b76", size = 4549, upload-time = "2024-08-03T18:03:14.447Z" },
-]
-
-[[package]]
 name = "pathable"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1395,9 +1371,9 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ag-ui-langgraph" },
-    { name = "copilotkit" },
     { name = "deepagents" },
     { name = "deepagents-acp" },
+    { name = "deepagents-code" },
     { name = "docker" },
     { name = "fastapi" },
     { name = "fastmcp" },
@@ -1419,9 +1395,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ag-ui-langgraph" },
-    { name = "copilotkit" },
     { name = "deepagents" },
     { name = "deepagents-acp", specifier = ">=0.0.8" },
+    { name = "deepagents-code" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "fastapi", specifier = ">=0.139.0" },
     { name = "fastmcp", specifier = ">=3.4.2" },
@@ -1976,15 +1952,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8c/46/002b68de6827091d5ae90b048f326e8aad8d953520950e5ce1508879414f/tiktoken-0.13.0-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:e28157350f7ebf35008dd8e9e0fdb621f976e4230c881099c85e8cf07eaa50e2", size = 1181826, upload-time = "2026-05-15T04:50:56.296Z" },
     { url = "https://files.pythonhosted.org/packages/db/c6/d393e3185a276505182f7abd93fe714f3c444a2be9180798fa052347504e/tiktoken-0.13.0-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:165cf1820ea4a354985c2490a5205d4cc74661c934aca79dd0368232fff94e0f", size = 1239489, upload-time = "2026-05-15T04:50:57.918Z" },
     { url = "https://files.pythonhosted.org/packages/b7/4d/bc07d1f1635d4897a202acc0ae11c2886eaa7325c359ba4741b47bf8e225/tiktoken-0.13.0-cp313-cp313t-win_amd64.whl", hash = "sha256:6c43a675ca14f6f2749ba7f12075d37456015a24b859f2517b9beb4ef30807ec", size = 873820, upload-time = "2026-05-15T04:50:59.528Z" },
-]
-
-[[package]]
-name = "toml"
-version = "0.10.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/be/ba/1f744cdc819428fc6b5084ec34d9b30660f6f9daaf70eead706e3203ec3c/toml-0.10.2.tar.gz", hash = "sha256:b3bda1d108d5dd99f4a20d24d9c348e91c4db7ab1b749200bded2f839ccbe68f", size = 22253, upload-time = "2020-11-01T01:40:22.204Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/44/6f/7120676b6d73228c96e17f1f794d8ab046fc910d781c8d151120c3f1569e/toml-0.10.2-py2.py3-none-any.whl", hash = "sha256:806143ae5bfb6a3c6e736a764057db0e6a0e05e338b5630894a5f779cabb4f9b", size = 16588, upload-time = "2020-11-01T01:40:20.672Z" },
 ]
 
 [[package]]

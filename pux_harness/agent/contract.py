@@ -1042,7 +1042,7 @@ _HEAVY_MODULE_ROOTS: frozenset[str] = frozenset({
     "docker",                                  # [sandbox]
     "selenium", "seleniumbase",                # [browser]
     "fastapi", "uvicorn", "starlette",         # [server] HTTP runtime
-    "copilotkit", "ag_ui_langgraph",           # [server] CopilotKit transport
+    "ag_ui_langgraph",                         # [server] AG-UI transport
     "fastmcp", "langchain_mcp_adapters",       # [mcp] MCP servers/adapters
 })
 
