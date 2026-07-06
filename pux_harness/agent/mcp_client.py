@@ -127,8 +127,20 @@ class McpSessionManager:
     async def open(self) -> None:
         """Probe every spec's server and load tools.
 
-        A server that is unreachable / fails ``tools/list`` → zero tools from
-        that server + a loud ``ERROR`` log. Does NOT crash the org."""
+        Each server is probed INDEPENDENTLY: a server that is unreachable or
+        fails ``tools/list`` → zero tools from that server + a loud ``ERROR``
+        log. Does NOT crash the org (one bad foreign server can't brick the
+        batch).
+
+        ``MultiServerMCPClient.get_tools()`` returns a FLAT list across all
+        servers (no per-server bucketing), so we call it once per spec with
+        ``server_name=`` to attribute tools to the right server for the
+        allowlist + namespace. A bare ``get_tools()`` would ``gather`` every
+        server and raise on the FIRST failure — defeating the per-server
+        isolation this method promises. Proven live (2026-07-06): the old code
+        read ``server_tools.get(...)`` on what is a ``list``, crashing
+        ``AttributeError`` for every live server — caught only by a live
+        handshake, never by the mocked unit tests."""
         if not self.specs:
             return
 
@@ -154,17 +166,17 @@ class McpSessionManager:
         )
         self._client = client
 
-        try:
-            server_tools: dict[str, list[BaseTool]] = await client.get_tools()
-        except Exception as exc:
-            logger.error(
-                "org %s: get_tools() failed for all servers — %s",
-                self.org, exc,
-            )
-            return
-
         for spec in self.specs:
-            exposed = server_tools.get(spec.name, [])
+            if spec.name not in connections:
+                continue  # already logged at _to_connection
+            try:
+                exposed = await client.get_tools(server_name=spec.name)
+            except Exception as exc:
+                logger.error(
+                    "org %s, tool server %r: tools/list failed — %s",
+                    self.org, spec.name, exc,
+                )
+                continue
             if not exposed:
                 logger.error(
                     "org %s, tool server %r: no tools loaded — skipped",
