@@ -69,6 +69,7 @@ from pux_harness.agent.profile import (
     apply_profile_to_tools,
     load_middleware_overrides,
 )
+from pux_harness.context.audit import AuditMiddleware
 from pux_harness.context.browser_vision import (
     BrowserVisionMiddleware,
     browser_vision_enabled,
@@ -179,6 +180,17 @@ def _build_session_guide(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     return SessionGuideMiddleware()
 
 
+def _build_audit(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
+    """``AuditMiddleware`` — observe-only tool-call audit into the shared
+    ``EventStore`` (``type=tool_audit``). Opt-in only (NOT in either default
+    list): ``middleware.{supervisor,subagent}.add: [audit]``. Listed FIRST in the
+    registry so it mounts OUTERMOST — its ``handler(request)`` then wraps the
+    whole pipeline (context capture + vision enrichment + the real tool), so
+    ``elapsed``/``outcome`` measure the actual call, not a slice. Never mutates
+    the audited I/O."""
+    return AuditMiddleware(org=ctx.org, scope=scope.value)
+
+
 def _build_context(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
     """The ContextMiddleware (capture + offload into the shared ``EventStore``)
     for ONE tier. ``build_context_layer`` returns the coupled (middleware,
@@ -240,10 +252,12 @@ def _build_rubric(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
 
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # Canonical mount ORDER — ``_resolve_toggles`` emits in this order, so a
-    # spec's registry position IS its mount position (context outermost,
-    # browser_vision innermost past rubric). This is what makes the stack
-    # byte-identical to the pre-Phase-3 build: [context, routing, session_guide,
-    # rubric?, browser_vision?] on the supervisor.
+    # spec's registry position IS its mount position. ``audit`` (opt-in) is FIRST
+    # so it wraps the whole pipeline as an outermost observer; then context
+    # outermost of the default-on layers; browser_vision innermost past rubric.
+    # Default-on orgs (no audit) still emit [context, routing, session_guide,
+    # rubric?, browser_vision?] — byte-identical to the pre-Phase-3 build.
+    MiddlewareSpec("audit", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_audit),
     MiddlewareSpec("context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context),
     MiddlewareSpec("routing", frozenset({Scope.SUPERVISOR}), _build_routing),
     MiddlewareSpec("session_guide", frozenset({Scope.SUPERVISOR}), _build_session_guide),
