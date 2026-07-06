@@ -32,16 +32,20 @@ Two validation tiers:
 
 * **Permanent legacy tripwires** (``no-legacy-agent-py``,
   ``no-legacy-org-roster``, ``no-legacy-sandbox-artifacts``,
-  ``no-legacy-middleware-in-graph``, ``no-legacy-memory-saver``): the legacy
+  ``no-legacy-middleware-in-graph``, ``no-legacy-memory-saver``,
+  ``no-legacy-subagents-block``): the legacy
   ``.pi/agents/<slug>.py`` SUBAGENT-dict module form, the
   ``agents:``-key-on-AGENTS.md org form, the frozen bash/compose sandbox
-  lifecycle, a hand-assembled middleware list in ``graph.py``, and an ephemeral
-  ``MemorySaver`` in ``acp.py``/``main.py`` are structurally forbidden —
-  ``--check-contract`` blocks any commit that reintroduces them. Agents are now
+  lifecycle, a hand-assembled middleware list in ``graph.py``, an ephemeral
+  ``MemorySaver`` in ``acp.py``/``main.py``, and the ``profile.yaml``
+  ``subagents:`` block (a second partial-override surface) are structurally
+  forbidden — ``--check-contract`` blocks any commit that reintroduces them.
+  Agents are now
   one frontmatter+body ``<slug>.md`` per org (org-local first, then
   ``orgs/_shared/agents/``); the sandbox lifecycle is harness-owned; the
-  middleware stack is built by the single ``stack.build_stack`` factory; and the
-  server-side runtimes share one persistent ``AsyncSqliteSaver``
+  middleware stack is built by the single ``stack.build_stack`` factory; the
+  server-side runtimes share one persistent ``AsyncSqliteSaver``; and per-agent
+  overrides go in the agent's own frontmatter (+ ``extends:`` for inheritance)
   (``threads.open_thread_store``, Phase 23). A sixth tripwire
   ``no-duplicate-loaders-in-orgs`` keeps the 7 pure org/agent loaders in
   ``orgs.py`` as thin delegates to ``pux_harness.kit.loaders`` (Phase 1
@@ -153,6 +157,63 @@ def _load_agent_subagent(slug: str, org: str) -> dict[str, Any] | None:
     return _load_agent_spec(slug, org)
 
 
+def _first_agent_md(slug: str, org: str) -> Path | None:
+    """The first ``<slug>.md`` that exists in the agent search dirs (org-local
+    then ``_shared``), or ``None``. Used by the extends-chain walker to read RAW
+    frontmatter without triggering the recursive merge in ``_load_agent_spec``."""
+    for d in _agent_search_dirs(org):
+        path = d / f"{slug}.md"
+        if path.is_file():
+            return path
+    return None
+
+
+def _agent_extends_chain_violations(slug: str, org: str) -> list[Violation]:
+    """Validate an agent's ``extends:`` chain resolves + is acyclic (Phase 2).
+
+    Reads RAW frontmatter (NO merge) and walks the chain manually so the two
+    dedicated rules fire with precise, actionable messages — independent of
+    ``_load_agent_spec``'s own recursion (which raises + would surface as a
+    generic ``agent-resolves``). A chain that references a non-existent agent
+    fires ``agent-extends-resolvable``; a cycle fires ``agent-extends-acyclic``.
+
+    Returns ``[]`` for an agent with no ``extends:`` (the common case), a
+    missing roster slug (``agent-resolves`` owns that — ``cur == slug`` + path
+    ``None``), or unreadable frontmatter (``agent-resolves`` /
+    ``no-legacy-agent-py`` own that). Callers skip the merge when this returns
+    non-empty so the same fault isn't reported twice."""
+    v: list[Violation] = []
+    chain: list[str] = [slug]
+    visited: set[str] = {slug}
+    cur = slug
+    while True:
+        path = _first_agent_md(cur, org)
+        if path is None:
+            if cur != slug:
+                v.append(Violation(
+                    "error", "agent-extends-resolvable",
+                    f"{org}/{slug}: extends chain references unknown agent "
+                    f"{cur!r} (chain: {' -> '.join(chain)})"))
+            return v  # cur == slug + missing -> agent-resolves owns it
+        try:
+            fm, _ = _split_frontmatter(path.read_text())
+        except ValueError:
+            return v  # bad frontmatter -> agent-resolves / no-legacy-agent-py own it
+        parent = fm.get("extends")
+        if not isinstance(parent, str) or not parent.strip():
+            return v  # chain terminates cleanly (no extends); bad-type -> merge raises
+        parent = parent.strip()
+        if parent in visited:
+            v.append(Violation(
+                "error", "agent-extends-acyclic",
+                f"{org}/{slug}: extends cycle detected "
+                f"({' -> '.join(chain)} -> {parent})"))
+            return v
+        chain.append(parent)
+        visited.add(parent)
+        cur = parent
+
+
 def check_org(name: str) -> list[Violation]:
     """Validate one org's bundle — fully offline (no server, no tokens).
 
@@ -252,6 +313,14 @@ def check_org(name: str) -> list[Violation]:
     # with required frontmatter keys + a non-empty body (system_prompt).
     agent_subagents: dict[str, dict[str, Any]] = {}
     for slug in slugs:
+        # Phase 2: validate the ``extends:`` chain FIRST (specific rules), before
+        # the recursive merge in ``_load_agent_subagent`` raises a generic
+        # ``agent-resolves``. A broken chain skips the merge so the same fault
+        # isn't reported twice.
+        extends_vs = _agent_extends_chain_violations(slug, name)
+        if extends_vs:
+            v.extend(extends_vs)
+            continue
         try:
             sub = _load_agent_subagent(slug, name)
         except Exception as exc:
@@ -334,6 +403,30 @@ def check_org(name: str) -> list[Violation]:
     # grammar -> ValueError). Offline; no model/Docker.
     profile_path = org_dir / "profile.yaml"
     if profile_path.is_file():
+        # Phase 2 fold — permanent no-legacy gate (no-legacy-left-behind). The
+        # ``profile.yaml`` ``subagents:`` block was a SECOND partial-override
+        # surface with its own resolver; it was folded into per-agent
+        # ``extends:`` + delta frontmatter fields. A stale block is a HARD
+        # contract failure pointing at the replacement. ``load_profile`` /
+        # ``HarnessProfileConfig.from_dict`` reject the same key at BUILD time
+        # too (unknown key → ``profile-schema`` below) — two layers over one
+        # fault, mirroring the dev-bot GP defense-in-depth (Safeguard S2).
+        # Scanned RAW (not via validate_profile) so the message names the fix.
+        try:
+            _profile_top = yaml.safe_load(profile_path.read_text())
+        except yaml.YAMLError:
+            _profile_top = None  # validate_profile below owns the parse error
+        if isinstance(_profile_top, dict) and "subagents" in _profile_top:
+            v.append(Violation(
+                "error", "no-legacy-subagents-block",
+                f"{name}: profile.yaml: the top-level `subagents:` block was "
+                f"removed — folded into per-agent `extends:` + delta frontmatter "
+                f"fields (tools_add / tools_remove / skills_add / "
+                f"description_append / tool_description_overrides / "
+                f"base_system_prompt / system_prompt_suffix / excluded_tools). "
+                f"Move each subagent's override into its own "
+                f"`orgs/{name}/agents/<slug>.md` (or a shared base + `extends:`)."
+            ))
         try:
             profile_mod.validate_profile(name)
         except (TypeError, ValueError, yaml.YAMLError) as exc:
@@ -350,19 +443,6 @@ def check_org(name: str) -> list[Violation]:
             # override fails --check-contract, not the first build.
             for err in stack_mod.validate_overrides(name):
                 v.append(Violation("error", "middleware-overrides", err))
-
-            # Phase 2: every slug in the ``subagents:`` block must be in the org's
-            # roster (typo'd slug → ``--check-contract`` red, not a silent no-op).
-            subagent_overrides = profile_mod.load_subagent_overrides(name)
-            if subagent_overrides:
-                roster = set(org_agent_slugs(name))
-                bad = sorted(s for s in subagent_overrides if s not in roster)
-                if bad:
-                    v.append(Violation(
-                        "error", "subagent-overrides-unknown-slug",
-                        f"{name}: profile.yaml subagents: unknown slug(s) {bad}; "
-                        f"must be in the org's roster: {sorted(roster)}",
-                    ))
 
     return v
 
@@ -627,6 +707,43 @@ def _no_legacy_sandbox_artifacts() -> list[Violation]:
                     f"orgs/{org_dir.name}/{art}: the harness owns the sandbox "
                     f"lifecycle now (policy.yaml host_setup + sandbox.build); "
                     f"this bash/compose artifact must be deleted"))
+    return v
+
+
+def _no_legacy_subagents_block() -> list[Violation]:
+    """Permanent tripwire (Phase 2 fold; no-legacy-left-behind): no
+    ``profile.yaml`` may ship a top-level ``subagents:`` block.
+
+    Phase 2 folded the per-subagent override surface INTO agent frontmatter —
+    ``extends:`` + the delta fields (``tools_add`` / ``tools_remove`` /
+    ``skills_add`` / ``description_append``) and the native HarnessProfileConfig
+    fields (``base_system_prompt`` / ``system_prompt_suffix`` /
+    ``tool_description_overrides`` / ``excluded_tools``), honored per-agent via
+    ``orgs._agent_profile_from_spec``. The old ``profile.yaml`` ``subagents:``
+    block was a SECOND partial-override surface with its own resolver — exactly
+    the dual-read the fold killed. A future re-introduction (someone re-adds the
+    block because it "feels simpler") is a HARD contract failure, not a silent
+    regression — mirroring ``no-legacy-middleware-in-graph`` /
+    ``no-legacy-org-roster``.
+
+    (A malformed profile is skipped here — ``profile-schema`` already reports
+    it, no double-noise. And since the block is no longer peeled in
+    ``profile.load_profile``, ``HarnessProfileConfig.from_dict`` ALSO rejects
+    the unknown key, so the block fails twice over.)"""
+    v: list[Violation] = []
+    for org in discover_orgs():
+        try:
+            data = profile_mod._read_profile_yaml(org)
+        except (TypeError, ValueError, yaml.YAMLError):
+            continue  # profile-schema reports a malformed profile; don't double-noise
+        if data and "subagents" in data:
+            v.append(Violation(
+                "error", "no-legacy-subagents-block",
+                f"{org}/profile.yaml: the top-level 'subagents:' block was "
+                f"removed in the Phase 2 fold — per-agent overrides now live "
+                f"in the agent's OWN frontmatter (extends: + tools_add / "
+                f"tools_remove / system_prompt_suffix / ...). Delete the block "
+                f"and move the overrides into the agent .md frontmatter."))
     return v
 
 
@@ -964,6 +1081,7 @@ def check_harness() -> list[Violation]:
     v.extend(_no_legacy_sandbox_artifacts())
     v.extend(_no_legacy_middleware_in_graph())
     v.extend(_no_legacy_memory_saver_in_runtimes())
+    v.extend(_no_legacy_subagents_block())
     v.extend(_no_duplicate_loaders_in_orgs())
     v.extend(_kit_import_isolation())
     return v

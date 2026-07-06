@@ -65,7 +65,6 @@ from pux_harness.agent.profile import (
     MiddlewareOverrides,
     apply_profile_to_tools,
     load_middleware_overrides,
-    load_subagent_overrides,
 )
 from pux_harness.context.browser_vision import (
     BrowserVisionMiddleware,
@@ -420,13 +419,11 @@ def build_stack(
         if profile.system_prompt_suffix:
             prompt = f"{prompt}\n\n{profile.system_prompt_suffix}"
 
-    subagent_overrides = load_subagent_overrides(org)
     subagents = load_subagents(
         org, specialists,
         profile=profile,
         subagent_middleware=subagent_middleware,
         retrieval_tools=ctx_tools,
-        subagent_overrides=subagent_overrides,
     )
 
     # Phase 1 — own the general-purpose subagent. deepagents auto-adds a HEAVY

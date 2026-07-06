@@ -27,15 +27,15 @@ from typing import Any, TYPE_CHECKING
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
+from deepagents import HarnessProfileConfig
 
 from pux_harness.agent.model import get_model
 from pux_harness.sandbox.tools import Category, classify_slug, prefixed
 
 if TYPE_CHECKING:
-    # Type-only: deepagents profile shapes referenced in the general-purpose
-    # subagent builder. ``from __future__ import annotations`` keeps them lazy,
-    # so there is no runtime deepagents import at module load here.
-    from deepagents import GeneralPurposeSubagentProfile, HarnessProfileConfig
+    # Type-only: the GP subagent profile shape is referenced only in a string
+    # annotation (``from __future__ import annotations``), so it stays lazy.
+    from deepagents import GeneralPurposeSubagentProfile
 
 # The PURE org/agent loaders live in ``pux_harness.kit`` (the slim, Docker-free
 # core — the ONE source of truth for how an org dir / agent <slug>.md /
@@ -292,6 +292,34 @@ def _build_sub(
     return sub
 
 
+# --- per-agent frontmatter overrides (Phase 2 fold) ------------------------
+#
+# The universal override vocabulary: the SAME ``HarnessProfileConfig`` fields
+# that work ORG-WIDE via ``profile.yaml`` work PER-AGENT via the agent's OWN
+# frontmatter. This folded the legacy ``profile.yaml`` ``subagents:`` block (a
+# SECOND partial-override surface with its own resolver) into the one
+# frontmatter path — the ``extends:`` merge in ``kit.loaders._merge_extends``
+# inherits + overrides these the same way it inherits tools/skills, so there is
+# no second surface. The ``no-legacy-subagents-block`` contract tripwire keeps
+# the old block from returning.
+_AGENT_PROFILE_KEYS: tuple[str, ...] = (
+    "base_system_prompt", "system_prompt_suffix",
+    "tool_description_overrides", "excluded_tools",
+)
+
+
+def _agent_profile_from_spec(spec: dict[str, Any]) -> HarnessProfileConfig | None:
+    """Build a per-agent ``HarnessProfileConfig`` from an agent spec's OWN
+    frontmatter override fields (Phase 2 fold). ``None`` when the spec carries
+    none of the four fields — the common case, byte-identical (no per-agent
+    rewriting). The spec is already ``extends:``-merged, so a child agent
+    inherits + overrides these via the merge the same way it inherits tools."""
+    present = {k: spec[k] for k in _AGENT_PROFILE_KEYS if k in spec}
+    if not present:
+        return None
+    return HarnessProfileConfig.from_dict(present)
+
+
 # --- the general-purpose subagent (own the GP) -----------------------------
 #
 # deepagents auto-adds a HEAVY default ``general-purpose`` subagent to EVERY
@@ -406,7 +434,6 @@ def load_subagents(
     *,
     subagent_middleware: list[AgentMiddleware],
     retrieval_tools: list[BaseTool],
-    subagent_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build deepagents SubAgent dicts for ``org``'s specialists.
 
@@ -427,19 +454,31 @@ def load_subagents(
       ``excluded_tools`` can never strip retrieval).
 
     ``profile`` (optional ``HarnessProfileConfig`` from ``orgs/<org>/
-    profile.yaml``; Phase 16.3b) applies the org-wide overrides to EACH
+    profile.yaml``; Phase 16.3b) applies the ORG-WIDE overrides to EACH
     specialist: ``system_prompt_suffix`` is appended to the body, and
     ``tool_description_overrides`` + ``excluded_tools`` are applied to the
     resolved tool whitelist (so an org-wide override reaches a shared subagent
     like the browser agent, not just the CTO). The helper is imported lazily to
     avoid a module cycle (``profile.py`` imports ``orgs._orgs_dir``).
 
-    ``subagent_overrides`` (Phase 2): per-subagent ``{slug: HarnessProfileConfig}``
-    from ``profile.yaml``'s ``subagents:`` block. Precedence is
-    ``base_system_prompt`` (replace) → org-wide suffix → per-subagent suffix
-    (most-specific = last word). Tools: org-wide prune/rewrite first, then
-    per-subagent prune/rewrite (excluded = union per-key;
-    ``tool_description_overrides`` per-subagent wins).
+    PER-AGENT overrides (Phase 2 fold — the universal pattern): the agent's OWN
+    frontmatter may carry the SAME four ``HarnessProfileConfig`` fields
+    (``base_system_prompt`` / ``system_prompt_suffix`` /
+    ``tool_description_overrides`` / ``excluded_tools``), honored per-agent via
+    ``_agent_profile_from_spec``. The spec is already ``extends:``-merged
+    (``kit.loaders._merge_extends``), so a child agent inherits + overrides these
+    exactly as it inherits tools/skills — no second surface. This REPLACED the
+    legacy ``profile.yaml`` ``subagents:`` block (now a contract failure).
+    Precedence (most-specific = last word):
+
+        .md body (or extends-merged body)
+        → per-agent ``base_system_prompt`` (replace)
+        → org-wide ``system_prompt_suffix``
+        → per-agent ``system_prompt_suffix``
+
+    Tools: resolved whitelist → org-wide prune/rewrite → per-agent
+    prune/rewrite (per-agent wins; ``excluded_tools`` is additive,
+    ``tool_description_overrides`` per-key wins) → retrieval surface appended.
     """
     if org not in discover_orgs():
         raise KeyError(f"unknown org {org!r}; discovered orgs: {discover_orgs()}")
@@ -460,33 +499,29 @@ def load_subagents(
             slug, spec, tool_map, spec["system_prompt"], org,
             middleware=subagent_middleware,
         )
-        # Phase 2: per-subagent overrides. Precedence:
-        # .md body → per-agent base_system_prompt → org-wide suffix → per-agent suffix
-        subagent_cfg = None
-        if subagent_overrides:
-            subagent_cfg = subagent_overrides.get(sub["name"])
-        if subagent_cfg is not None and subagent_cfg.base_system_prompt:
-            sub["system_prompt"] = subagent_cfg.base_system_prompt
-        # Org-wide suffix appends.
-        if profile is not None:
-            if profile.system_prompt_suffix:
-                sub["system_prompt"] = (
-                    f"{sub['system_prompt']}\n\n{profile.system_prompt_suffix}"
-                )
-        # Per-subagent suffix appends last (most-specific = last word).
-        if subagent_cfg is not None and subagent_cfg.system_prompt_suffix:
+        # Per-agent overrides from the spec's OWN frontmatter (Phase 2 fold).
+        agent_cfg = _agent_profile_from_spec(spec)
+        # Prompt precedence: body → per-agent base (replace) → org-wide suffix
+        # → per-agent suffix (most-specific = last word).
+        if agent_cfg is not None and agent_cfg.base_system_prompt:
+            sub["system_prompt"] = agent_cfg.base_system_prompt
+        if profile is not None and profile.system_prompt_suffix:
             sub["system_prompt"] = (
-                f"{sub['system_prompt']}\n\n{subagent_cfg.system_prompt_suffix}"
+                f"{sub['system_prompt']}\n\n{profile.system_prompt_suffix}"
             )
-        # Tools: .md → org-wide prune/rewrite → per-subagent prune/rewrite
+        if agent_cfg is not None and agent_cfg.system_prompt_suffix:
+            sub["system_prompt"] = (
+                f"{sub['system_prompt']}\n\n{agent_cfg.system_prompt_suffix}"
+            )
+        # Tools: .md → org-wide prune/rewrite → per-agent prune/rewrite.
         if sub.get("tools"):
             if profile is not None:
                 sub["tools"] = apply_profile_to_tools(sub["tools"], profile)
-            if subagent_cfg is not None and (
-                subagent_cfg.excluded_tools or subagent_cfg.tool_description_overrides
+            if agent_cfg is not None and (
+                agent_cfg.excluded_tools or agent_cfg.tool_description_overrides
             ):
                 from pux_harness.agent.profile import apply_profile_to_tools as _aptt_per
-                sub["tools"] = _aptt_per(sub["tools"], subagent_cfg)
+                sub["tools"] = _aptt_per(sub["tools"], agent_cfg)
         # Retrieval surface, appended AFTER profile filtering so an org-wide
         # ``excluded_tools`` can't strip it. Guarded by ``sub.get("tools")``: a
         # spec with no whitelist inherits the main agent's tools (already

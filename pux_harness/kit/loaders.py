@@ -175,16 +175,148 @@ def build_system_prompt(org: str, *, project_root: Path, addendum: str = "") -> 
 
 # --- agent specs + skills --------------------------------------------------
 
-def _load_agent_spec(slug: str, org: str, project_root: Path) -> dict[str, Any] | None:
+def _merge_extends(base: dict[str, Any], delta_fm: dict[str, Any], body: str) -> dict[str, Any]:
+    """Merge a delta agent (one that declares ``extends:``) onto its resolved
+    base. The base is a FULLY RESOLVED spec (already merged up its own chain);
+    the delta is this agent's OWN frontmatter (``extends:`` already popped) +
+    body. Returns a spec dict in the same ``{**fm, "system_prompt": body}``
+    shape ``_load_agent_spec`` returns, so ``_build_sub`` consumes it unchanged.
+
+    Merge rules (the universal per-agent override vocabulary — the SAME fields
+    that work at the org level via ``profile.yaml`` work here via frontmatter):
+
+    * ``name`` / ``description``: delta wins. ``description_append`` is
+      concatenated onto the effective description (a child can ADD context
+      without restating the parent's).
+    * ``model``: delta wins.
+    * ``tools``: an EXPLICIT ``tools:`` in the delta is a FULL-REPLACE (opt into
+      a fixed whitelist — matches ``_resolve_tools`` semantics). Otherwise the
+      base list is modified additively: ∪ ``tools_add`` − ``tools_remove`` (set
+      semantics on the tool SUFFIX after the last ``/``; base order preserved,
+      adds appended in order, dups + removes dropped).
+    * ``skills``: explicit ``skills:`` full-replace; otherwise ∪ ``skills_add``
+      (additive only — no remove use-case today).
+    * ``tool_description_overrides``: per-key merge, delta wins (Safeguard S5 —
+      keeps the legacy-block fold from leaking a second surface).
+    * ``system_prompt``: base body + delta body joined with ``\\n\\n`` (the
+      delta body IS ``prompt_append`` — least-specific suffix; the org-wide
+      ``system_prompt_suffix`` still layers on AFTER, in ``load_subagents``).
+    """
+    merged: dict[str, Any] = dict(base)
+
+    # name — delta wins.
+    if "name" in delta_fm:
+        merged["name"] = delta_fm["name"]
+
+    # description — delta wins; description_append concatenates onto the
+    # effective description (delta if given, else base).
+    desc = merged.get("description")
+    if "description" in delta_fm:
+        desc = delta_fm["description"]
+    if delta_fm.get("description_append"):
+        desc = f"{desc or ''} {delta_fm['description_append']}".strip()
+    if desc is not None:
+        merged["description"] = desc
+
+    # model — delta wins.
+    if "model" in delta_fm:
+        merged["model"] = delta_fm["model"]
+
+    # tools — explicit full-replace, else additive set union/diff on suffixes.
+    if "tools" in delta_fm:
+        merged["tools"] = delta_fm["tools"]
+    else:
+        base_tools = _parse_list(base.get("tools"))
+        add = _parse_list(delta_fm.get("tools_add"))
+        rem = {t.rsplit("/", 1)[-1] for t in _parse_list(delta_fm.get("tools_remove"))}
+        if add or rem:
+            seen: set[str] = set()
+            out: list[str] = []
+            for entry in [*base_tools, *add]:
+                suffix = entry.rsplit("/", 1)[-1]
+                if suffix in rem or suffix in seen:
+                    continue
+                seen.add(suffix)
+                out.append(entry)
+            merged["tools"] = out
+
+    # skills — explicit full-replace, else additive (dedup, order preserved).
+    if "skills" in delta_fm:
+        merged["skills"] = delta_fm["skills"]
+    elif delta_fm.get("skills_add"):
+        base_skills = _parse_list(base.get("skills"))
+        add = _parse_list(delta_fm.get("skills_add"))
+        seen_s: set[str] = set()
+        out_s: list[str] = []
+        for entry in [*base_skills, *add]:
+            if entry in seen_s:
+                continue
+            seen_s.add(entry)
+            out_s.append(entry)
+        merged["skills"] = out_s
+
+    # tool_description_overrides — per-key merge, delta wins (Safeguard S5).
+    tdo = dict(base.get("tool_description_overrides") or {})
+    if delta_fm.get("tool_description_overrides"):
+        tdo.update(delta_fm["tool_description_overrides"])
+    if tdo:
+        merged["tool_description_overrides"] = tdo
+
+    # system_prompt — base body + delta body (the delta IS prompt_append).
+    base_body = base.get("system_prompt", "")
+    merged["system_prompt"] = f"{base_body}\n\n{body}".strip() if body else base_body
+
+    return merged
+
+
+def _load_agent_spec(
+    slug: str,
+    org: str,
+    project_root: Path,
+    _chain: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
     """Read ``<slug>.md`` from the org-local then ``_shared`` agent dir and
     return a spec dict (``name``/``description`` + optional ``tools``/
     ``skills``/``model`` from frontmatter; ``system_prompt`` = the body).
 
-    Returns ``None`` if no ``<slug>.md`` exists in either search dir."""
+    Returns ``None`` if no ``<slug>.md`` exists in either search dir.
+
+    Phase 2 — ``extends: <base-slug>`` (recursive, cycle-detected). When the
+    frontmatter carries ``extends:``, the base resolves from the SAME search
+    dirs (org-local then ``_shared``) and this slug's frontmatter + body merge
+    ON TOP via ``_merge_extends`` (delta wins; ``tools_add`` / ``tools_remove``
+    / ``skills_add`` / ``description_append`` / ``tool_description_overrides``
+    are the delta vocabulary). A cycle raises ``ValueError``; an unresolvable
+    base raises ``FileNotFoundError`` — both fail loud (the contract surfaces
+    them as ``agent-extends-acyclic`` / ``agent-extends-resolvable``).
+    ``_chain`` is the ordered recursion guard (internal — not for callers)."""
     for d in _agent_search_dirs(org, project_root):
         path = d / f"{slug}.md"
         if path.is_file():
             fm, body = _split_frontmatter(path.read_text())
+            extends = fm.pop("extends", None)
+            if extends is not None:
+                if not isinstance(extends, str) or not extends.strip():
+                    msg = (
+                        f"agent {slug!r}: extends must be a non-empty agent slug, "
+                        f"got {extends!r}"
+                    )
+                    raise ValueError(msg)
+                extends = extends.strip()
+                if slug in _chain:
+                    chain = " -> ".join([*_chain, slug])
+                    msg = f"agent {slug!r}: extends cycle ({chain})"
+                    raise ValueError(msg)
+                base = _load_agent_spec(extends, org, project_root, (*_chain, slug))
+                if base is None:
+                    searched = [str(p / f"{extends}.md")
+                                for p in _agent_search_dirs(org, project_root)]
+                    msg = (
+                        f"agent {slug!r}: extends {extends!r} -> no such agent "
+                        f"(searched {searched})"
+                    )
+                    raise FileNotFoundError(msg)
+                return _merge_extends(base, fm, body)
             return {**fm, "system_prompt": body}
     return None
 

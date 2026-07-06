@@ -56,7 +56,6 @@ __all__ = [
     "default_rubric",
     "validate_profile",
     "apply_profile_to_tools",
-    "load_subagent_overrides",
 ]
 
 
@@ -138,83 +137,6 @@ class MiddlewareOverrides:
     supervisor_remove: frozenset[str] = frozenset()
     subagent_add: frozenset[str] = frozenset()
     subagent_remove: frozenset[str] = frozenset()
-
-
-# --- Phase 2 per-subagent overrides ---------------------------------------
-
-# The subagent-level subset of HarnessProfileConfig fields that the harness
-# can honor per-subagent (applied manually in load_subagents). Keys OUTSIDE
-# this set are rejected with a hint — no silent skip.
-_SUBAGENT_OVERRIDE_KEYS: frozenset[str] = frozenset({
-    "system_prompt_suffix",
-    "base_system_prompt",
-    "excluded_tools",
-    "tool_description_overrides",
-})
-
-
-def _subagent_overrides_from_block(org: str, block: object) -> dict[str, HarnessProfileConfig]:
-    """Parse ``profile.yaml``'s ``subagents:`` block -> ``{slug: HarnessProfileConfig}``.
-
-    Each key is a specialist slug; each value is a mapping whose keys must be
-    ⊆ ``_SUBAGENT_OVERRIDE_KEYS``. Rejected keys (``excluded_middleware``,
-    ``extra_middleware``, ``general_purpose_subagent``) get a specific error
-    message pointing to the right mechanism. Shape validation is delegated to
-    ``HarnessProfileConfig.from_dict``."""
-    if not isinstance(block, dict):
-        msg = (
-            f"{org}/profile.yaml: subagents: must be a mapping, "
-            f"got {type(block).__name__}"
-        )
-        raise TypeError(msg)
-    out: dict[str, HarnessProfileConfig] = {}
-    for slug, sub_block in block.items():
-        if not isinstance(slug, str) or not slug:
-            msg = (
-                f"{org}/profile.yaml: subagents: each key must be a non-empty "
-                f"string slug, got {slug!r}"
-            )
-            raise TypeError(msg)
-        if not isinstance(sub_block, dict):
-            msg = (
-                f"{org}/profile.yaml: subagents.{slug}: must be a mapping, "
-                f"got {type(sub_block).__name__}"
-            )
-            raise TypeError(msg)
-        unknown = set(sub_block) - _SUBAGENT_OVERRIDE_KEYS
-        if unknown:
-            hints: list[str] = []
-            for k in sorted(unknown):
-                if k in ("excluded_middleware", "extra_middleware"):
-                    hints.append(
-                        f"{k!r} is not supported per-subagent; "
-                        f"use the top-level middleware: block instead"
-                    )
-                elif k == "general_purpose_subagent":
-                    hints.append(
-                        f"{k!r} is a graph-level toggle, not a per-subagent field"
-                    )
-                else:
-                    hints.append(f"{k!r} is not a valid per-subagent key")
-            msg = (
-                f"{org}/profile.yaml: subagents.{slug}: unsupported key(s): "
-                f"{'; '.join(hints)}. Allowed: {sorted(_SUBAGENT_OVERRIDE_KEYS)}"
-            )
-            raise TypeError(msg)
-        out[slug] = HarnessProfileConfig.from_dict(sub_block)
-    return out
-
-
-def load_subagent_overrides(org: str) -> dict[str, HarnessProfileConfig]:
-    """Read the ``subagents:`` block from ``orgs/<org>/profile.yaml``.
-
-    Returns ``{}`` when the org ships no ``profile.yaml`` or no ``subagents:``
-    block (the common case — byte-identical to today). Shape-validated via
-    ``_subagent_overrides_from_block``."""
-    data = _read_profile_yaml(org)
-    if data is None or "subagents" not in data:
-        return {}
-    return _subagent_overrides_from_block(org, data["subagents"])
 
 
 def _validate_models_block(org: str, data: dict) -> None:
@@ -440,7 +362,14 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
     data = _read_profile_yaml(org)
     if data is None:
         return None
-    peeled = {k: v for k, v in data.items() if k not in ("rubric", "models", "middleware", "subagents")}
+    # ``rubric`` / ``models`` / ``middleware`` are VALID harness blocks peeled
+    # out + read by their own loaders. ``subagents`` is NOT peeled on purpose
+    # (Phase 2 fold): the legacy ``profile.yaml`` ``subagents:`` block was
+    # replaced by per-agent ``extends:`` + delta frontmatter fields, so leaving
+    # it in lets ``HarnessProfileConfig.from_dict`` reject it as an unknown key
+    # (and the ``no-legacy-subagents-block`` contract tripwire points the operator
+    # at the replacement). No silent skip — a stale block is a real bug.
+    peeled = {k: v for k, v in data.items() if k not in ("rubric", "models", "middleware")}
     return HarnessProfileConfig.from_dict(peeled)
 
 
@@ -486,10 +415,11 @@ def validate_profile(org: str) -> HarnessProfileConfig | None:
     allowed on subagents — is checked by ``stack.validate_overrides``; this only
     shape-checks.)
     """
-    cfg = load_profile(org)              # raises on a malformed non-peeled schema
+    cfg = load_profile(org)              # raises on a malformed schema (incl. a
+                                        # legacy ``subagents:`` block — Phase 2
+                                        # fold: from_dict now rejects that key)
     load_rubric_gate(org)                # raises on a malformed rubric: block
     load_middleware_overrides(org)       # raises on a malformed middleware: block
-    load_subagent_overrides(org)         # raises on a malformed subagents: block
     return cfg
 
 
