@@ -208,10 +208,12 @@ def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:
     SKIPPED — the backend's ``FilesystemMiddleware`` injects the fs/shell tools
     into every subagent regardless of its whitelist, so they have no entry in
     the specialist ``tool_map`` (previously the runtime would have raised
-    KeyError on one while the contract accepted it). A specialist slug resolves
-    to its ``pux_sandbox_*`` StructuredTool; anything else fails loud — a stale
-    reference is a real bug. Sharing the classifier with the contract means the
-    runtime and offline paths can no longer disagree.
+    KeyError on one while the contract accepted it). Any other slug resolves iff
+    its ``pux_sandbox_*`` key is present in ``tool_map`` — that admits BOTH
+    REGISTRY specialists AND org-declared sandbox tools (``sandbox/tools/tools.yaml``),
+    which share the prefix; a stale/unknown reference still fails loud. Sharing
+    the classifier with the contract means the runtime and offline paths can no
+    longer disagree.
     """
     resolved: list[BaseTool] = []
     for entry in _aloaders._parse_list(raw):
@@ -220,10 +222,14 @@ def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:
         if kind is Category.NATIVE:
             continue
         key = prefixed(slug, Category.SPECIALIST)
-        if kind is not Category.SPECIALIST or key not in tool_map:
+        # Resolve iff the tool is actually present in the map. REGISTRY
+        # specialists and declared sandbox tools BOTH key under ``pux_sandbox_*``
+        # (declared tools share the specialist prefix), so a single membership
+        # check admits both; a stale/unknown reference still fails loud.
+        if key not in tool_map:
             raise KeyError(
                 f"agent references unknown tool {entry!r} "
-                f"(resolved {key!r}, not in the specialist tool map)"
+                f"(resolved {key!r}, not in the tool map)"
             )
         resolved.append(tool_map[key])
     return resolved

@@ -81,6 +81,7 @@ from pux_harness.agent import profile as profile_mod
 from pux_harness.agent import model as model_mod
 from pux_harness.agent import stack as stack_mod
 from pux_harness.agent import tool_servers as tool_servers_mod
+from pux_harness.sandbox.tools import declared as declared_mod
 from pux_harness.sandbox.tools import (
     NATIVE_FS_TOOLS,
     SPECIALIST_TOOL_NAMES,
@@ -437,20 +438,28 @@ def check_org(name: str) -> list[Violation]:
     # Rule 4: tool whitelist resolves through the shared classifier
     # (``classify_slug`` from the tool registry). A native slug is accepted
     # (FilesystemMiddleware injects the fs/shell tools for every subagent), a
-    # specialist slug resolves to a ``pux_sandbox_*`` tool, anything else is
+    # specialist slug resolves to a ``pux_sandbox_*`` tool, a DECLARED sandbox
+    # tool name (``sandbox/tools/tools.yaml``) is admitted too, anything else is
     # unknown. The SAME classifier drives the runtime ``_resolve_tools`` in
     # ``orgs.py``, so the offline check and the runtime can no longer disagree
     # (the old paths diverged on native slugs). No server probe — pure Python,
     # runs identically in pytest and ``--check-contract``.
+    declared_names = declared_mod.declared_tool_names(org_dir / "sandbox")
     for slug, sub in agent_subagents.items():
         for raw in _parse_list(sub.get("tools", [])):
             tool = raw.rsplit("/", 1)[-1]
-            if classify_slug(tool) is None:
+            if classify_slug(tool) is None and tool not in declared_names:
                 v.append(Violation("error", "tool-resolves",
                                    f"{name}/{slug}: tool {raw!r} -> "
                                    f"{prefixed(tool, Category.SPECIALIST)!r} "
-                                   f"not a native fs tool or a "
-                                   f"pux_sandbox_* specialist"))
+                                   f"not a native fs tool, a "
+                                   f"pux_sandbox_* specialist, or a declared "
+                                   f"sandbox tool"))
+
+    # Declared sandbox tools are their own channel (policy-independent): validate
+    # every org unconditionally, even those with no ``policy.yaml``. No-op when
+    # the org declares no ``sandbox/tools/tools.yaml``.
+    v.extend(_validate_sandbox_tools(name))
 
     # Rule 5: policy.yaml parses + valid schema + known sections.
     policy_path = org_dir / "policy.yaml"
@@ -656,6 +665,20 @@ def _validate_tool_servers(name: str, pol: policy_mod.Policy) -> list[Violation]
     v: list[Violation] = []
     for err in tool_servers_mod.validate_tool_servers(name):
         v.append(Violation("error", "tool-servers", err))
+    return v
+
+
+def _validate_sandbox_tools(name: str) -> list[Violation]:
+    """Offline validation of the org's declared sandbox tools
+    (``sandbox/tools/tools.yaml``). Mirrors ``declared.validate_declared_tools``
+    but returns Violation objects instead of plain strings.
+
+    Policy-independent — declared tools are their own channel (in-container
+    scripts surfaced as typed tools), so this runs for every org, even those
+    with no ``policy.yaml``. No-op when the org declares no tools.yaml."""
+    v: list[Violation] = []
+    for err in declared_mod.validate_declared_tools(_org_path(name) / "sandbox"):
+        v.append(Violation("error", "sandbox-tools", err))
     return v
 
 

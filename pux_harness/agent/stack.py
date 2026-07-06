@@ -60,6 +60,7 @@ from pux_harness.agent.model import get_model
 from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
     _build_general_purpose_sub,
+    _org_path,
     build_system_prompt,
     load_subagents,
     supervisor_skills_roots,
@@ -79,6 +80,7 @@ from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
 from pux_harness.context.session_guide import SessionGuideMiddleware
 from pux_harness.sandbox.tools import build_grader_tools
+from pux_harness.sandbox.tools.declared import build_declared_tools
 
 __all__ = [
     "Scope",
@@ -462,9 +464,20 @@ def build_stack(
     )
     ctx_tools = list(ctx.emitted_tools_supervisor)
 
+    # Declared sandbox tools: org-local ``sandbox/tools/tools.yaml`` -> typed
+    # ``pux_sandbox_*`` StructuredTools whose ``func`` exec's the script
+    # IN-CONTAINER. Empty for orgs that declare none (byte-identical stack).
+    # They share the specialist prefix, so they key into the same ``tool_map``
+    # and resolve through the same agent ``tools:`` allowlist as REGISTRY
+    # specialists (``_resolve_tools`` admits anything present in the map).
+    declared = build_declared_tools(_org_path(org) / "sandbox", exec_client)
+
     # Tools: MCP tools first (so profile overrides can shape them), then every
-    # specialist + the retrieval surface.
-    supervisor_tools: list[BaseTool] = [*mcp_tools, *specialists, *ctx_tools]
+    # specialist + declared + the retrieval surface. Declared tools ride the
+    # SAME surface as specialists so the supervisor can call them AND a subagent
+    # can be granted one via its ``tools:`` allowlist.
+    tools_surface: list[BaseTool] = [*specialists, *declared]
+    supervisor_tools: list[BaseTool] = [*mcp_tools, *tools_surface, *ctx_tools]
     if profile is not None:
         supervisor_tools = apply_profile_to_tools(supervisor_tools, profile)
 
@@ -477,7 +490,7 @@ def build_stack(
             prompt = f"{prompt}\n\n{profile.system_prompt_suffix}"
 
     subagents = load_subagents(
-        org, specialists,
+        org, tools_surface,
         profile=profile,
         subagent_middleware=subagent_middleware,
         retrieval_tools=ctx_tools,
