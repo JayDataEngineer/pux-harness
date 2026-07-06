@@ -54,7 +54,12 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.model import get_model
-from pux_harness.agent.orgs import build_system_prompt, load_subagents
+from pux_harness.agent.orgs import (
+    _GENERAL_PURPOSE_NAME,
+    _build_general_purpose_sub,
+    build_system_prompt,
+    load_subagents,
+)
 from pux_harness.agent.profile import (
     HarnessProfileConfig,
     MiddlewareOverrides,
@@ -423,6 +428,38 @@ def build_stack(
         retrieval_tools=ctx_tools,
         subagent_overrides=subagent_overrides,
     )
+
+    # Phase 1 — own the general-purpose subagent. deepagents auto-adds a HEAVY
+    # ``general-purpose`` subagent to EVERY graph (deepagents/graph.py:716-717)
+    # unless ``gp_profile.enabled is False`` OR a spec named ``general-purpose``
+    # is already in the inline subagents. pux passes no GP kwarg AND stays off
+    # the model-keyed ``_HARNESS_PROFILES`` registry (two orgs on one model
+    # would merge-collide; the long-lived server builds many orgs per process;
+    # there is no ``unregister``), so without an explicit spec the auto-add
+    # fires for EVERY org — even dev-bot, whose roster rule
+    # (``dev-bot-no-general-subagent``) reads ``org.yaml`` and so NEVER sees the
+    # auto-added slot.
+    #
+    # Honor the NATIVE field (no parallel grammar): when the org's profile
+    # carries a ``general_purpose_subagent:`` block (flowed straight through
+    # ``HarnessProfileConfig.from_dict``), pux emits its OWN ``name=
+    # "general-purpose"`` spec → the name now already exists inline → deepagents
+    # skips the auto-add. The no-block case emits NOTHING, so deepagents'
+    # auto-add still fires (byte-identical to today — the parity path). Three
+    # cases live in ``orgs._build_general_purpose_sub``: neutered (enabled:
+    # false) vs customized vs default.
+    if profile is not None and profile.general_purpose_subagent is not None:
+        # Defense against an org that ALSO rostered a literal "general-purpose"
+        # specialist in org.yaml — the roster entry wins (don't double-emit;
+        # ``not any(...)`` mirrors deepagents' own guard so there's one slot).
+        if not any(s["name"] == _GENERAL_PURPOSE_NAME for s in subagents):
+            subagents.append(_build_general_purpose_sub(
+                profile.general_purpose_subagent,
+                org,
+                tool_surface=[*specialists, *ctx_tools],
+                middleware=subagent_middleware,
+                profile=profile,
+            ))
 
     return StackPlan(
         supervisor_tools=supervisor_tools,

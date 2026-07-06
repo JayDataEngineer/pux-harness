@@ -23,13 +23,19 @@ no ``importlib``. Tool + skills resolution stays CENTRAL (here, via
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.model import get_model
 from pux_harness.sandbox.tools import Category, classify_slug, prefixed
+
+if TYPE_CHECKING:
+    # Type-only: deepagents profile shapes referenced in the general-purpose
+    # subagent builder. ``from __future__ import annotations`` keeps them lazy,
+    # so there is no runtime deepagents import at module load here.
+    from deepagents import GeneralPurposeSubagentProfile, HarnessProfileConfig
 
 # The PURE org/agent loaders live in ``pux_harness.kit`` (the slim, Docker-free
 # core — the ONE source of truth for how an org dir / agent <slug>.md /
@@ -284,6 +290,113 @@ def _build_sub(
         sub["skills"] = _resolve_skills(spec["skills"], slug)
     sub["middleware"] = list(middleware)
     return sub
+
+
+# --- the general-purpose subagent (own the GP) -----------------------------
+#
+# deepagents auto-adds a HEAVY default ``general-purpose`` subagent to EVERY
+# graph (deepagents/graph.py:716-717) unless ``gp_profile.enabled is False`` OR
+# a spec named ``general-purpose`` is already in the inline subagents. pux
+# passes no GP kwarg to ``create_deep_agent`` and stays off the model-keyed
+# ``_HARNESS_PROFILES`` registry (two orgs on one model would merge-collide; the
+# long-lived server builds many orgs per process; and there is no
+# ``unregister``). So without an explicit spec the auto-add fires for EVERY pux
+# org — including dev-bot, the Claude-Code-equivalent coding org whose roster
+# rule (``dev-bot-no-general-subagent``) checks ``org.yaml`` and so NEVER sees
+# the auto-added slot.
+#
+# The fix honors the NATIVE field (no parallel grammar): when an org's
+# ``profile.yaml`` carries a ``general_purpose_subagent:`` block — surfaced
+# straight through ``HarnessProfileConfig.from_dict`` — pux emits its OWN
+# ``name="general-purpose"`` spec, and deepagents then skips the auto-add (the
+# name already exists). Three cases:
+#   * no block (``cfg.general_purpose_subagent is None``) -> pux emits NOTHING;
+#     deepagents auto-adds its default (byte-identical to today — the parity path).
+#   * ``enabled: false`` -> a NEUTERED spec (empty tools + an honest disabled
+#     description/prompt). Occupies the task-menu slot but is dead — even a
+#     stray delegation returns immediately. (Safeguard S1: full removal would
+#     need the registry pux can't safely use; the neuter is strictly better than
+#     the heavy auto-add leak.)
+#   * ``enabled`` None/True (+ optional description/system_prompt) -> a
+#     CUSTOMIZED spec on the full specialist + retrieval surface, with the org's
+#     profile overrides applied the same way every roster subagent's are.
+
+_GENERAL_PURPOSE_NAME = "general-purpose"
+
+# The pux-default description/system_prompt for a customized GP the org enables
+# without supplying its own (the native field's description/system_prompt are
+# both optional). Mirrors deepagents' GENERAL_PURPOSE_SUBAGENT intent: a
+# generalist fallback for tasks no specialist covers.
+_DEFAULT_GP_DESCRIPTION = (
+    "General-purpose worker for tasks no specialist covers. Has the full "
+    "specialist + retrieval tool surface."
+)
+_DEFAULT_GP_PROMPT = (
+    "You are a general-purpose subagent. Complete the delegated task directly "
+    "using the tools available; do not delegate further. Return the result, not "
+    "a log of how you got there."
+)
+
+# Safeguard S1: the disabled slot must say so honestly + carry NO tools, so even
+# a stray delegation returns immediately rather than silently doing generic work.
+_DISABLED_GP_DESCRIPTION = "Disabled for this org — do not delegate here."
+_DISABLED_GP_PROMPT = (
+    "This subagent is disabled for this org. Do not attempt the task; return "
+    "immediately with a one-line notice that this slot is disabled."
+)
+
+
+def _build_general_purpose_sub(
+    gp: "GeneralPurposeSubagentProfile",
+    org: str,
+    *,
+    tool_surface: list[BaseTool],
+    middleware: list[AgentMiddleware],
+    profile: "HarnessProfileConfig | None",
+) -> dict[str, Any]:
+    """Build the ``general-purpose`` subagent spec from a profile's GP config.
+
+    Emitted by the factory (``stack.build_stack``) ONLY when the org's
+    ``profile.yaml`` carries a ``general_purpose_subagent:`` block — so the
+    no-block case stays byte-identical to deepagents' auto-add. See the module
+    note above for the three-case shape (disabled / customized) + the
+    no-registry rationale.
+
+    ``tool_surface`` is the general pux surface (specialists + retrieval); it is
+    profile-filtered here (``excluded_tools`` / ``tool_description_overrides``)
+    the same way every roster subagent's whitelist is (``apply_profile_to_tools``
+    — imported lazily because ``profile.py`` imports ``_orgs_dir`` from THIS
+    module → a cycle), so an org-wide override reaches the GP too. The org-wide
+    ``system_prompt_suffix`` layers on top of the GP prompt (custom or default),
+    matching the precedence every other subagent follows in ``load_subagents``."""
+    # Lazy import: profile.py imports ``_orgs_dir`` from THIS module → cycle.
+    from pux_harness.agent.profile import apply_profile_to_tools
+
+    model = get_model(role="worker", org=org)
+    if gp.enabled is False:
+        return {
+            "name": _GENERAL_PURPOSE_NAME,
+            "description": _DISABLED_GP_DESCRIPTION,
+            "system_prompt": _DISABLED_GP_PROMPT,
+            "tools": [],
+            "model": model,
+            "middleware": [],
+        }
+    description = gp.description or _DEFAULT_GP_DESCRIPTION
+    prompt = gp.system_prompt or _DEFAULT_GP_PROMPT
+    if profile is not None and profile.system_prompt_suffix:
+        prompt = f"{prompt}\n\n{profile.system_prompt_suffix}"
+    tools = list(tool_surface)
+    if profile is not None:
+        tools = apply_profile_to_tools(tools, profile)
+    return {
+        "name": _GENERAL_PURPOSE_NAME,
+        "description": description,
+        "system_prompt": prompt,
+        "tools": tools,
+        "model": model,
+        "middleware": list(middleware),
+    }
 
 
 def load_subagents(

@@ -219,6 +219,35 @@ def check_org(name: str) -> list[Violation]:
                 f"({bad}); the CTO does the thinking — delegate only to "
                 f"dev-bot-explorer / code-worker / web-agent"))
 
+    # Phase 1 — defense in depth via a SECOND code path. The roster rule above
+    # (``dev-bot-no-general-subagent``) reads org.yaml, so it NEVER sees the
+    # ``general-purpose`` slot deepagents auto-adds to EVERY graph
+    # (deepagents/graph.py:716-717) when no inline spec owns that name. This
+    # sibling rule reads profile.yaml and asserts dev-bot OPTS OUT of that
+    # auto-add via the NATIVE ``general_purpose_subagent.enabled: false`` field
+    # — which the harness turns into a neutered spec (``orgs.
+    # _build_general_purpose_sub``, Safeguard S1). Two layers, two files, one
+    # intent: dev-bot must not ship a generic catch-all worker. A re-enable OR a
+    # dropped field is a HARD contract failure, not a silent drift back to the
+    # heavy auto-add. (Skipped on a malformed profile — the ``profile-schema``
+    # rule below already reports that, no double-noise.)
+    if name == "dev-bot":
+        gp_cfg: Any = None
+        gp_ok = True
+        try:
+            gp_cfg = profile_mod.load_profile(name)
+        except (TypeError, ValueError, yaml.YAMLError):
+            gp_ok = False
+        if gp_ok:
+            gp = gp_cfg.general_purpose_subagent if gp_cfg is not None else None
+            if gp is None or gp.enabled is not False:
+                v.append(Violation(
+                    "error", "dev-bot-disables-general-purpose",
+                    "dev-bot: profile.yaml must declare "
+                    "'general_purpose_subagent: {enabled: false}' — deepagents "
+                    "otherwise auto-adds a heavy generic worker the roster rule "
+                    "(dev-bot-no-general-subagent) cannot see"))
+
     # Rule 3: every slug resolves to a valid agent .md (org-local or _shared)
     # with required frontmatter keys + a non-empty body (system_prompt).
     agent_subagents: dict[str, dict[str, Any]] = {}
