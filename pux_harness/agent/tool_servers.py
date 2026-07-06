@@ -85,10 +85,22 @@ class _MissingPlaceholder(Exception):
 def _substitute_spec(
     spec: ToolServerSpec,
     env: dict[str, str] | None = None,
+    *,
+    permissive: bool = False,
 ) -> ToolServerSpec:
     """Return a copy of ``spec`` with ``${VAR}`` placeholders resolved in
-    ``url``, ``headers`` values, and ``env`` values. Raises ``ValueError`` on
-    any unresolved placeholder or missing credential."""
+    ``url``, ``headers`` values, and ``env`` values.
+
+    Raises ``ValueError`` on any unresolved placeholder or missing credential.
+    When ``permissive=True`` (the offline-contract path), unresolved
+    placeholders are LEFT AS-IS instead of raising — the field is structurally
+    present (non-empty); its VALUE is a runtime/env concern the contract cannot
+    check without the operator's secrets. This is what lets a catalog ship a
+    git-safe ``url: ${PUX_MCP_WEB_RESEARCH_URL}`` that passes
+    ``--check-contract`` offline while still failing loud at load time if the
+    operator forgot to set the var. Credential checks still raise in both modes
+    (a declared credential absent from env is reported as its own contract
+    error, not swallowed)."""
     e = os.environ if env is None else dict(env)
     missing_creds = [c for c in spec.credentials if not e.get(c, "")]
     if missing_creds:
@@ -96,33 +108,23 @@ def _substitute_spec(
             f"tool server {spec.name!r}: missing required credential(s): "
             f"{missing_creds}"
         )
-    url = spec.url
-    if url:
-        resolved = _expand_env(url, e)
-        if resolved is None:
-            raise ValueError(
-                f"tool server {spec.name!r}: unresolved ${_missing_var(url, e)} "
-                f"in url {url!r}"
-            )
-        url = resolved
-    headers = dict(spec.headers)
-    for k, v in headers.items():
-        resolved = _expand_env(v, e)
-        if resolved is None:
-            raise ValueError(
-                f"tool server {spec.name!r}: unresolved ${_missing_var(v, e)} "
-                f"in header {k}"
-            )
-        headers[k] = resolved
-    env_resolved = dict(spec.env)
-    for k, v in env_resolved.items():
-        resolved = _expand_env(v, e)
-        if resolved is None:
-            raise ValueError(
-                f"tool server {spec.name!r}: unresolved ${_missing_var(v, e)} "
-                f"in env {k}"
-            )
-        env_resolved[k] = resolved
+
+    def _resolve(value: str, field: str) -> str:
+        if not value:
+            return value
+        resolved = _expand_env(value, e)
+        if resolved is not None:
+            return resolved
+        if permissive:
+            return value  # leave ${VAR} as-is (offline structural check)
+        raise ValueError(
+            f"tool server {spec.name!r}: unresolved ${_missing_var(value, e)} "
+            f"in {field} {value!r}"
+        )
+
+    url = _resolve(spec.url, "url")
+    headers = {k: _resolve(v, f"header {k}") for k, v in spec.headers.items()}
+    env_resolved = {k: _resolve(v, f"env {k}") for k, v in spec.env.items()}
     return ToolServerSpec(
         name=spec.name,
         kind=spec.kind,
@@ -243,6 +245,8 @@ def load_catalog() -> dict[str, ToolServerSpec]:
 def resolve_tool_servers(
     org: str,
     env: dict[str, str] | None = None,
+    *,
+    permissive: bool = False,
 ) -> list[ToolServerSpec]:
     """Resolve the org's ``policy.yaml`` ``tool_servers:`` list into fully-
     resolved ``ToolServerSpec`` objects.
@@ -253,9 +257,15 @@ def resolve_tool_servers(
       - ``{name, kind, transport, ...}`` → inline spec
 
     Raises ``ValueError`` on unknown catalog ref, unknown kind, missing
-    transport-required fields, duplicate resolved name, or unresolved
-    ``${VAR}`` placeholders. Returns ``[]`` when the org has no tool_servers
-    declaration or the list is empty."""
+    transport-required fields, duplicate resolved name, or (unless
+    ``permissive=True``) unresolved ``${VAR}`` placeholders. Returns ``[]``
+    when the org has no tool_servers declaration or the list is empty.
+
+    ``permissive=True`` is the offline-contract path: ``${VAR}`` placeholders
+    are left unresolved instead of raising, so structural validation (the field
+    is declared, the transport is known, the catalog ref resolves) can run
+    without the operator's env/secret values. The runtime path
+    (``permissive=False``, the default) fails loud on any unresolved var."""
     from pux_harness.sandbox import policy as policy_mod
     from pux_harness.sandbox.policy import NoPolicy
 
@@ -327,7 +337,7 @@ def resolve_tool_servers(
             )
         seen.add(name)
 
-        spec = _substitute_spec(spec, env)
+        spec = _substitute_spec(spec, env, permissive=permissive)
         resolved.append(spec)
 
     return resolved
@@ -343,7 +353,11 @@ def validate_tool_servers(org: str) -> list[str]:
     declaration fails ``--check-contract``."""
     errors: list[str] = []
     try:
-        specs = resolve_tool_servers(org, env={})
+        # permissive=True: validate STRUCTURE without the operator's env values.
+        # A catalog entry may ship a git-safe ``url: ${VAR}`` whose value is
+        # injected at runtime; the contract must pass that offline (the field is
+        # declared) while the runtime path still fails loud if the var is unset.
+        specs = resolve_tool_servers(org, env={}, permissive=True)
     except ValueError as e:
         return [str(e)]
     for spec in specs:
