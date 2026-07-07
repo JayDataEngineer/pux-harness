@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, PrivateAttr
 
 from pux_harness.kit import compile_org, load_subagents
+from pux_harness.kit._testing import ScriptedModel
 
 
 # --- a scripted model + a stub tool (offline; no API key) -------------------
@@ -42,17 +42,15 @@ def _stub_tool() -> StructuredTool:
     )
 
 
-class _ScriptedModel(BaseChatModel):
-    """Call ``generate_form`` once, then end the turn."""
+class _ScriptedModel(ScriptedModel):
+    """Call ``generate_form`` once, then end the turn.
+
+    Inherits ``_llm_type`` + ``bind_tools`` from the shared compile-only
+    ``ScriptedModel`` (``kit/_testing.py``); only ``_generate`` is overridden
+    here to drive a real tool call for the invoke-path tests below.
+    """
 
     _calls: int = PrivateAttr(default=0)
-
-    @property
-    def _llm_type(self) -> str:
-        return "scripted"
-
-    def bind_tools(self, tools: Any, **kwargs: Any) -> "_ScriptedModel":
-        return self
 
     def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None,
                   **kwargs: Any) -> ChatResult:
@@ -177,7 +175,7 @@ def test_import_isolation_no_docker_no_heavy_subsystem() -> None:
     subprocess so prior test imports don't pollute ``sys.modules``."""
     code = (
         "import sys; import pux_harness.kit; import pux_harness.kit.compile; "
-        "import pux_harness.kit.loaders; "
+        "import pux_harness.kit.loaders; import pux_harness.kit._testing; "
         "mods = sys.modules; "
         "heavy = ['docker', 'pux_harness.sandbox', 'pux_harness.browser', "
         "'pux_harness.context']; "
