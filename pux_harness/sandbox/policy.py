@@ -186,6 +186,19 @@ class Policy:
     host_setup: list[HostSetupHook] = field(default_factory=list)
     jobs: list[JobSpec] = field(default_factory=list)
     tool_servers: list = field(default_factory=list)
+    protocols: list = field(default_factory=list)
+
+
+# Agent-facing protocol surfaces an org may declare in policy.yaml.
+# ``acp`` = stdio Agent Client Protocol (``pux acp --org <name>`` — always
+# available, per-spawn, nothing to mount); ``agui`` = CopilotKit AG-UI SSE
+# (``pux serve`` mounts ``/agui/{name}``). Absent/empty ``protocols:`` resolves
+# to DEFAULT_PROTOCOLS (both), so the declaration is opt-in NARROWING + explicit
+# self-description — never a regression: an org without it behaves as before
+# (all surfaces). KNOWN_PROTOCOLS is the single source contract.py validates
+# against.
+DEFAULT_PROTOCOLS: list[str] = ["acp", "agui"]
+KNOWN_PROTOCOLS: frozenset[str] = frozenset(DEFAULT_PROTOCOLS)
 
 
 @dataclass
@@ -308,6 +321,13 @@ def _policy_from_dict(d: Mapping) -> Policy:
     if not isinstance(ts_raw, list):
         raise PolicyError("policy: section 'tool_servers' must be a list")
     pol.tool_servers = list(ts_raw)
+    # protocols: which agent-facing surfaces this org declares (see
+    # DEFAULT_PROTOCOLS). Absent or empty -> resolve_protocols() yields the
+    # DEFAULT, preserving today's "all surfaces for all orgs".
+    proto_raw = d.get("protocols") or []
+    if not isinstance(proto_raw, list):
+        raise PolicyError("policy: section 'protocols' must be a list")
+    pol.protocols = [str(x) for x in proto_raw]
     return pol
 
 
@@ -349,6 +369,28 @@ def load(org_name: str, project_root: str | Path) -> Policy:
         if not rule.protocol:
             rule.protocol = "tcp"
     return pol
+
+
+# --- protocols ----------------------------------------------------------------
+
+
+def resolve_protocols(pol: Policy) -> list[str]:
+    """The surfaces an org actually exposes. Declared non-empty -> as-is (a
+    NARROWED set, e.g. ``[acp]`` for a coding org that should not mount AG-UI);
+    absent/empty -> :data:`DEFAULT_PROTOCOLS` (both surfaces)."""
+    return list(pol.protocols) if pol.protocols else list(DEFAULT_PROTOCOLS)
+
+
+def protocols_for_org(org_name: str, project_root: str | Path) -> list[str]:
+    """Load-bearing seam for ``pux serve``'s AG-UI mount gate + tests. Resolves
+    the org's declared surfaces, defaulting to :data:`DEFAULT_PROTOCOLS` when
+    the org has no policy.yaml (NoPolicy) — so a policy-less org keeps today's
+    behavior (all surfaces mounted)."""
+    try:
+        pol = load(org_name, project_root)
+    except NoPolicy:
+        return list(DEFAULT_PROTOCOLS)
+    return resolve_protocols(pol)
 
 
 # --- credentials --------------------------------------------------------------

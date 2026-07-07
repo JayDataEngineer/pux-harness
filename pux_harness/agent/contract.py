@@ -118,7 +118,7 @@ _REQUIRED_AGENT_KEYS: frozenset[str] = frozenset({
 # ``build`` is a sub-key under ``sandbox``, NOT a top-level section.
 KNOWN_POLICY_SECTIONS: frozenset[str] = frozenset({
     "workspace", "egress", "credentials", "sandbox", "browser", "host_setup",
-    "jobs", "tool_servers",
+    "jobs", "tool_servers", "protocols",
 })
 
 # ``NATIVE_FS_TOOLS`` is imported from ``pux_harness.sandbox.tools`` (derived
@@ -496,6 +496,7 @@ def check_org(name: str) -> list[Violation]:
                 v.extend(_validate_build_spec(name, pol))
                 v.extend(_validate_jobs(name, pol))
                 v.extend(_validate_tool_servers(name, pol))
+                v.extend(_validate_protocols(name, pol))
         elif parsed is not None:
             v.append(Violation("error", "policy-shape",
                                f"{name}: policy.yaml top-level must be a "
@@ -670,6 +671,23 @@ def _validate_tool_servers(name: str, pol: policy_mod.Policy) -> list[Violation]
     v: list[Violation] = []
     for err in tool_servers_mod.validate_tool_servers(name):
         v.append(Violation("error", "tool-servers", err))
+    return v
+
+
+def _validate_protocols(name: str, pol: policy_mod.Policy) -> list[Violation]:
+    """Offline validation of the ``protocols`` declaration. Each entry must be a
+    known surface (``policy.KNOWN_PROTOCOLS``); an unknown entry is a typo (or a
+    surface that doesn't exist yet). Empty/absent is valid — it resolves to the
+    default (both surfaces)."""
+    v: list[Violation] = []
+    allowed = sorted(policy_mod.KNOWN_PROTOCOLS)
+    for proto in pol.protocols:
+        if proto not in policy_mod.KNOWN_PROTOCOLS:
+            v.append(Violation(
+                "error", "protocols",
+                f"{name}: policy.yaml protocols entry {proto!r} is not a known "
+                f"surface; allowed: {allowed}",
+            ))
     return v
 
 

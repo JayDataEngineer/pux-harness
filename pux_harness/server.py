@@ -153,9 +153,17 @@ async def lifespan(app: FastAPI):
                 _mcp_managers[org_name] = mgr
                 app.state.mcp[org_name] = mgr.tools
 
-        # Register AG-UI endpoints now that the checkpointer is ready.
+        # Register AG-UI endpoints now that the checkpointer is ready — but only
+        # for orgs that declare the `agui` surface in policy.yaml (absent ->
+        # DEFAULT both, so this only ever NARROWS: an org opting `protocols:
+        # [acp]` is excluded from the web/AG-UI mount). See
+        # policy.protocols_for_org.
         if _HAS_AG_UI:
+            from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
+            from pux_harness.kit._paths import project_root  # noqa: PLC0415
             for org_name in discover_orgs():
+                if "agui" not in policy_mod.protocols_for_org(org_name, project_root()):
+                    continue
                 add_langgraph_fastapi_endpoint(
                     app=app,
                     agent=LangGraphAGUIAgent(
