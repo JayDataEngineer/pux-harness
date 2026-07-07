@@ -3,16 +3,24 @@
 The ONE langgraph invoke-config builder for both graph-invoke sites (``main.py``
 for ``pux direct`` and ``server.py`` for ``pux serve``). When Langfuse is
 installed AND the ``LANGFUSE_PUBLIC_KEY`` / ``LANGFUSE_SECRET_KEY`` env vars are
-set, every run is traced to a Langfuse session (one session per ``thread_id``,
-tagged with the org + transport). When either is absent,
+set, every run is traced to a Langfuse session. When either is absent,
 ``build_invoke_config`` returns the plain config the graph already used — zero
 behavior change.
 
 Rely-on-upstream: we attach langfuse's own LangChain ``CallbackHandler`` to the
 langgraph config ``callbacks`` — no hand-rolled tracing. langgraph fans that
-callback across every node / LLM / tool call in the deepagents graph
-automatically, so plans, delegations, tool calls, and token cost are all
-captured.
+callback across every node / LLM / tool call in the deepagents graph, so plans,
+delegations, tool calls, and token cost are all captured.
+
+**langfuse v4 API (verified against the installed 4.x source):** the handler
+constructor takes only ``public_key`` / ``trace_context`` — NOT ``session_id`` /
+``tags``. Per-run trace attributes are set via the run **metadata** that
+langgraph propagates from ``config["metadata"]``; langfuse reads the reserved
+keys ``langfuse_session_id`` (str) and ``langfuse_tags`` (list). So the thread
+id becomes the session id (one session per resumed thread) and org/transport
+become tags (UI filter axes). This was confirmed by reading the installed
+``langfuse.langchain.CallbackHandler`` source — a constructor ``session_id=``
+kwarg raises ``TypeError`` in v4 (the unit test pins this).
 
 A down / unreachable Langfuse host NEVER blocks a run: the handler is
 best-effort and queues locally. We gate on env PRESENCE (not a live auth check)
@@ -20,7 +28,7 @@ precisely so a configured-but-down host can't take a run down with it.
 
 ACP (``acp.py``) is NOT wired here: deepagents-acp owns graph invocation and
 exposes no per-thread ``session_id`` seam at build time. Documented as a known
-gap (Phase D live proof covers the ``direct`` + ``serve`` lanes).
+gap (the live proof covers the ``direct`` + ``serve`` lanes).
 """
 from __future__ import annotations
 
@@ -51,21 +59,18 @@ def _env_configured() -> bool:
     )
 
 
-def langfuse_handler(org: str, transport: str, thread_id: str) -> Any | None:
-    """A Langfuse ``CallbackHandler`` for one run, or ``None`` (no-op).
+def langfuse_handler() -> Any | None:
+    """A bare Langfuse ``CallbackHandler``, or ``None`` (no-op).
 
     ``None`` (run untraced) when langfuse is not importable OR the credential
-    env vars are unset. ``transport`` tags the surface (``direct`` / ``serve``);
-    the ``thread_id`` becomes the Langfuse ``session_id`` so a resumed thread is
-    a single session in the UI.
+    env vars are unset. The v4 handler reads its keys from the env itself (via
+    ``get_client()``); per-run ``session_id`` / ``tags`` are NOT constructor
+    args — they're attached in ``build_invoke_config`` via ``config["metadata"]``
+    (langfuse attribute propagation).
     """
     if not _HAS_LANGFUSE or not _env_configured():
         return None
-    return _LangfuseHandler(  # type: ignore[misc]
-        session_id=thread_id,
-        tags=[f"org:{org}", f"transport:{transport}"],
-        metadata={"org": org, "transport": transport, "thread_id": thread_id},
-    )
+    return _LangfuseHandler()  # type: ignore[misc]
 
 
 def build_invoke_config(
@@ -77,15 +82,22 @@ def build_invoke_config(
     """The ONE langgraph invoke-config builder for both invoke sites.
 
     Identical to the prior inline dict (``configurable.thread_id`` +
-    ``recursion_limit``) when Langfuse is off; adds ``callbacks`` when on. Use
-    from ``main.py`` (transport ``"direct"``) and ``server.py`` (transport
-    ``"serve"``).
+    ``recursion_limit``) when Langfuse is off; adds ``callbacks`` + the langfuse
+    metadata keys when on. Use from ``main.py`` (transport ``"direct"``) and
+    ``server.py`` (transport ``"serve"``).
     """
     cfg: dict[str, Any] = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": recursion_limit,
     }
-    handler = langfuse_handler(org, transport, thread_id)
+    handler = langfuse_handler()
     if handler is not None:
         cfg["callbacks"] = [handler]
+        # langfuse v4 reads these reserved keys from run metadata (langgraph
+        # propagates config["metadata"] into every callback run): the thread_id
+        # groups a resumed thread into one session; org/transport are UI tags.
+        cfg["metadata"] = {
+            "langfuse_session_id": thread_id,
+            "langfuse_tags": [f"org:{org}", f"transport:{transport}"],
+        }
     return cfg
