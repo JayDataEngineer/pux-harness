@@ -23,6 +23,13 @@ Tier is the COARSE selector (a whole role map per "mode": the shipped ``default`
 overrides (org, env, frontmatter) still win ABOVE the tier — the tier is the
 floor, so an org's explicit ``models:`` pin is respected in every tier.
 
+A tier may ALSO declare a ``<role>_fallbacks`` chain: an ordered list of model
+ids ``get_model`` wraps via LangChain ``with_fallbacks`` so a transient error
+(429 / timeout / 5xx) that exhausts the primary's ``max_retries`` fails over to
+the next declared id. The chain applies ONLY to a role that resolved from the
+tier — an explicit override (frontmatter / org / env) is a hard pin with no
+failover. Declared + WARNING-logged, not a silent swap.
+
 Capability (``is_multimodal``) is a property of the MODEL ID, read from the
 ``models:`` registry. Unknown ids default to non-multimodal (fail-safe: a driver
 of unknown capability takes the describe_image fallback, never image blocks it
@@ -44,14 +51,18 @@ Historical notes:
 """
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 
+import openai
 import yaml
 from langchain_openai import ChatOpenAI
 
 from pux_harness.agent.reasoning import ReasoningChatOpenAI
+
+_log = logging.getLogger(__name__)
 
 _YAML = Path(__file__).resolve().parent / "models.yaml"
 
@@ -59,6 +70,25 @@ _YAML = Path(__file__).resolve().parent / "models.yaml"
 # against this set so a typo (e.g. `grader_modle:`) fails at contract time.
 ROLES: tuple[str, ...] = ("base", "worker", "multimodal", "grader")
 ROLE_KEYS: tuple[str, ...] = tuple(f"{r}_model" for r in ROLES)
+# The per-role fallback-chain key inside a tier: ``<role>_fallbacks`` is an
+# ordered list of model ids tried in turn when the primary ``<role>_model``
+# raises a transient API error after its own ``max_retries``. A fallback chain
+# applies ONLY when the role resolved from the tier — an explicit override
+# (frontmatter ``model:``, org ``models:``, ``PUX_<ROLE>_MODEL``) is a HARD pin.
+FALLBACK_KEYS: tuple[str, ...] = tuple(f"{r}_fallbacks" for r in ROLES)
+
+# Transient provider errors that warrant failing over to the next declared
+# model. Deliberately NARROW: 401/400/404 (auth / bad-request / not-found) are
+# config or request bugs that would recur on every fallback, so they are NOT in
+# the set — the call dies loud instead of silently burning the chain. The
+# primary's ``max_retries=6`` already rides transient 429s via backoff; this set
+# catches the case where retries EXHAUST or the model is persistently down.
+_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    openai.RateLimitError,
+    openai.APITimeoutError,
+    openai.APIConnectionError,
+    openai.InternalServerError,
+)
 
 # Legacy single-model-era env vars still honored (back-compat).
 _LEGACY_DEFAULT_MODEL_ENV = "PUX_MODEL"        # base role only
@@ -91,6 +121,25 @@ def _spec() -> dict:
         missing = [k for k in ROLE_KEYS if k not in tmap]
         if missing:
             raise RuntimeError(f"models.yaml tier {tname!r} missing role key(s): {missing}")
+        # ``<role>_fallbacks`` (when declared) must be a non-empty list of
+        # unique model-id strings — anything else fails loud (no silent skip of
+        # a malformed chain that would leave a role with no real failover).
+        for fkey in FALLBACK_KEYS:
+            if fkey not in tmap:
+                continue
+            fbs = tmap[fkey]
+            if not isinstance(fbs, list) or not fbs:
+                raise RuntimeError(
+                    f"models.yaml tier {tname!r}: {fkey} must be a non-empty list "
+                    f"of model ids, got {type(fbs).__name__}")
+            for fb in fbs:
+                if not isinstance(fb, str) or not fb:
+                    raise RuntimeError(
+                        f"models.yaml tier {tname!r}: {fkey} entries must be "
+                        f"non-empty strings, got {fb!r}")
+            if len(set(fbs)) != len(fbs):
+                raise RuntimeError(
+                    f"models.yaml tier {tname!r}: {fkey} has duplicate ids: {fbs}")
     default_tier = data["default_tier"]
     if not isinstance(default_tier, str) or default_tier not in tiers:
         raise RuntimeError(
@@ -179,6 +228,47 @@ def _org_role_override(org: str, role_key: str) -> str | None:
     return val if isinstance(val, str) and val else None
 
 
+def _tier_fallbacks(role: str, tier: str) -> list[str]:
+    """The declared ``<role>_fallbacks`` chain for ``tier`` — empty when the tier
+    declares none for this role. Returns a copy so callers can't mutate the
+    cached spec. ``_spec()`` already guaranteed any declared chain is a
+    non-empty list of unique non-empty strings."""
+    fbs = _tiers()[tier].get(f"{role}_fallbacks") or []
+    return [str(fb) for fb in fbs]
+
+
+def _role_overridden(role: str, org: str | None, model: str | None) -> bool:
+    """True when the role's id is an EXPLICIT override (frontmatter / org / env)
+    rather than the active tier's default. A fallback chain applies ONLY to the
+    tier default — an explicit pin is the operator saying "use exactly this
+    model", so no failover (mirrors the priority stack in ``resolve_model_id``
+    and honors no-silent-fallbacks: an override is never quietly swapped)."""
+    if model:
+        return True
+    role_key = f"{role}_model"
+    if org is not None and _org_role_override(org, role_key):
+        return True
+    if os.environ.get(f"PUX_{role.upper()}_MODEL"):
+        return True
+    if role == "base" and os.environ.get(_LEGACY_DEFAULT_MODEL_ENV):
+        return True
+    return False
+
+
+def resolve_fallback_ids(
+    *, role: str = "base", org: str | None = None, model: str | None = None,
+) -> list[str]:
+    """The ordered fallback model ids for ``role`` against ``org`` — empty when
+    the role is an explicit override (frontmatter / org / env) OR the active
+    tier declares no ``<role>_fallbacks``. Public so tests + the contract
+    checker can inspect the chain WITHOUT building ``ChatOpenAI`` instances."""
+    if role not in ROLES:
+        raise ValueError(f"unknown model role {role!r}; known roles: {ROLES}")
+    if _role_overridden(role, org, model):
+        return []
+    return _tier_fallbacks(role, active_tier())
+
+
 def resolve_model_id(
     *, role: str = "base", org: str | None = None, model: str | None = None,
 ) -> str:
@@ -208,30 +298,61 @@ def resolve_model_id(
     return _tier_role(role, active_tier())
 
 
+def _instantiate(model_id: str) -> ReasoningChatOpenAI:
+    """Build a ``ReasoningChatOpenAI`` for ``model_id`` with the current provider
+    config. Shared by the primary + every fallback model so a chain is
+    homogeneous in base_url / key / timeout / retries.
+
+    ``max_retries=6`` lets the OpenAI client ride transient limits (429
+    "provider_rate_limit_exceeded" on the free OpenCode Zen Go router) with
+    built-in exponential backoff (~30-60s across 6 retries) rather than dying on
+    the first 429. Standard client resilience, not a behavior fallback — and the
+    precondition for ``get_model``'s declared fallback chain (each model is
+    independently resilient; ``with_fallbacks`` only fires when retries exhaust)."""
+    provider = _provider()
+    base_url = os.environ.get(_LEGACY_BASE_URL_ENV, provider["base_url"])
+    api_key_env = provider.get("api_key_env", "OPENCODE_API_KEY")
+    return ReasoningChatOpenAI(
+        model=model_id,
+        base_url=base_url,
+        api_key=os.environ[api_key_env],
+        timeout=180,
+        max_retries=6,
+        max_tokens=int(os.environ.get("PUX_MAX_TOKENS", provider.get("max_tokens", 8192))),
+        temperature=float(os.environ.get("PUX_TEMPERATURE", provider.get("temperature", 0.2))),
+    )
+
+
 def get_model(
     *, role: str = "base", org: str | None = None, model: str | None = None,
 ) -> ChatOpenAI:
     """Build a ``ChatOpenAI`` for ``role`` resolved against ``org``, or for the
     literal ``model`` id when one is supplied (the subagent-frontmatter override
     path). Provider config comes from ``models.yaml``; legacy env overrides
-    (``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still win."""
-    provider = _provider()
-    base_url = os.environ.get(_LEGACY_BASE_URL_ENV, provider["base_url"])
-    api_key_env = provider.get("api_key_env", "OPENCODE_API_KEY")
+    (``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still win.
+
+    When the role resolves from the active tier AND that tier declares a
+    ``<role>_fallbacks`` chain, the returned model is wrapped in LangChain's
+    ``with_fallbacks``: a transient error (429/timeout/5xx — see
+    ``_TRANSIENT_EXCEPTIONS``) that exhausts the primary's ``max_retries`` fails
+    over to the next declared id. This is a DECLARED, per-tier chain (auditable
+    in ``models.yaml`` + WARNING-logged when attached) — not a silent swap; and
+    an explicit override (frontmatter / org / env) disables it (a hard pin).
+    ``with_fallbacks`` propagates ``.bind_tools`` / ``.with_structured_output``
+    to every model in the chain, so deepagents' later tool-binding flows through."""
     model_id = resolve_model_id(role=role, org=org, model=model)
-    return ReasoningChatOpenAI(
-        model=model_id,
-        base_url=base_url,
-        api_key=os.environ[api_key_env],
-        timeout=180,
-        # OpenCode Zen Go is a free router with a tight per-account rate limit
-        # (429 "provider_rate_limit_exceeded"). Let the OpenAI client ride
-        # transient limits with built-in exponential backoff (~30-60s across
-        # 6 retries) rather than dying on the first 429. Standard client
-        # resilience, not a behavior fallback.
-        max_retries=6,
-        max_tokens=int(os.environ.get("PUX_MAX_TOKENS", provider.get("max_tokens", 8192))),
-        temperature=float(os.environ.get("PUX_TEMPERATURE", provider.get("temperature", 0.2))),
+    primary = _instantiate(model_id)
+    fb_ids = resolve_fallback_ids(role=role, org=org, model=model)
+    if not fb_ids:
+        return primary
+    chain = [_instantiate(fb) for fb in fb_ids]
+    _log.warning(
+        "model role %r: primary %s with declared fallback chain %s "
+        "(transient-error failover; declared in models.yaml tier %r)",
+        role, model_id, fb_ids, active_tier(),
+    )
+    return primary.with_fallbacks(
+        chain, exceptions_to_handle=_TRANSIENT_EXCEPTIONS,
     )
 
 

@@ -33,6 +33,18 @@
 #                    max_iterations × per agent output, so the CHEAP model is the
 #                    right default; bump per-org where a rubric needs more reasoning.
 #
+# THE FALLBACK CHAINS (OPTIONAL, the `<role>_fallbacks` keys inside a tier)
+#   A list of model ids `get_model` wraps via LangChain `with_fallbacks`: when the
+#   primary `<role>_model` raises a TRANSIENT error (429 / timeout / 5xx) that
+#   exhausts its own max_retries, the call fails over to the next id in the list.
+#   Declared + WARNING-logged — NOT a silent swap (a 401/400/404 config bug dies
+#   loud instead of burning the chain). Applies ONLY when the role resolved from
+#   the tier; an explicit override (frontmatter / org `models:` / `PUX_<ROLE>_MODEL`)
+#   is a HARD pin — no failover. Each fallback should match the primary's
+#   multimodal capability for vision-bearing roles (a non-multimodal base falling
+#   over to a multimodal id shifts vision behavior mid-run). Keep it shallow —
+#   every entry is another model tried in series.
+#
 # THE `models:` REGISTRY
 #   Per-id capability flags. Capability is a property of the MODEL id, not the
 #   tier — glm-5.2 is non-multimodal everywhere it appears. `is_multimodal(id)`
@@ -76,6 +88,12 @@ tiers:
   # BrowserVisionMiddleware text-pointer fallback, not native image blocks.
   default:
     base_model: glm-5.2
+    # If glm-5.2 (SOTA, non-multimodal) is persistently rate-limited / down
+    # after its own max_retries, fail over to glm-5.1 — a sibling non-multimodal
+    # text model, so supervisor behavior (incl. the describe_image vision path)
+    # is unchanged on failover. Add deeper ids (e.g. mimo-v2.5) to widen the
+    # chain at the cost of a behavior shift on the deepest failover.
+    base_fallbacks: [glm-5.1]
     worker_model: mimo-v2.5
     multimodal_model: mimo-v2.5
     grader_model: mimo-v2.5

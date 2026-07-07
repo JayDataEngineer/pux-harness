@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import openai
 import pytest
+from langchain_core.runnables.fallbacks import RunnableWithFallbacks
 from langchain_openai import ChatOpenAI
 
 from pux_harness.agent import model, profile
@@ -54,14 +56,15 @@ def test_validate_models_spec_missing_file(tmp_path, _spec_cleared, monkeypatch)
 
 
 def test_validate_models_spec_missing_role(tmp_path, _spec_cleared, monkeypatch):
-    """A roles: map missing one of the four role keys fails loud."""
+    """A tier missing one of the four role keys fails loud."""
     (tmp_path / "models.yaml").write_text(
         "provider:\n  base_url: x\n"
-        "roles:\n"
-        "  base_model: a\n"
-        "  worker_model: a\n"
-        "  multimodal_model: a\n"
-        "  # grader_model missing\n"
+        "tiers:\n  t:\n"
+        "    base_model: a\n"
+        "    worker_model: a\n"
+        "    multimodal_model: a\n"
+        "    # grader_model missing\n"
+        "default_tier: t\n"
     )
     monkeypatch.setattr(model, "_YAML", tmp_path / "models.yaml")
     with pytest.raises(RuntimeError, match=r"missing.*grader_model"):
@@ -201,3 +204,251 @@ def test_get_model_literal_override(monkeypatch):
     frontmatter override path)."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     assert model.get_model(model="glm-5.2").model_name == "glm-5.2"
+
+
+# --- per-role declared fallback chains -------------------------------------
+#
+# A tier may declare ``<role>_fallbacks``: an ordered list of model ids
+# ``get_model`` wraps via LangChain ``with_fallbacks`` so a transient error
+# (429/timeout/5xx) exhausting the primary's ``max_retries`` fails over. The
+# chain applies ONLY to a role resolved from the tier — an explicit override
+# (frontmatter / org / env) is a hard pin. Declared + logged, not a silent swap.
+
+
+def test_fallback_keys_align_with_roles():
+    """FALLBACK_KEYS is exactly ``<role>_fallbacks`` for each role, in order."""
+    assert model.FALLBACK_KEYS == (
+        "base_fallbacks", "worker_fallbacks",
+        "multimodal_fallbacks", "grader_fallbacks",
+    )
+
+
+def test_shipped_default_base_has_fallback_chain():
+    """The shipped default tier declares a base fallback chain (the demonstrator
+    that the feature is live in the real config, not dormant)."""
+    assert model.resolve_fallback_ids(role="base") == ["glm-5.1"]
+
+
+def test_worker_role_has_no_shipped_fallbacks():
+    """Roles without a declared chain resolve to an empty list (no fallback)."""
+    assert model.resolve_fallback_ids(role="worker") == []
+    assert model.resolve_fallback_ids(role="grader") == []
+
+
+def test_resolve_fallback_ids_rejects_unknown_role():
+    """An unknown role fails loud (consistent with resolve_model_id)."""
+    with pytest.raises(ValueError, match="unknown model role"):
+        model.resolve_fallback_ids(role="intern")
+
+
+def test_literal_override_disables_fallbacks():
+    """A caller-supplied ``model=`` literal is a hard pin — no failover."""
+    assert model.resolve_fallback_ids(role="base", model="glm-5.1") == []
+
+
+def test_env_override_disables_fallbacks(monkeypatch):
+    """``PUX_<ROLE>_MODEL`` pins the role — the tier's chain is NOT attached."""
+    monkeypatch.setenv("PUX_BASE_MODEL", "pinned-base")
+    assert model.resolve_fallback_ids(role="base") == []
+
+
+def test_legacy_pux_model_disables_base_fallbacks(monkeypatch):
+    """The legacy ``PUX_MODEL`` (base-only) is also a hard pin for the base role."""
+    monkeypatch.setenv("PUX_MODEL", "legacy-base")
+    assert model.resolve_fallback_ids(role="base") == []
+
+
+def test_org_override_disables_fallbacks(fake_org_tree):
+    """An org ``models: {base_model: X}`` pins the role above the tier — the
+    chain is NOT attached for that org's base."""
+    (fake_org_tree / "orgs" / "o").mkdir(parents=True)
+    (fake_org_tree / "orgs" / "o" / "profile.yaml").write_text(
+        "models:\n  base_model: org-base\n"
+    )
+    assert model.resolve_fallback_ids(role="base", org="o") == []
+    # An org WITHOUT a base override still gets the tier chain.
+    (fake_org_tree / "orgs" / "p").mkdir(parents=True)
+    (fake_org_tree / "orgs" / "p" / "profile.yaml").write_text(
+        "system_prompt_suffix: hi\n"
+    )
+    assert model.resolve_fallback_ids(role="base", org="p") == ["glm-5.1"]
+
+
+def test_get_model_attaches_fallback_chain(monkeypatch):
+    """``get_model(role=base)`` returns a ``RunnableWithFallbacks`` whose chain
+    is the declared tier fallback (each a real model instance). Proves the
+    rely-on-upstream wiring (LangChain ``with_fallbacks``) without a live call."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    m = model.get_model(role="base")
+    assert isinstance(m, RunnableWithFallbacks)
+    assert [fb.model_name for fb in m.fallbacks] == ["glm-5.1"]
+    # The primary id is still the resolved role id.
+    assert m.model_name == "glm-5.2"
+
+
+def test_get_model_without_fallbacks_is_plain_chat(monkeypatch):
+    """A role with no declared chain returns a plain ChatOpenAI (no wrapper) —
+    zero behavior change for non-fallback roles."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    m = model.get_model(role="grader")
+    assert not isinstance(m, RunnableWithFallbacks)
+    assert isinstance(m, ChatOpenAI)
+
+
+def test_get_model_override_skips_fallback_chain(monkeypatch):
+    """An explicit ``model=`` literal returns a plain ChatOpenAI on that id — the
+    tier chain is NOT attached (a hard pin has no failover)."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    m = model.get_model(role="base", model="glm-5.2")
+    assert not isinstance(m, RunnableWithFallbacks)
+    assert m.model_name == "glm-5.2"
+
+
+def test_bind_tools_flows_through_fallback_chain(monkeypatch):
+    """``with_fallbacks`` propagates ``.bind_tools`` to every model in the chain
+    — the load-bearing precondition for deepagents, which binds tools AFTER
+    ``get_model`` returns. If this breaks, the supervisor's tool surface vanishes."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    m = model.get_model(role="base")
+    bound = m.bind_tools([{"name": "t", "description": "d", "input_schema": {}}])
+    assert isinstance(bound, RunnableWithFallbacks)
+    assert len(bound.fallbacks) == 1
+
+
+def test_transient_exceptions_are_narrow(monkeypatch):
+    """The failover set is EXACTLY the transient API errors — 401/400/404 (auth,
+    bad-request, not-found) are deliberately ABSENT so a config/request bug dies
+    loud instead of silently burning the chain (no-silent-fallbacks)."""
+    excs = set(model._TRANSIENT_EXCEPTIONS)
+    assert excs == {
+        openai.RateLimitError,
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+    }
+    # The non-transient config/request errors are NOT in the set.
+    for non_transient in (openai.AuthenticationError, openai.BadRequestError,
+                          openai.NotFoundError):
+        assert non_transient not in excs
+
+
+def test_transient_set_triggers_failover_deterministically():
+    """Behavioral proof (no live outage needed): with ``_TRANSIENT_EXCEPTIONS``,
+    a transient error on the primary fails over to the next declared model —
+    the runtime contract ``get_model`` relies on when it wraps the chain via
+    LangChain ``with_fallbacks``. Uses ``RunnableLambda`` so the failover logic
+    (a Runnable-level concern, identical for any Runnable incl. ChatOpenAI) is
+    exercised deterministically."""
+    import httpx
+    from langchain_core.runnables import RunnableLambda
+
+    def _rate_limit(_):
+        resp = httpx.Response(
+            status_code=429, request=httpx.Request("POST", "http://x/v1"))
+        raise openai.RateLimitError("limited", response=resp, body=None)
+
+    chain = RunnableLambda(_rate_limit).with_fallbacks(
+        [RunnableLambda(lambda _: "FALLBACK-OK")],
+        exceptions_to_handle=model._TRANSIENT_EXCEPTIONS,
+    )
+    # Transient 429 on the primary → the fallback's value is returned.
+    assert chain.invoke("x") == "FALLBACK-OK"
+
+
+def test_non_transient_error_does_not_failover():
+    """The flip side of no-silent-fallbacks: a config/request bug (400
+    BadRequest) is NOT in the transient set, so the chain does NOT mask it — the
+    error raises loud instead of being silently swallowed by the next model."""
+    import httpx
+    from langchain_core.runnables import RunnableLambda
+
+    def _bad_request(_):
+        resp = httpx.Response(
+            status_code=400, request=httpx.Request("POST", "http://x/v1"))
+        raise openai.BadRequestError("bad", response=resp, body=None)
+
+    chain = RunnableLambda(_bad_request).with_fallbacks(
+        [RunnableLambda(lambda _: "SHOULD-NOT-REACH")],
+        exceptions_to_handle=model._TRANSIENT_EXCEPTIONS,
+    )
+    with pytest.raises(openai.BadRequestError):
+        chain.invoke("x")
+
+
+def test_resolve_fallback_ids_returns_a_copy():
+    """The returned list is a copy — mutating it must not corrupt the cached spec
+    (a later call would otherwise see the mutation)."""
+    chain = model.resolve_fallback_ids(role="base")
+    chain.append("mutated")
+    assert model.resolve_fallback_ids(role="base") == ["glm-5.1"]
+
+
+# --- validate_models_spec rejects malformed fallback chains ----------------
+
+
+def _minimal_spec(tmp_path, monkeypatch, tier_body: str) -> None:
+    """Write a minimal VALID spec (one tier with all four role keys, no models
+    registry so the multimodal cross-check is skipped) + ``tier_body`` appended
+    inside the tier, then point ``model._YAML`` at it. Used to assert specific
+    ``<role>_fallbacks`` malformations fail loud."""
+    (tmp_path / "models.yaml").write_text(
+        "provider:\n  base_url: x\n"
+        "tiers:\n  t:\n"
+        + tier_body
+        + "\ndefault_tier: t\n"
+    )
+    monkeypatch.setattr(model, "_YAML", tmp_path / "models.yaml")
+
+
+def _minimal_role_lines() -> str:
+    return (
+        "    base_model: a\n"
+        "    worker_model: a\n"
+        "    multimodal_model: a\n"
+        "    grader_model: a\n"
+    )
+
+
+def test_validate_accepts_well_formed_fallbacks(tmp_path, _spec_cleared, monkeypatch):
+    """A non-empty list of unique string ids is accepted."""
+    _minimal_spec(
+        tmp_path, monkeypatch, _minimal_role_lines() + "    base_fallbacks: [b, c]\n"
+    )
+    model.validate_models_spec()  # raises on any problem
+
+
+def test_validate_rejects_non_list_fallbacks(tmp_path, _spec_cleared, monkeypatch):
+    """A scalar ``base_fallbacks`` (not a list) fails loud."""
+    _minimal_spec(
+        tmp_path, monkeypatch, _minimal_role_lines() + "    base_fallbacks: b\n"
+    )
+    with pytest.raises(RuntimeError, match="base_fallbacks must be a non-empty list"):
+        model.validate_models_spec()
+
+
+def test_validate_rejects_empty_fallback_list(tmp_path, _spec_cleared, monkeypatch):
+    """An empty ``base_fallbacks: []`` fails loud (a declared-but-empty chain is
+    almost certainly a config mistake — it declares failover intent with no ids)."""
+    _minimal_spec(
+        tmp_path, monkeypatch, _minimal_role_lines() + "    base_fallbacks: []\n"
+    )
+    with pytest.raises(RuntimeError, match="base_fallbacks must be a non-empty list"):
+        model.validate_models_spec()
+
+
+def test_validate_rejects_non_string_fallback_entry(tmp_path, _spec_cleared, monkeypatch):
+    """A non-string entry (e.g. an int) fails loud."""
+    _minimal_spec(
+        tmp_path, monkeypatch, _minimal_role_lines() + "    base_fallbacks: [5]\n"
+    )
+    with pytest.raises(RuntimeError, match="base_fallbacks entries must be non-empty"):
+        model.validate_models_spec()
+
+
+def test_validate_rejects_duplicate_fallback_ids(tmp_path, _spec_cleared, monkeypatch):
+    """Duplicate ids in the chain fail loud (a redundant failover target)."""
+    _minimal_spec(
+        tmp_path, monkeypatch, _minimal_role_lines() + "    base_fallbacks: [b, b]\n"
+    )
+    with pytest.raises(RuntimeError, match="base_fallbacks has duplicate"):
+        model.validate_models_spec()
