@@ -53,6 +53,7 @@ __all__ = [
     "load_profile",
     "load_rubric_gate",
     "load_middleware_overrides",
+    "load_ask_user_enabled",
     "default_rubric",
     "validate_profile",
     "apply_profile_to_tools",
@@ -408,18 +409,52 @@ def load_middleware_overrides(org: str) -> MiddlewareOverrides:
     return _middleware_overrides_from_block(org, data["middleware"])
 
 
+def load_ask_user_enabled(org: str) -> bool:
+    """Read the ``ask_user:`` flag from ``orgs/<org>/profile.yaml``.
+
+    ``True`` opts the org INTO the supervisor ``ask_user`` HITL tool
+    (constructed in ``stack.build_stack``: over the web it interrupts +
+    resumes; over an editor it poses the question + ends the turn). ``False``
+    (or no file, or no flag) is the byte-identical default — no ask_user tool
+    anywhere in the stack. ``build_stack`` additionally drops it over MCP +
+    autonomous runtimes (the tool-level gate); this loader is only the ORG's
+    opt-in half.
+
+    A non-bool value raises ``TypeError`` — no silent skip; a malformed flag is
+    a real bug. Read independently of ``load_profile`` (the flag is peeled out
+    before ``HarnessProfileConfig.from_dict``) so the construction gate reads it
+    without disturbing the config path.
+
+    Inheritance-aware: reads the ``extends:``-chain-merged block
+    (``_resolved_profile_yaml``); a child inherits a parent's ask_user flag and
+    overrides it if it restates the key. For a non-extending org, byte-identical
+    to the raw own read.
+    """
+    data = _resolved_profile_yaml(org)
+    if data is None or "ask_user" not in data:
+        return False
+    val = data["ask_user"]
+    if not isinstance(val, bool):
+        raise TypeError(
+            f"profile.yaml ask_user must be a bool, "
+            f"got {type(val).__name__}: {val!r}"
+        )
+    return val
+
+
 def load_profile(org: str) -> HarnessProfileConfig | None:
     """Read ``orgs/<org>/profile.yaml`` -> ``HarnessProfileConfig``, or ``None``.
 
     ``None`` (no file) is the COMMON case — most orgs ship no profile and the
     ``build_graph`` path is byte-identical to today (the regression guarantee).
     If present, the ``rubric:`` block, the ``models:`` map,
-    and the ``middleware:`` block (the stack factory)
+    the ``middleware:`` block (the stack factory), and the ``ask_user:`` flag
     are PEELED out before ``HarnessProfileConfig.from_dict`` (which would
     otherwise reject them as unknown keys) — the rubric block is surfaced
     separately by ``load_rubric_gate``, the models map is read by the model-role
-    resolver (``model._org_role_override``), and the middleware block is read by
-    ``load_middleware_overrides``. ``from_dict`` validates the rest of the
+    resolver (``model._org_role_override``), the middleware block is read by
+    ``load_middleware_overrides``, and the ask_user flag is read by
+    ``load_ask_user_enabled``. ``from_dict`` validates the rest of the
     schema: unknown keys + bad shapes raise ``TypeError``; bad
     ``excluded_middleware`` grammar raises ``ValueError``. A non-mapping top
     level raises ``TypeError`` here. No silent skip — a malformed profile is a
@@ -435,14 +470,14 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
     data = _resolved_profile_yaml(org)
     if data is None:
         return None
-    # ``rubric`` / ``models`` / ``middleware`` are VALID harness blocks peeled
-    # out + read by their own loaders. ``subagents`` is NOT peeled on purpose
-    # The legacy ``profile.yaml`` ``subagents:`` block was
+    # ``rubric`` / ``models`` / ``middleware`` / ``ask_user`` are VALID harness
+    # blocks peeled out + read by their own loaders. ``subagents`` is NOT peeled
+    # on purpose. The legacy ``profile.yaml`` ``subagents:`` block was
     # replaced by per-agent ``extends:`` + delta frontmatter fields, so leaving
     # it in lets ``HarnessProfileConfig.from_dict`` reject it as an unknown key
     # (and the ``no-legacy-subagents-block`` contract tripwire points the operator
     # at the replacement). No silent skip — a stale block is a real bug.
-    peeled = {k: v for k, v in data.items() if k not in ("rubric", "models", "middleware")}
+    peeled = {k: v for k, v in data.items() if k not in ("rubric", "models", "middleware", "ask_user")}
     return HarnessProfileConfig.from_dict(peeled)
 
 
@@ -497,6 +532,7 @@ def validate_profile(org: str) -> HarnessProfileConfig | None:
                                         # legacy ``subagents:`` block — from_dict now rejects that key)
     load_rubric_gate(org)                # raises on a malformed rubric: block
     load_middleware_overrides(org)       # raises on a malformed middleware: block
+    load_ask_user_enabled(org)           # raises on a non-bool ask_user: flag
     return cfg
 
 

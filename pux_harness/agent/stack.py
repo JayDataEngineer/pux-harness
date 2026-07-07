@@ -56,6 +56,11 @@ from deepagents import RubricMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
+from pux_harness.agent.hitl import (
+    ASK_USER_PROMPT_SUFFIX,
+    ask_user_turn_based,
+    make_ask_user_tool,
+)
 from pux_harness.agent.model import driver_multimodal, get_model
 from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
@@ -69,6 +74,7 @@ from pux_harness.agent.profile import (
     HarnessProfileConfig,
     MiddlewareOverrides,
     apply_profile_to_tools,
+    load_ask_user_enabled,
     load_middleware_overrides,
 )
 from pux_harness.context.audit import AuditMiddleware
@@ -121,16 +127,19 @@ class RuntimeFacts:
     Most stack decisions are ORG-level (profile.yaml). A few are RUNTIME-level —
     they depend on how the graph is being driven, not which org. The motivating
     example (the user's): "if we call over MCP, remove the ``ask_user`` tool from
-    supervisor agents." MCP + ``ask_user`` aren't wired yet, but the seam is here
-    so that rule lands cleanly when they are — see ``_apply_rules``.
+    supervisor agents." ``ask_user`` is now wired (opt-in via ``profile.yaml``
+    ``ask_user: true``); the construction gate — opt-in AND NOT mcp/autonomous —
+    lives in ``build_stack``. ``_apply_rules`` stays the middleware-level seam.
 
-    ``build_graph`` doesn't currently thread facts (no caller has a rule to
-    assert yet), so the default ``RuntimeFacts()`` is used. That's intentional:
-    the seam exists, identity-by-default, ready to grow.
+    ``build_graph`` threads ``facts`` through; the default ``RuntimeFacts()`` is
+    used only by callers (tests) that don't care about a rule. The entrypoints
+    (``server.py`` / ``acp.py`` / ``cli.py`` / ``mcp_server.py``) set the real
+    ``transport`` + ``autonomous`` for the runtime they drive.
     """
 
-    transport: str = "serve"        # serve | direct | acp | tui
+    transport: str = "serve"        # serve | direct | acp | tui | mcp
     mcp_active: bool = False
+    autonomous: bool = False        # headless/batch — no human to resume ask_user
     tool_servers_active: bool = False
     provider: str | None = None
     tier: str | None = None
@@ -421,21 +430,18 @@ def _resolve_toggles(
 
 
 def _apply_rules(facts: RuntimeFacts, scope: Scope, names: list[str]) -> list[str]:
-    """Runtime-facts rules seam. Today identity (no rule is wired), kept as an
-    explicit, tested function so the policy layer is legible + extensible rather
-    than a hidden branch.
+    """Runtime-facts rules seam for the MIDDLEWARE list. Identity today — kept as
+    an explicit, tested function so the policy layer is legible + extensible
+    rather than a hidden branch.
 
-    The motivating rule (lands when ``ask_user`` + MCP ship): an org exposing
-    tools over MCP should NOT also offer a supervisor ``ask_user`` (the MCP
-    caller can't answer it) — so::
-
-        if facts.mcp_active and scope is Scope.SUPERVISOR:
-            names = [n for n in names if n != "ask_user"]
-
-    Tool-level rules (drop ``ask_user`` from the tool list, not the middleware
-    list) live alongside this in ``build_stack`` when the tool exists.
+    This is the middleware-level seam (called from ``_resolve_toggles``). The
+    runtime-facts rule that DID land — drop ``ask_user`` over MCP/autonomous —
+    is TOOL-level, so it lives in ``build_stack`` (the tool isn't constructed at
+    all rather than constructed-then-filtered). When a future rule needs to
+    toggle a MIDDLEWARE on transport (e.g. a streaming-only middleware), wire it
+    here.
     """
-    _ = facts  # no rule wired yet; param kept for the seam + signature stability
+    _ = facts  # no middleware rule wired yet; param kept for the seam + stability
     return list(names)
 
 
@@ -530,6 +536,27 @@ def build_stack(
             prompt = profile.base_system_prompt
         if profile.system_prompt_suffix:
             prompt = f"{prompt}\n\n{profile.system_prompt_suffix}"
+
+    # ``ask_user`` HITL tool — opt-in (``profile.yaml`` ``ask_user: true``) AND
+    # a runtime that can actually field a human reply. DROPPED over MCP (the
+    # caller can't answer) + autonomous/headless (no human): absent from the
+    # tool surface, so the model simply can't call it — no silent no-op.
+    # Appended AFTER ``apply_profile_to_tools`` so a profile allowlist can't
+    # accidentally strip it; the flag is the explicit gate.
+    ask_user_active = (
+        load_ask_user_enabled(org)
+        and not (facts.mcp_active or facts.autonomous)
+    )
+    if ask_user_active:
+        supervisor_tools = [
+            *supervisor_tools,
+            make_ask_user_tool(facts.transport),
+        ]
+        # The "end your turn" suffix is for the EDITOR (turn-based) path only:
+        # over the web the interrupt pause already gates the reply, so an
+        # end-turn instruction would be stale by the time the tool returns.
+        if ask_user_turn_based(facts.transport):
+            prompt = f"{prompt}\n\n{ASK_USER_PROMPT_SUFFIX}"
 
     subagents = load_subagents(
         org, tools_surface,

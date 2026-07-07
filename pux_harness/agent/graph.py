@@ -29,7 +29,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from pux_harness.agent.model import get_model
 from pux_harness.agent.profile import load_profile, load_rubric_gate
-from pux_harness.agent.stack import build_stack
+from pux_harness.agent.stack import RuntimeFacts, build_stack
 from pux_harness.memory import MEMORY_SOURCES, build_memory_backend
 from pux_harness.sandbox.backend import PuxSandboxBackend
 from pux_harness.sandbox.docker_exec import DockerExecClient, get_exec_client
@@ -60,6 +60,7 @@ def build_graph(
     *,
     checkpointer: Any,
     store: Any | None = None,
+    facts: RuntimeFacts | None = None,
     mcp_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
     """Compile the deepagents graph for ``org`` against ``checkpointer``.
@@ -76,6 +77,13 @@ def build_graph(
     ``stack.build_stack`` from the deps below + the org's ``profile.yaml``.
     This function only supplies those deps + the memory backend + checkpointer
     and binds the result via ``create_deep_agent``.
+
+    ``facts`` carries RUNTIME-level decisions (transport, autonomous) that
+    ``build_stack`` can't derive from the org alone — today the ``ask_user``
+    HITL tool's construction gate (web → interrupt; editor → turn-based; mcp /
+    autonomous → dropped). ``None`` → the default ``RuntimeFacts()`` (transport
+    ``serve``, not autonomous), which is correct for the runner + the AG-UI web
+    path; the ACP / direct / mcp entrypoints pass a real ``RuntimeFacts``.
 
     ``store`` is an optional ``BaseStore`` for persistent memory.
     When provided, memory survives server restarts. When ``None`` (the runner
@@ -103,6 +111,7 @@ def build_graph(
         profile=cfg,
         rubric_gate=gate,
         exec_client=shared_exec(),
+        facts=facts,
         mcp_tools=mcp_tools,
     )
 
