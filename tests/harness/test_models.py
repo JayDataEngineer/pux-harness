@@ -16,6 +16,7 @@ from pathlib import Path
 
 import openai
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables.fallbacks import RunnableWithFallbacks
 from langchain_openai import ChatOpenAI
 
@@ -275,15 +276,55 @@ def test_org_override_disables_fallbacks(fake_org_tree):
 
 
 def test_get_model_attaches_fallback_chain(monkeypatch):
-    """``get_model(role=base)`` returns a ``RunnableWithFallbacks`` whose chain
-    is the declared tier fallback (each a real model instance). Proves the
-    rely-on-upstream wiring (LangChain ``with_fallbacks``) without a live call."""
+    """``get_model(role=base)`` returns a ``BaseChatModel`` (a
+    ``_FallbackReasoningChatOpenAI``) carrying the declared tier chain — NOT a
+    bare ``RunnableWithFallbacks`` (which crashes ``deepagents.resolve_model``).
+    The primary id is still the resolved role id; the chain ids are the declared
+    fallbacks. Proves the rely-on-upstream wiring (LangChain ``with_fallbacks``)
+    without a live call."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     m = model.get_model(role="base")
-    assert isinstance(m, RunnableWithFallbacks)
-    assert [fb.model_name for fb in m.fallbacks] == ["glm-5.1"]
-    # The primary id is still the resolved role id.
+    # MUST be a BaseChatModel — deepagents' resolve_model fast-path requires it.
+    assert isinstance(m, BaseChatModel)
+    # And NOT a RunnableWithFallbacks (the pre-fix shape that crashed pux serve).
+    assert not isinstance(m, RunnableWithFallbacks)
     assert m.model_name == "glm-5.2"
+    assert [fb.model_name for fb in m._fallback_models] == ["glm-5.1"]
+
+
+def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
+    """REGRESSION (verify-or-die): the fallback-bearing base model is accepted by
+    ``deepagents.resolve_model``'s ``isinstance(model, BaseChatModel)`` fast-path
+    and returned UNCHANGED. A bare ``RunnableWithFallbacks`` (the pre-fix shape)
+    missed the fast-path → ``apply_provider_profile(model)`` →
+    ``get_provider_profile(model)`` → ``spec.count(':")`` → ``AttributeError``
+    ('ReasoningChatOpenAI' object has no attribute 'count') → ``pux serve``
+    startup crash. This is the EXACT gap that let the regression ship: bind_tools
+    was proven but the model was never driven through the real deepagents seam."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    from deepagents._models import resolve_model
+    m = model.get_model(role="base")
+    # Fast-path: the BaseChatModel is returned as-is (no re-init, no string parse).
+    assert resolve_model(m) is m
+
+
+def test_fallback_model_builds_in_real_deepagent_factory(monkeypatch):
+    """REGRESSION (verify-or-die): the fallback-bearing base model is accepted by
+    the REAL ``deepagents.create_deep_agent`` factory — the full seam that crashed
+    ``pux serve`` startup (build_graph → create_deep_agent → resolve_model →
+    AttributeError). Building binds tools internally; proving the factory accepts
+    the model is the strongest guarantee that ``pux serve`` boots. No network —
+    the model is never invoked, only assembled."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    from deepagents import create_deep_agent
+    m = model.get_model(role="base")
+    graph = create_deep_agent(
+        model=m,
+        system_prompt="you are a test agent",
+        tools=[],
+        subagents=[],
+    )
+    assert graph is not None
 
 
 def test_get_model_without_fallbacks_is_plain_chat(monkeypatch):

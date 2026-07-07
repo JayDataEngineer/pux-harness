@@ -59,6 +59,7 @@ from pathlib import Path
 import openai
 import yaml
 from langchain_openai import ChatOpenAI
+from pydantic import PrivateAttr
 
 from pux_harness.agent.reasoning import ReasoningChatOpenAI
 
@@ -298,10 +299,93 @@ def resolve_model_id(
     return _tier_role(role, active_tier())
 
 
-def _instantiate(model_id: str) -> ReasoningChatOpenAI:
+class _FallbackReasoningChatOpenAI(ReasoningChatOpenAI):
+    """A ``ReasoningChatOpenAI`` carrying a LangChain ``with_fallbacks`` chain.
+
+    WHY THIS CLASS EXISTS (the deepagents seam)
+      ``get_model`` previously returned ``primary.with_fallbacks(chain)`` — a
+      ``RunnableWithFallbacks``. But ``deepagents.create_deep_agent`` calls
+      ``resolve_model(model)`` (``_models.py``), whose fast-path is
+      ``isinstance(model, BaseChatModel)``. ``RunnableWithFallbacks`` is a
+      ``Runnable``, NOT a ``BaseChatModel`` → the fast-path misses → deepagents
+      falls through to ``init_chat_model(model, ...)`` →
+      ``apply_provider_profile(model)`` → ``get_provider_profile(model)`` →
+      ``spec.count(":")`` → ``AttributeError`` (caught live at ``pux serve``
+      startup: "'ReasoningChatOpenAI' object has no attribute 'count'"). LangChain
+      ships NO ``ChatModelWithFallbacks`` adapter — only ``RunnableWithFallbacks``
+      — so the fallback-bearing model MUST be a ``BaseChatModel`` subclass we own.
+
+    This subclass IS a ``BaseChatModel`` (via ``ReasoningChatOpenAI``) so
+    ``resolve_model``'s fast-path returns it unchanged, AND it carries the chain.
+    The failover itself stays upstream (LangChain ``with_fallbacks``): the hot
+    path is ``bind_tools`` — deepagents always binds the supervisor's tools, and
+    a bound model is a ``Runnable`` the supervisor drives — so
+    ``bind_tools`` returns ``super().bind_tools(...).with_fallbacks(
+    [fb.bind_tools(...) ...], exceptions_to_handle=...)``. ``with_structured_output``
+    mirrors that. The defensive ``_generate`` (off the agent hot path — the model
+    is reached bound, not bare) re-runs the same failover inline so the LangChain
+    callback chain is preserved on each attempt with the SAME
+    ``exceptions_to_handle`` semantics as ``with_fallbacks``.
+
+    Profile matching (``_harness_profile_for_model`` → ``get_model_identifier`` /
+    ``get_model_provider``) reads ``model_name`` / ``_get_ls_params()``, inherited
+    unchanged from ``ChatOpenAI`` — so it reports the PRIMARY id (e.g.
+    ``glm-5.2``), not the chain.
+    """
+
+    _fallback_models: list = PrivateAttr(default_factory=list)
+    _fallback_exceptions: tuple = PrivateAttr(default_factory=tuple)
+
+    def _chain(self, runnable):
+        """Wrap a bound/structured ``Runnable`` with the fallback chain (upstream
+        ``with_fallbacks``). No chain → the runnable unchanged."""
+        if not self._fallback_models:
+            return runnable
+        return runnable.with_fallbacks(
+            self._fallback_models, exceptions_to_handle=self._fallback_exceptions)
+
+    def bind_tools(self, tools, **kwargs):  # type: ignore[override]
+        return self._chain(super().bind_tools(tools, **kwargs))
+
+    def with_structured_output(self, schema, **kwargs):  # type: ignore[override]
+        chain = [fb.with_structured_output(schema, **kwargs) for fb in self._fallback_models]
+        bound = super().with_structured_output(schema, **kwargs)
+        if not chain:
+            return bound
+        return bound.with_fallbacks(chain, exceptions_to_handle=self._fallback_exceptions)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        if not self._fallback_models:
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        try:
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        except self._fallback_exceptions:
+            pass
+        last_exc: BaseException | None = None
+        for fb in self._fallback_models:
+            try:
+                return fb._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            except self._fallback_exceptions as exc:
+                last_exc = exc
+        assert last_exc is not None  # _fallback_models non-empty → loop ran ≥1
+        raise last_exc
+
+
+def _instantiate(
+    model_id: str,
+    *,
+    fallback_models: list[ReasoningChatOpenAI] | None = None,
+    fallback_exceptions: tuple[type[BaseException], ...] = (),
+) -> ReasoningChatOpenAI:
     """Build a ``ReasoningChatOpenAI`` for ``model_id`` with the current provider
     config. Shared by the primary + every fallback model so a chain is
     homogeneous in base_url / key / timeout / retries.
+
+    When ``fallback_models`` is given, returns a ``_FallbackReasoningChatOpenAI``
+    carrying that chain — a ``BaseChatModel`` (so ``deepagents.resolve_model``'s
+    fast-path accepts it, not a ``RunnableWithFallbacks`` which crashes it) whose
+    ``bind_tools`` / ``with_structured_output`` / ``_generate`` wrap the chain
+    via LangChain ``with_fallbacks``.
 
     ``max_retries=6`` lets the OpenAI client ride transient limits (429
     "provider_rate_limit_exceeded" on the free OpenCode Zen Go router) with
@@ -312,7 +396,7 @@ def _instantiate(model_id: str) -> ReasoningChatOpenAI:
     provider = _provider()
     base_url = os.environ.get(_LEGACY_BASE_URL_ENV, provider["base_url"])
     api_key_env = provider.get("api_key_env", "OPENCODE_API_KEY")
-    return ReasoningChatOpenAI(
+    kwargs = dict(
         model=model_id,
         base_url=base_url,
         api_key=os.environ[api_key_env],
@@ -321,6 +405,12 @@ def _instantiate(model_id: str) -> ReasoningChatOpenAI:
         max_tokens=int(os.environ.get("PUX_MAX_TOKENS", provider.get("max_tokens", 8192))),
         temperature=float(os.environ.get("PUX_TEMPERATURE", provider.get("temperature", 0.2))),
     )
+    if fallback_models:
+        m = _FallbackReasoningChatOpenAI(**kwargs)
+        m._fallback_models = list(fallback_models)
+        m._fallback_exceptions = tuple(fallback_exceptions)
+        return m
+    return ReasoningChatOpenAI(**kwargs)
 
 
 def get_model(
@@ -332,27 +422,30 @@ def get_model(
     (``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still win.
 
     When the role resolves from the active tier AND that tier declares a
-    ``<role>_fallbacks`` chain, the returned model is wrapped in LangChain's
-    ``with_fallbacks``: a transient error (429/timeout/5xx — see
+    ``<role>_fallbacks`` chain, the returned model is a
+    ``_FallbackReasoningChatOpenAI`` (a ``BaseChatModel`` subclass — NOT a bare
+    ``RunnableWithFallbacks``, which crashes ``deepagents.resolve_model``) whose
+    ``bind_tools`` / ``with_structured_output`` / ``_generate`` wrap the chain
+    via LangChain's ``with_fallbacks``: a transient error (429/timeout/5xx — see
     ``_TRANSIENT_EXCEPTIONS``) that exhausts the primary's ``max_retries`` fails
     over to the next declared id. This is a DECLARED, per-tier chain (auditable
     in ``models.yaml`` + WARNING-logged when attached) — not a silent swap; and
     an explicit override (frontmatter / org / env) disables it (a hard pin).
-    ``with_fallbacks`` propagates ``.bind_tools`` / ``.with_structured_output``
-    to every model in the chain, so deepagents' later tool-binding flows through."""
+    The failover is LangChain's own ``with_fallbacks`` (rely-on-upstream): the
+    primary IS a ``ReasoningChatOpenAI`` so ``bind_tools`` etc. inherit upstream
+    behavior unchanged, only adapted to carry the chain."""
     model_id = resolve_model_id(role=role, org=org, model=model)
-    primary = _instantiate(model_id)
     fb_ids = resolve_fallback_ids(role=role, org=org, model=model)
     if not fb_ids:
-        return primary
+        return _instantiate(model_id)
     chain = [_instantiate(fb) for fb in fb_ids]
     _log.warning(
         "model role %r: primary %s with declared fallback chain %s "
         "(transient-error failover; declared in models.yaml tier %r)",
         role, model_id, fb_ids, active_tier(),
     )
-    return primary.with_fallbacks(
-        chain, exceptions_to_handle=_TRANSIENT_EXCEPTIONS,
+    return _instantiate(
+        model_id, fallback_models=chain, fallback_exceptions=_TRANSIENT_EXCEPTIONS,
     )
 
 
