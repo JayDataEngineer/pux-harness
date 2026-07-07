@@ -162,15 +162,27 @@ async def lifespan(app: FastAPI):
         if _HAS_AG_UI:
             from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
             from pux_harness.kit._paths import project_root  # noqa: PLC0415
+            # The module-level ``app`` is reused across lifespans (in tests every
+            # TestClient context re-enters lifespan; production runs one). Mounting
+            # APPENDS a route per call, so without dropping the prior mount a later
+            # request would still route to the FIRST registration — a graph bound
+            # to the previous lifespan's sqlite checkpointer, now closed
+            # (``ValueError: no active connection``). Rebuild the /agui/* surface
+            # fresh each lifespan so the active graph's connection is live.
+            # No-op on a fresh app; correct for any in-process re-mount.
+            app.router.routes[:] = [
+                r for r in app.router.routes
+                if not getattr(r, "path", "").startswith("/agui/")
+            ]
             for org_name in discover_orgs():
                 if "agui" not in policy_mod.protocols_for_org(org_name, project_root()):
                     continue
                 add_langgraph_fastapi_endpoint(
                     app=app,
-                    agent=LangGraphAGUIAgent(
+                    agent=LangGraphAgent(
                         name=org_name,
-                        description=f"Pux org '{org_name}'",
                         graph=_get_graph(org_name),
+                        description=f"Pux org '{org_name}'",
                     ),
                     path=f"/agui/{org_name}",
                 )
@@ -188,8 +200,14 @@ app = FastAPI(title="Pux Agent Protocol", version="0.1.0", lifespan=lifespan)
 # ── AG-UI support (lazy import, registered after lifespan starts) ─────────────
 _HAS_AG_UI = False
 try:
-    from ag_ui_langgraph import add_langgraph_fastapi_endpoint  # noqa: F401
-    from copilotkit import LangGraphAGUIAgent  # noqa: F401
+    # Both pieces come from ONE upstream (ag-ui-langgraph): the endpoint AND the
+    # agent class. ``add_langgraph_fastapi_endpoint`` is type-annotated to accept
+    # ``ag_ui_langgraph.agent.LangGraphAgent``, so that is what we pass — not the
+    # deprecated ``copilotkit.LangGraphAGUIAgent`` (the copilotkit dep was dropped
+    # in 76659a0; the orphaned import survived only while the package lingered in
+    # the venv). The interrupt handling the ask_user web proof depends on lives in
+    # ag_ui_langgraph/agent.py, so LangGraphAgent covers it natively.
+    from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint  # noqa: F401
     _HAS_AG_UI = True
 except ImportError:
     pass
