@@ -123,7 +123,7 @@ class Credentials:
 class BuildSpec:
     """``sandbox.build`` — build the org's custom sandbox image before create
     if absent. Paths are project-relative; resolved + existence-checked by the
-    runner (and the contract's offline validator). Host-side Docker SDK build,
+    runner (and the contract's offline validator). Host-side Docker build,
     no compose. Both fields blank == no build requested (``build_spec`` → None).
     """
 
@@ -132,10 +132,28 @@ class BuildSpec:
 
 
 @dataclass
+class DepsSpec:
+    """``sandbox.deps`` — extra apt + pip packages installed into the org's
+    sandbox container at ``create()`` time (after ``start()``, before
+    persisted-state restore). Installed in-container via ``apt-get`` / ``pip``;
+    warn-and-continue on failure (a blocked mirror or bad package never breaks
+    the run — mirror run_jobs / host_setup best-effort semantics). Egress for
+    ``pypi.org`` / ``files.pythonhosted.org`` (pip) and the Debian mirrors (apt)
+    MUST be on the org's egress allowlist — install is NOT auto-allowed
+    (explicit-egress principle). The image's ``/root/.cache`` pip-cache mount
+    makes repeat installs fast.
+    """
+
+    apt: list[str] = field(default_factory=list)
+    pip: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SandboxSpec:
     image: str = ""
     tier: str = ""  # "isolated" or "bridged"
     build: BuildSpec = field(default_factory=BuildSpec)
+    deps: DepsSpec = field(default_factory=DepsSpec)
 
 
 @dataclass
@@ -266,10 +284,21 @@ def _policy_from_dict(d: Mapping) -> Policy:
         )
     else:
         build = BuildSpec()
+    deps_map = sb.get("deps")
+    if deps_map is not None:
+        if not isinstance(deps_map, Mapping):
+            raise PolicyError("policy: section 'sandbox.deps' must be a mapping")
+        deps = DepsSpec(
+            apt=[str(x) for x in (deps_map.get("apt") or [])],
+            pip=[str(x) for x in (deps_map.get("pip") or [])],
+        )
+    else:
+        deps = DepsSpec()
     pol.sandbox = SandboxSpec(
         image=str(sb.get("image", "") or ""),
         tier=str(sb.get("tier", "") or ""),
         build=build,
+        deps=deps,
     )
     br = _section("browser")
     pol.browser = BrowserSpec(

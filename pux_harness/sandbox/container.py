@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -443,6 +444,13 @@ class SandboxContainer:
         # Restore persisted state (Chrome profile, dotfiles, packages). Fire-and-
         # forget — failures don't block the sandbox (Go treats them the same way).
         self._restore_persisted(container)
+        # Install the org's declared sandbox.deps (apt + pip) — best-effort, after
+        # start + restore, before workspace scaffold. A blocked mirror or bad
+        # package logs a warning and never breaks the run (mirror run_jobs /
+        # host_setup). Egress for pypi + Debian mirrors must be on the org's
+        # allowlist — install is NOT auto-allowed (explicit-egress).
+        if pol is not None:
+            self._install_deps(container, pol)
         # Scaffold writable workspace dirs + chown to the host project owner so
         # host-side tools can read artifacts the agent writes.
         self._scaffold_workspace(container)
@@ -502,6 +510,27 @@ class SandboxContainer:
     def _restore_persisted(self, container: docker.models.containers.Container) -> None:
         # Verbatim port of manager.go::restorePersistedState.
         self._exec(container, _RESTORE_SCRIPT)
+
+    def _install_deps(self, container: docker.models.containers.Container,
+                      pol: policy.Policy) -> None:
+        """Install the org's declared ``sandbox.deps`` (apt + pip) into the
+        container. Apt and pip are independent best-effort steps (each via
+        ``_exec``, which logs non-zero exit as a warning, never fatal) — a
+        blocked Debian mirror does NOT also block a pypi install attempt. No-op
+        when both lists are empty (today's default for every org)."""
+        deps = pol.sandbox.deps
+        if not deps.apt and not deps.pip:
+            return
+        log.info("installing sandbox deps (%s): apt=%s pip=%s",
+                 pol.sandbox.image or DEFAULT_IMAGE, deps.apt, deps.pip)
+        if deps.apt:
+            quoted = " ".join(shlex.quote(p) for p in deps.apt)
+            self._exec(container,
+                       f"apt-get update -qq && apt-get install -y "
+                       f"--no-install-recommends {quoted}")
+        if deps.pip:
+            quoted = " ".join(shlex.quote(p) for p in deps.pip)
+            self._exec(container, f"python3 -m pip install --no-cache-dir {quoted}")
 
     def _scaffold_workspace(self, container: docker.models.containers.Container) -> None:
         for d in ("/sandbox/workspace/memos", "/sandbox/workspace/.pux/sessions"):
