@@ -53,7 +53,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
+import httpx
 from deepagents import RubricMiddleware
+from langchain.agents.middleware import ModelRetryMiddleware, ToolRetryMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
@@ -62,7 +64,7 @@ from pux_harness.agent.hitl import (
     ask_user_turn_based,
     make_ask_user_tool,
 )
-from pux_harness.agent.model import driver_multimodal, get_model
+from pux_harness.agent.model import _TRANSIENT_EXCEPTIONS, driver_multimodal, get_model
 from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
     _build_general_purpose_sub,
@@ -77,6 +79,8 @@ from pux_harness.agent.profile import (
     apply_profile_to_tools,
     load_ask_user_enabled,
     load_middleware_overrides,
+    load_model_retry,
+    load_tool_retry,
 )
 from pux_harness.context.audit import AuditMiddleware
 from pux_harness.context.browser_vision import (
@@ -185,6 +189,14 @@ class StackCtx:
     facts: RuntimeFacts
     rubric_gate: Any | None    # profile.RubricGate | None
     exec_client: Any           # DockerExecClient — for the grader's evidence tools
+    # Retry-layer configs (profile.ModelRetryConfig / ToolRetryConfig | None).
+    # model_retry is default-ON (a present config even when no block is shipped
+    # — ``load_model_retry`` returns the shipped default); tool_retry is
+    # gate-driven (``None`` => no block => ``_build_tool_retry`` skips). Threaded
+    # like ``rubric_gate`` so the retry specs read a resolved config, not re-read
+    # the YAML in their build.
+    model_retry_cfg: Any = None
+    tool_retry_cfg: Any = None
     # Side-effect channel for the ``context`` spec: ``build_context_layer``
     # returns the coupled (middleware, retrieval-tools) pair, but a spec's
     # ``build`` returns only middleware. The supervisor context build deposits
@@ -317,31 +329,111 @@ def _build_rubric(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     )
 
 
+# Transient TOOL-call exceptions that warrant a retry: network/transport
+# failures from the MCP / HTTP tool surface (httpx is the transport under
+# langchain-mcp-adapters + openai). Deliberately does NOT include schema /
+# validation errors — a retry won't fix a bad tool call. tool-retry is ALWAYS
+# scoped to a declared tool list, so a broad retry_on is safe: a non-transient
+# failure on a scoped tool returns a ToolMessage (``on_failure=continue``) and
+# the model adapts, never crashes the run.
+_TOOL_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    httpx.HTTPError,        # base: ConnectError / TimeoutException / ReadError / …
+    TimeoutError,
+    ConnectionError,
+    OSError,                # socket / DNS level
+)
+
+
+def _build_model_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
+    """``ModelRetryMiddleware`` — a backoff'd re-pass of the model call on a
+    TRANSIENT provider error (the SAME narrow set
+    ``model._TRANSIENT_EXCEPTIONS`` the fallback chain treats as
+    failover-worthy — one "transient" definition across both layers).
+
+    Complementary to the fallback layer (``_FallbackReasoningChatOpenAI``):
+    the chain fails over FAST across declared models with NO delay; this layer
+    adds the TIME dimension (exponential backoff + jitter) the chain lacks,
+    re-running the whole chain after a cool-down so a rate-limit window can
+    reset. Three layers (client ``max_retries`` → fallback chain → this) all
+    exhausted = a real outage; ``on_failure`` defaults to ``error`` (re-raise,
+    fail loud — never inject error text as model content).
+
+    Default-ON for every supervisor (``DEFAULT_SUPERVISOR``); zero happy-path
+    cost (acts only on exceptions). Mounted just before ``browser_vision`` so
+    ``browser_vision`` stays innermost-of-the-visual-layers while model-retry
+    wraps the raw model invocation. Disable per-org via ``model_retry:
+    {enabled: false}`` (or ``model_retry: false``) or ``middleware.supervisor.
+    remove: [model_retry]``."""
+    cfg = ctx.model_retry_cfg
+    if cfg is None or not cfg.enabled:
+        return None
+    return ModelRetryMiddleware(
+        max_retries=cfg.max_retries,
+        retry_on=_TRANSIENT_EXCEPTIONS,
+        on_failure=cfg.on_failure,
+        backoff_factor=cfg.backoff_factor,
+        initial_delay=cfg.initial_delay,
+        max_delay=cfg.max_delay,
+        jitter=cfg.jitter,
+    )
+
+
+def _build_tool_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
+    """``ToolRetryMiddleware`` — backoff'd retry of declared NETWORK tools
+    (search / scrape / research, or any flaky HTTP tool) on a transient
+    transport error. GATE-DRIVEN (mounted only when the org ships a
+    ``tool_retry:`` block → ``ctx.tool_retry_cfg`` is set) and ALWAYS scoped to
+    that block's ``tools:`` list — never global, per the langchain guidance (a
+    schema error must not loop). ``on_failure`` defaults to ``continue``
+    (return a ToolMessage with the error so the model adapts — re-raising would
+    crash a long run on one flaky call). ``None`` when no block → byte-identical
+    to today."""
+    cfg = ctx.tool_retry_cfg
+    if cfg is None:
+        return None
+    return ToolRetryMiddleware(
+        max_retries=cfg.max_retries,
+        tools=list(cfg.tools),
+        retry_on=_TOOL_TRANSIENT_EXCEPTIONS,
+        on_failure=cfg.on_failure,
+        backoff_factor=cfg.backoff_factor,
+        initial_delay=cfg.initial_delay,
+        max_delay=cfg.max_delay,
+        jitter=cfg.jitter,
+    )
+
+
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # Canonical mount ORDER — ``_resolve_toggles`` emits in this order, so a
     # spec's registry position IS its mount position. ``audit`` (opt-in) is FIRST
     # so it wraps the whole pipeline as an outermost observer; then context
-    # outermost of the default-on layers; browser_vision innermost past rubric.
-    # Default-on orgs (no audit) still emit [context, routing, session_guide,
-    # rubric?, browser_vision?] — byte-identical to the pre-factory build.
+    # outermost of the default-on layers; ``model_retry`` + ``tool_retry`` sit
+    # AFTER ``rubric`` so model-retry wraps the raw model invocation and
+    # ``browser_vision`` stays innermost-of-the-visual-layers (still LAST).
     MiddlewareSpec("audit", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_audit),
     MiddlewareSpec("context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context),
     MiddlewareSpec("routing", frozenset({Scope.SUPERVISOR}), _build_routing),
     MiddlewareSpec("session_guide", frozenset({Scope.SUPERVISOR}), _build_session_guide),
     MiddlewareSpec("rubric", frozenset({Scope.SUPERVISOR}), _build_rubric),
+    MiddlewareSpec("model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry),
+    MiddlewareSpec("tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry),
     MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
 ]
 
 
 # --- defaults (the "one place") -------------------------------------------
 
-# The default-on supervisor baseline. ``rubric`` is gate-driven (added to the
-# on-set iff the org's gate is armed) so it's NOT in the default list but still
-# lands at its registry position when armed. ``context`` + ``browser_vision``
-# are now selectable specs (default-on, removable via ``middleware.supervisor.
-# remove``) — the user's "selectively remove/add middleware" request, applied
-# uniformly to the formerly-non-toggleable layers too.
-DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "browser_vision"]
+# The default-on supervisor baseline. ``rubric`` + ``tool_retry`` are
+# gate-driven (added to the on-set iff the org arms them) so they're NOT in the
+# default list but still land at their registry position when armed.
+# ``model_retry`` IS default-on (the user's "configurable retry middleware,
+# default conservative" — every supervisor gets a transient-scoped backoff'd
+# re-pass of the model call; disable per-org via ``model_retry:
+# {enabled: false}``). ``context`` + ``browser_vision`` are selectable specs
+# (default-on, removable via ``middleware.supervisor.remove``) — the user's
+# "selectively remove/add middleware" request, applied uniformly to the
+# formerly-non-toggleable layers too.
+DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "model_retry", "browser_vision"]
 
 # Subagents get the context layer + browser_vision by default; routing /
 # session_guide / rubric are supervisor concerns. An org MAY add a subagent
@@ -406,10 +498,12 @@ def _resolve_toggles(
     no gate, ``browser_vision`` with a text-only driver)."""
     by_name = _specs_by_name()
 
-    # defaults + gate-driven rubric → rules → removes → adds (add wins over remove).
+    # defaults + gate-driven rubric/tool_retry → rules → removes → adds (add wins over remove).
     on: set[str] = set(default_names)
     if scope is Scope.SUPERVISOR and ctx.rubric_gate is not None and ctx.rubric_gate.enabled:
         on.add("rubric")
+    if scope is Scope.SUPERVISOR and ctx.tool_retry_cfg is not None:
+        on.add("tool_retry")
     on = set(_apply_rules(ctx.facts, scope, list(on)))
     on -= set(removes)
     on |= set(adds)
@@ -506,6 +600,8 @@ def build_stack(
         facts=facts,
         rubric_gate=rubric_gate,
         exec_client=exec_client,
+        model_retry_cfg=load_model_retry(org),
+        tool_retry_cfg=load_tool_retry(org),
     )
     overrides = load_middleware_overrides(org)
     scoped = _normalize_overrides(profile, overrides)

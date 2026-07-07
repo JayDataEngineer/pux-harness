@@ -49,9 +49,13 @@ from pux_harness.agent.model import ROLE_KEYS
 
 __all__ = [
     "RubricGate",
+    "ModelRetryConfig",
+    "ToolRetryConfig",
     "MiddlewareOverrides",
     "load_profile",
     "load_rubric_gate",
+    "load_model_retry",
+    "load_tool_retry",
     "load_middleware_overrides",
     "load_ask_user_enabled",
     "default_rubric",
@@ -138,6 +142,46 @@ class MiddlewareOverrides:
     supervisor_remove: frozenset[str] = frozenset()
     subagent_add: frozenset[str] = frozenset()
     subagent_remove: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class ModelRetryConfig:
+    """Per-org ``ModelRetryMiddleware`` config. Default-ON: every supervisor
+    gets a transient-scoped, backoff'd retry layer around the model call (the
+    TIME dimension the model fallback chain lacks — the chain fails over fast
+    across models with no delay; this layer waits out a rate-limit window then
+    re-runs the whole chain). An org tunes it via a ``model_retry:`` block, or
+    disables it (``model_retry: {enabled: false}`` or ``model_retry: false``).
+    See ``stack._build_model_retry``.
+
+    ``retry_on`` is NOT a field here — it is the SAME narrow transient set the
+    fallback chain uses (``model._TRANSIENT_EXCEPTIONS``), so "transient" has
+    ONE definition across both resilience layers. Tuning the exception set
+    would desync them; tune ``max_retries`` / backoff instead."""
+
+    enabled: bool = True
+    max_retries: int = 2
+    on_failure: str = "error"     # "error" (re-raise, fail loud) | "continue"
+    backoff_factor: float = 2.0
+    initial_delay: float = 1.0
+    max_delay: float = 60.0
+    jitter: bool = True
+
+
+@dataclass(frozen=True)
+class ToolRetryConfig:
+    """Per-org ``ToolRetryMiddleware`` config. Opt-in: absent unless the org
+    adds a ``tool_retry:`` block. ALWAYS scoped to ``tools`` (network/flaky
+    tool NAMES) — never global, per the langchain guidance (a schema /
+    validation error must not loop). See ``stack._build_tool_retry``."""
+
+    max_retries: int = 2
+    tools: tuple[str, ...] = ()
+    on_failure: str = "continue"  # return a ToolMessage; let the model adapt
+    backoff_factor: float = 2.0
+    initial_delay: float = 1.0
+    max_delay: float = 60.0
+    jitter: bool = True
 
 
 def _validate_models_block(org: str, data: dict) -> None:
@@ -388,6 +432,148 @@ def _middleware_overrides_from_block(org: str, block: object) -> MiddlewareOverr
     )
 
 
+def _retry_float(org: str, block: dict, key: str, default: float, *, section: str) -> float:
+    """Validate one non-negative numeric field of a retry config block. Used by
+    both ``_model_retry_from_block`` and ``_tool_retry_from_block`` so the
+    backoff-param shape check is identical across the two layers."""
+    val = block.get(key, default)
+    if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
+        msg = (
+            f"{org}/profile.yaml: {section}.{key} must be a non-negative "
+            f"number, got {val!r}"
+        )
+        raise TypeError(msg)
+    return float(val)
+
+
+def _retry_int(org: str, block: dict, key: str, default: int, *, section: str) -> int:
+    """Validate one non-negative int field (``max_retries``) of a retry block.
+    ``bool`` is a subclass of ``int`` — reject it so ``true`` isn't silently 1."""
+    val = block.get(key, default)
+    if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+        msg = (
+            f"{org}/profile.yaml: {section}.{key} must be a non-negative int, "
+            f"got {val!r}"
+        )
+        raise TypeError(msg)
+    return val
+
+
+def _retry_on_failure(org: str, block: dict, default: str, *, section: str) -> str:
+    val = block.get("on_failure", default)
+    if val not in ("error", "continue"):
+        msg = (
+            f"{org}/profile.yaml: {section}.on_failure must be 'error' or "
+            f"'continue', got {val!r}"
+        )
+        raise TypeError(msg)
+    return val
+
+
+def _model_retry_from_block(org: str, block: object) -> ModelRetryConfig:
+    """Build a ``ModelRetryConfig`` from the parsed ``model_retry:`` block.
+
+    Accepts a bool (``model_retry: false`` → disabled) OR a mapping. Validates
+    shape + ranges so a typo fails loud at load / contract time, not at the
+    first transient error. ``retry_on`` is NOT configurable (one transient
+    definition across both layers — see ``ModelRetryConfig``)."""
+    if isinstance(block, bool):
+        return ModelRetryConfig(enabled=block)
+    if not isinstance(block, dict):
+        msg = (
+            f"{org}/profile.yaml: model_retry: must be a bool or mapping, "
+            f"got {type(block).__name__}"
+        )
+        raise TypeError(msg)
+    known = {"enabled", "max_retries", "on_failure",
+             "backoff_factor", "initial_delay", "max_delay", "jitter"}
+    unknown = set(block) - known
+    if unknown:
+        msg = (
+            f"{org}/profile.yaml: model_retry: unknown key(s) {sorted(unknown)}; "
+            f"valid keys: {sorted(known)}"
+        )
+        raise TypeError(msg)
+    enabled = block.get("enabled", True)
+    if not isinstance(enabled, bool):
+        msg = (
+            f"{org}/profile.yaml: model_retry.enabled must be a bool, "
+            f"got {type(enabled).__name__}"
+        )
+        raise TypeError(msg)
+    jitter = block.get("jitter", True)
+    if not isinstance(jitter, bool):
+        msg = (
+            f"{org}/profile.yaml: model_retry.jitter must be a bool, "
+            f"got {type(jitter).__name__}"
+        )
+        raise TypeError(msg)
+    return ModelRetryConfig(
+        enabled=enabled,
+        max_retries=_retry_int(org, block, "max_retries", 2, section="model_retry"),
+        on_failure=_retry_on_failure(org, block, "error", section="model_retry"),
+        backoff_factor=_retry_float(org, block, "backoff_factor", 2.0, section="model_retry"),
+        initial_delay=_retry_float(org, block, "initial_delay", 1.0, section="model_retry"),
+        max_delay=_retry_float(org, block, "max_delay", 60.0, section="model_retry"),
+        jitter=jitter,
+    )
+
+
+def _tool_retry_from_block(org: str, block: object) -> ToolRetryConfig:
+    """Build a ``ToolRetryConfig`` from the parsed ``tool_retry:`` block.
+
+    ``tools`` (a non-empty list of tool-name strings) is REQUIRED —
+    tool-retry is NEVER global (a schema error must not loop). Validates shape
+    so a typo fails at load / contract time."""
+    if not isinstance(block, dict):
+        msg = (
+            f"{org}/profile.yaml: tool_retry: must be a mapping, "
+            f"got {type(block).__name__}"
+        )
+        raise TypeError(msg)
+    known = {"max_retries", "tools", "on_failure",
+             "backoff_factor", "initial_delay", "max_delay", "jitter"}
+    unknown = set(block) - known
+    if unknown:
+        msg = (
+            f"{org}/profile.yaml: tool_retry: unknown key(s) {sorted(unknown)}; "
+            f"valid keys: {sorted(known)}"
+        )
+        raise TypeError(msg)
+    raw_tools = block.get("tools")
+    if not isinstance(raw_tools, list) or not raw_tools:
+        msg = (
+            f"{org}/profile.yaml: tool_retry.tools must be a non-empty list of "
+            f"tool-name strings (tool-retry is never global)"
+        )
+        raise TypeError(msg)
+    tools: list[str] = []
+    for item in raw_tools:
+        if not isinstance(item, str) or not item.strip():
+            msg = (
+                f"{org}/profile.yaml: tool_retry.tools: each entry must be a "
+                f"non-empty string, got {item!r}"
+            )
+            raise TypeError(msg)
+        tools.append(item.strip())
+    jitter = block.get("jitter", True)
+    if not isinstance(jitter, bool):
+        msg = (
+            f"{org}/profile.yaml: tool_retry.jitter must be a bool, "
+            f"got {type(jitter).__name__}"
+        )
+        raise TypeError(msg)
+    return ToolRetryConfig(
+        max_retries=_retry_int(org, block, "max_retries", 2, section="tool_retry"),
+        tools=tuple(tools),
+        on_failure=_retry_on_failure(org, block, "continue", section="tool_retry"),
+        backoff_factor=_retry_float(org, block, "backoff_factor", 2.0, section="tool_retry"),
+        initial_delay=_retry_float(org, block, "initial_delay", 1.0, section="tool_retry"),
+        max_delay=_retry_float(org, block, "max_delay", 60.0, section="tool_retry"),
+        jitter=jitter,
+    )
+
+
 def load_middleware_overrides(org: str) -> MiddlewareOverrides:
     """Read the ``middleware:`` block from ``orgs/<org>/profile.yaml``.
 
@@ -407,6 +593,44 @@ def load_middleware_overrides(org: str) -> MiddlewareOverrides:
     if data is None or "middleware" not in data:
         return MiddlewareOverrides()
     return _middleware_overrides_from_block(org, data["middleware"])
+
+
+def load_model_retry(org: str) -> ModelRetryConfig:
+    """Read the ``model_retry:`` block from ``orgs/<org>/profile.yaml``.
+
+    Default-ON: an ABSENT block returns the shipped ``ModelRetryConfig()``
+    (enabled=True, max_retries=2) — every supervisor gets the retry layer
+    unless it opts out. ``model_retry: false`` (bool) disables; a mapping
+    tunes. Shape-validated (``_model_retry_from_block`` raises on a malformed
+    entry). Read independently of ``load_profile`` (peeled out before
+    ``HarnessProfileConfig.from_dict``) so the factory resolves it without
+    disturbing the config path.
+
+    Inheritance-aware: reads the ``extends:``-chain-merged block
+    (``_resolved_profile_yaml``); a child inherits a parent's model_retry
+    tuning and overrides the fields it restates. For a non-extending org,
+    byte-identical to the raw own read."""
+    data = _resolved_profile_yaml(org)
+    if data is None or "model_retry" not in data:
+        return ModelRetryConfig()
+    return _model_retry_from_block(org, data["model_retry"])
+
+
+def load_tool_retry(org: str) -> ToolRetryConfig | None:
+    """Read the ``tool_retry:`` block from ``orgs/<org>/profile.yaml``.
+
+    ``None`` when the org ships no ``profile.yaml`` OR no ``tool_retry:``
+    block — the common case (opt-in, byte-identical to today). When present,
+    the block is shape-validated (``_tool_retry_from_block`` raises on a
+    malformed entry, incl. a missing/empty ``tools`` list). Read independently
+    of ``load_profile`` (peeled out before ``HarnessProfileConfig.from_dict``).
+
+    Inheritance-aware (``_resolved_profile_yaml``); for a non-extending org,
+    byte-identical to the raw own read."""
+    data = _resolved_profile_yaml(org)
+    if data is None or "tool_retry" not in data:
+        return None
+    return _tool_retry_from_block(org, data["tool_retry"])
 
 
 def load_ask_user_enabled(org: str) -> bool:
@@ -448,12 +672,14 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
     ``None`` (no file) is the COMMON case — most orgs ship no profile and the
     ``build_graph`` path is byte-identical to today (the regression guarantee).
     If present, the ``rubric:`` block, the ``models:`` map,
-    the ``middleware:`` block (the stack factory), and the ``ask_user:`` flag
+    the ``middleware:`` block (the stack factory), the ``model_retry:`` /
+    ``tool_retry:`` blocks (the retry layers), and the ``ask_user:`` flag
     are PEELED out before ``HarnessProfileConfig.from_dict`` (which would
     otherwise reject them as unknown keys) — the rubric block is surfaced
     separately by ``load_rubric_gate``, the models map is read by the model-role
     resolver (``model._org_role_override``), the middleware block is read by
-    ``load_middleware_overrides``, and the ask_user flag is read by
+    ``load_middleware_overrides``, the retry blocks by ``load_model_retry`` /
+    ``load_tool_retry``, and the ask_user flag is read by
     ``load_ask_user_enabled``. ``from_dict`` validates the rest of the
     schema: unknown keys + bad shapes raise ``TypeError``; bad
     ``excluded_middleware`` grammar raises ``ValueError``. A non-mapping top
@@ -477,7 +703,8 @@ def load_profile(org: str) -> HarnessProfileConfig | None:
     # it in lets ``HarnessProfileConfig.from_dict`` reject it as an unknown key
     # (and the ``no-legacy-subagents-block`` contract tripwire points the operator
     # at the replacement). No silent skip — a stale block is a real bug.
-    peeled = {k: v for k, v in data.items() if k not in ("rubric", "models", "middleware", "ask_user")}
+    peeled = {k: v for k, v in data.items() if k not in
+              ("rubric", "models", "middleware", "ask_user", "model_retry", "tool_retry")}
     return HarnessProfileConfig.from_dict(peeled)
 
 
@@ -532,6 +759,8 @@ def validate_profile(org: str) -> HarnessProfileConfig | None:
                                         # legacy ``subagents:`` block — from_dict now rejects that key)
     load_rubric_gate(org)                # raises on a malformed rubric: block
     load_middleware_overrides(org)       # raises on a malformed middleware: block
+    load_model_retry(org)                # raises on a malformed model_retry: block
+    load_tool_retry(org)                 # raises on a malformed tool_retry: block
     load_ask_user_enabled(org)           # raises on a non-bool ask_user: flag
     return cfg
 
