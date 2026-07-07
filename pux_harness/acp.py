@@ -165,6 +165,16 @@ class _RegisteringAgentServerACP(AgentServerACP):
         if sess.list is None:
             sess.list = SessionListCapabilities()
         caps.session_capabilities = sess
+        # ``mcp_capabilities`` is INTENTIONALLY left at the schema default
+        # (http=False, sse=False): we do NOT back client-passed ``mcp_servers``
+        # — deepagents-acp 0.0.8 drops them (``new_session``/``load_session``
+        # accept the param but never store it; ``AgentSessionContext`` is a
+        # frozen cwd/mode/model dataclass, so the factory can't receive them).
+        # Per-session honoring needs a graph rebuild + ``McpSessionManager``
+        # lifecycle per session; deferred until a dispatcher needs it. Do NOT
+        # set True here without that backing — a client would send MCP servers
+        # we silently ignore. The truthful False is locked by contract in
+        # ``tests/server/test_acp.py`` (#71).
         return resp
 
     async def load_session(self, cwd, session_id, mcp_servers=None,
