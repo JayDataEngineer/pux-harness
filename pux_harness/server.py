@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.graph import build_graph
+from pux_harness.agent.observability import build_invoke_config
 from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
 from pux_harness.threads import open_thread_store
 from pux_harness.agent.orgs import discover_orgs, org_agent_slugs
@@ -253,10 +254,9 @@ async def _execute(org: str, thread_id: str, raw_input: Any, recursion_limit: in
     caller-supplied ``rubric`` key (e.g. ``--rubric`` from the CLI, flowing
     through ``_normalize_input``) wins and is left untouched."""
     graph = _get_graph(org)
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "recursion_limit": recursion_limit,
-    }
+    config = build_invoke_config(
+        thread_id, recursion_limit, org, transport="serve"
+    )
     state = _normalize_input(raw_input)
     if "rubric" not in state:
         dr = default_rubric(org)

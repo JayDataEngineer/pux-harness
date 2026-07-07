@@ -30,6 +30,7 @@ from pux_harness.agent.contract import (
 )
 from pux_harness.sandbox.docker_exec import get_exec_client
 from pux_harness.agent.graph import build_graph, shared_backend, shared_exec
+from pux_harness.agent.observability import build_invoke_config
 from pux_harness.agent.profile import default_rubric
 from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
 from pux_harness.agent.tool_servers import resolve_tool_servers
@@ -159,10 +160,9 @@ async def _run(
                 state["rubric"] = dr
         result = await agent.ainvoke(
             state,
-            config={
-                "configurable": {"thread_id": thread_id},
-                "recursion_limit": recursion_limit,
-            },
+            config=build_invoke_config(
+                thread_id, recursion_limit, org, transport="direct"
+            ),
         )
     messages = result["messages"]
     print("=== MESSAGE TRACE ===")
