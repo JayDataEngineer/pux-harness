@@ -46,6 +46,11 @@ class ToolServerSpec:
 
     ``kind`` is always ``"mcp"`` in v1 (``http``/``sidecar`` reserved, fail-loud
     if used). ``tools`` is the allowlist — ``None`` means "take everything".
+
+    ``github`` (stdio only) is the optional release-bootstrap source — present
+    when the binary is fetched on-demand from a GitHub release (see
+    ``mcp_bootstrap.ensure_server``). ``None`` means no bootstrap; the
+    ``command`` must already resolve on PATH (or the server fails loud at load).
     """
 
     name: str = ""
@@ -58,6 +63,7 @@ class ToolServerSpec:
     env: dict[str, str] = field(default_factory=dict)
     tools: list[str] | None = None
     credentials: list[str] = field(default_factory=list)
+    github: dict[str, Any] | None = None
 
 
 def _expand_env(value: str, env: dict[str, str]) -> str | None:
@@ -136,6 +142,7 @@ def _substitute_spec(
         env=env_resolved,
         tools=list(spec.tools) if spec.tools is not None else None,
         credentials=list(spec.credentials),
+        github=dict(spec.github) if spec.github is not None else None,
     )
 
 
@@ -192,6 +199,7 @@ def _parse_spec(name: str, d: dict[str, Any]) -> ToolServerSpec:
     creds = d.get("credentials")
     if creds is not None and not isinstance(creds, list):
         raise ValueError(f"tool server {name!r}: 'credentials' must be a list")
+    github = _parse_github_block(name, d.get("github"), transport)
     return ToolServerSpec(
         name=name,
         kind=kind,
@@ -203,7 +211,53 @@ def _parse_spec(name: str, d: dict[str, Any]) -> ToolServerSpec:
         env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
         tools=tools,
         credentials=[str(c) for c in (creds or [])],
+        github=github,
     )
+
+
+# Required keys in a ``github:`` release-bootstrap block + their token contract.
+# The ``asset`` glob MUST carry ``{os}`` and ``{arch}`` tokens so the per-platform
+# asset can be selected deterministically (a token-less glob can't pick the right
+# binary across platforms — fail it at contract, not at download time).
+_GITHUB_REQUIRED: tuple[str, ...] = ("repo", "asset", "binary", "version")
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def _parse_github_block(
+    name: str, raw: Any, transport: str,
+) -> dict[str, str] | None:
+    """Parse the optional ``github:`` release-bootstrap block. ``None`` when
+    absent. Raises ``ValueError`` on a malformed block. Only meaningful for
+    stdio servers (the only transport with a local binary to fetch)."""
+    if raw is None:
+        return None
+    if transport != "stdio":
+        raise ValueError(
+            f"tool server {name!r}: 'github' bootstrap is only meaningful for "
+            f"stdio servers (transport={transport!r})"
+        )
+    if not isinstance(raw, dict):
+        raise ValueError(f"tool server {name!r}: 'github' must be a mapping")
+    block: dict[str, str] = {}
+    for key in _GITHUB_REQUIRED:
+        val = raw.get(key)
+        if val is None or str(val) == "":
+            raise ValueError(
+                f"tool server {name!r}: 'github.{key}' is required and non-empty"
+            )
+        block[key] = str(val)
+    if not _GITHUB_REPO_RE.match(block["repo"]):
+        raise ValueError(
+            f"tool server {name!r}: 'github.repo' must be 'owner/name', "
+            f"got {block['repo']!r}"
+        )
+    for tok in ("{os}", "{arch}"):
+        if tok not in block["asset"]:
+            raise ValueError(
+                f"tool server {name!r}: 'github.asset' must contain {tok} "
+                f"(per-platform select); got {block['asset']!r}"
+            )
+    return block
 
 
 def load_catalog() -> dict[str, ToolServerSpec]:
@@ -350,7 +404,14 @@ def validate_tool_servers(org: str) -> list[str]:
     """Offline contract surface — validates the org's ``tool_servers:``
     declaration WITHOUT live credential resolution. Returns a list of error
     strings (empty = valid). Called from ``contract.check_org`` so a broken
-    declaration fails ``--check-contract``."""
+    declaration fails ``--check-contract``.
+
+    A ``github:`` release-bootstrap block is structurally validated at parse
+    time (``_parse_github_block`` — required keys, ``owner/repo`` shape,
+    ``{os}``/``{arch}`` tokens). A malformed block raises during
+    ``load_catalog`` and surfaces here via the same error path as any other
+    parse failure (the org need not even reference the entry — ``load_catalog``
+    parses the whole catalog for any org with a tool_servers list)."""
     errors: list[str] = []
     try:
         # permissive=True: validate STRUCTURE without the operator's env values.
