@@ -35,6 +35,7 @@ Archive layout (mirrors the project tree, scoped to what the org uses)::
 from __future__ import annotations
 
 import json
+import os
 import tarfile
 from io import BytesIO
 from pathlib import Path
@@ -50,6 +51,7 @@ from pux_harness.agent.orgs import (
     discover_orgs,
     org_agent_slugs,
 )
+from pux_harness.kit._paths import _PROJECT_ROOT_ENV
 from pux_harness.kit._paths import project_root as _default_project_root
 
 
@@ -182,20 +184,42 @@ def _resolve_shared_sandbox(
     if not isinstance(policy, dict):
         return files
 
+    # ``host_setup`` hooks (``helper_script``) AND ``jobs`` (``script``) both
+    # reference shared sandbox files. ``jobs`` is the newer mechanism
+    # (sandbox/policy.py JobSpec) and was missed here: dev-bot/general's
+    # ``warmup_browser.py`` silently dropped out of the archive, so the exported
+    # org's pre-run job FileNotFound'd at serve time. Schema source-of-truth is
+    # ``policy_mod.host_setup_hooks`` / ``job_specs`` (sandbox/policy.py); we
+    # hand-parse here to stay as lenient as the ``yaml.safe_load`` above —
+    # ``policy_mod.load()`` env-substitutes and would raise on an unset
+    # ``${VAR}`` elsewhere in the policy (the tool_servers URLs), silently
+    # dropping these files (a regression).
     hooks = policy.get("host_setup") or []
     if not isinstance(hooks, list):
-        return files
+        hooks = []
+    jobs = policy.get("jobs") or []
+    if not isinstance(jobs, list):
+        jobs = []
 
     shared_sandbox = _orgs_dir() / "_shared" / "sandbox"
     shared_clients = _orgs_dir() / "_shared" / "clients"
 
+    # Collect every shared file ref from both mechanisms, then resolve once.
+    # Org-local scripts (no ``_shared``) are already captured by
+    # _collect_org_files; only the shared ones need explicit bundling.
+    file_refs: list[str] = []
     for hook in hooks:
-        if not isinstance(hook, dict):
-            continue
-        script = hook.get("helper_script", "")
-        if not isinstance(script, str) or not script:
-            continue
-        # script is project-relative like "orgs/_shared/sandbox/extract_browser_cookies.py"
+        if isinstance(hook, dict):
+            ref = hook.get("helper_script", "")
+            if isinstance(ref, str) and ref:
+                file_refs.append(ref)
+    for job in jobs:
+        if isinstance(job, dict):
+            ref = job.get("script", "")
+            if isinstance(ref, str) and ref:
+                file_refs.append(ref)
+    for script in file_refs:
+        # project-relative, e.g. "orgs/_shared/sandbox/warmup_browser.py"
         if "_shared" not in script:
             continue
         script_path = root / script
@@ -315,6 +339,36 @@ def _build_manifest(
     }
 
 
+# Text files whose CONTENTS may carry stale ``orgs/specialists/`` path refs
+# that ``_normalize_specialists_refs`` rewrites (mirrors the tree flattening).
+_TEXT_SUFFIXES = (".md", ".yaml", ".yml", ".txt")
+
+
+def _normalize_specialists_refs(data: bytes) -> bytes:
+    """Mirror the tree flattening inside file CONTENTS.
+
+    The archive flattens ``orgs/specialists/<name>/`` to ``orgs/<name>/`` so a
+    consumer never reproduces the orchestrator's internal categorization. But
+    agent frontmatter and ``policy.yaml`` reference sandbox scripts, skill
+    roots, and Dockerfiles by their FULL host path
+    (``orgs/specialists/<name>/...``). Copied verbatim, those references dangle
+    in the unpacked tree and the org will not recompile — ``kit._resolve_skills``
+    raises ``KeyError`` (observed: 7/10 shipped orgs broken on round-trip), and
+    policy ``script:``/``dockerfile:`` paths miss at runtime.
+
+    Rewrite ``orgs/specialists/`` -> ``orgs/`` so the archive is self-consistent:
+    every content reference resolves at the same flattened path the tree uses.
+    Applied to text files only; non-UTF-8 / binary bytes pass through unchanged.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    if "orgs/specialists/" not in text:
+        return data
+    return text.replace("orgs/specialists/", "orgs/").encode("utf-8")
+
+
 def export_org(
     org: str,
     output: Path | None = None,
@@ -322,58 +376,90 @@ def export_org(
 ) -> Path:
     """Export an org as a self-contained ``.tar.gz`` archive.
 
-    ``project_root`` defaults to the kit's LIVE resolver (``$PUX_PROJECT_ROOT``
-    or the CWD) — per-call overridable, mirroring ``kit.compile_org``. Returns
-    the path to the written archive.
+    ``project_root`` is AUTHORITATIVE: the export resolves the org, its shared
+    agents/skills/sandbox, and tool servers against THIS root — even when it is
+    a foreign tree (a standalone consumer app that lives next to its own
+    inference code, NOT the orchestrator). That is what makes an export
+    portable: ``export_org`` packages an org from *wherever it lives* without
+    needing a copy inside the orchestrator. It defaults to the kit's LIVE
+    resolver (``$PUX_PROJECT_ROOT`` or the CWD), mirroring ``kit.compile_org``.
+
+    Implementation note: the downstream resolvers (``discover_orgs``,
+    ``_org_path``, ``_resolve_shared_agents``, ``_resolve_tool_servers``) all
+    funnel through ``kit._paths.project_root()`` ← ``$PUX_PROJECT_ROOT``. We
+    pin that env var to ``project_root`` for the call's duration (restored in a
+    ``finally``) so every resolver honors the passed root. Returns the path to
+    the written archive.
     """
-    root = project_root if project_root is not None else _default_project_root()
-    if org not in discover_orgs():
-        raise FileNotFoundError(
-            f"org {org!r} not found; discovered: {discover_orgs()}")
+    root = (
+        project_root if project_root is not None else _default_project_root()
+    ).resolve()
 
-    org_dir = _org_path(org)
+    prior_env = os.environ.get(_PROJECT_ROOT_ENV)
+    os.environ[_PROJECT_ROOT_ENV] = str(root)
+    try:
+        if org not in discover_orgs():
+            raise FileNotFoundError(
+                f"org {org!r} not found under {root}; "
+                f"discovered: {discover_orgs()}")
 
-    # 1. Root AGENTS.md (base prompt)
-    root_agents_md = root / "AGENTS.md"
-    files: dict[str, Path] = {}
-    if root_agents_md.is_file():
-        files["AGENTS.md"] = root_agents_md
+        org_dir = _org_path(org)
 
-    # 2. Org-local files
-    files.update(_collect_org_files(org_dir))
+        # 1. Root AGENTS.md (base prompt)
+        root_agents_md = root / "AGENTS.md"
+        files: dict[str, Path] = {}
+        if root_agents_md.is_file():
+            files["AGENTS.md"] = root_agents_md
 
-    # 3. Shared dependencies
-    files.update(_resolve_shared_agents(org))
-    files.update(_resolve_shared_skills(org, root))
-    files.update(_resolve_shared_sandbox(org, root))
-    files.update(_resolve_tool_servers(org))
+        # 2. Org-local files
+        files.update(_collect_org_files(org_dir))
 
-    # 4. Build manifest
-    manifest = _build_manifest(org, files)
+        # 3. Shared dependencies
+        files.update(_resolve_shared_agents(org))
+        files.update(_resolve_shared_skills(org, root))
+        files.update(_resolve_shared_sandbox(org, root))
+        files.update(_resolve_tool_servers(org))
 
-    # 5. Write tar.gz
-    if output is None:
-        output = Path(f"{org}.tar.gz")
+        # 4. Build manifest
+        manifest = _build_manifest(org, files)
 
-    with tarfile.open(output, "w:gz") as tar:
-        # Add a top-level directory entry
-        info = tarfile.TarInfo(name=f"{org}/")
-        info.type = tarfile.DIRTYPE
-        tar.addfile(info)
+        # 5. Write tar.gz
+        if output is None:
+            output = Path(f"{org}.tar.gz")
 
-        for archive_path, host_path in sorted(files.items()):
-            try:
-                data = host_path.read_bytes()
-            except (PermissionError, OSError):
-                continue
-            info = tarfile.TarInfo(name=f"{org}/{archive_path}")
-            info.size = len(data)
-            tar.addfile(info, BytesIO(data))
+        with tarfile.open(output, "w:gz") as tar:
+            # Add a top-level directory entry. The mode MUST carry the execute
+            # bit (0o755): a DIRTYPE entry at the default 0o644 is created on
+            # extract without traverse permission, so every child becomes an
+            # EACCES on read — the archive looks fine to `tar tzf` but is
+            # unusable when actually unpacked. Set it explicitly.
+            info = tarfile.TarInfo(name=f"{org}/")
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            tar.addfile(info)
 
-        # Add manifest
-        manifest_json = json.dumps(manifest, indent=2).encode()
-        info = tarfile.TarInfo(name=f"{org}/manifest.json")
-        info.size = len(manifest_json)
-        tar.addfile(info, BytesIO(manifest_json))
+            for archive_path, host_path in sorted(files.items()):
+                try:
+                    data = host_path.read_bytes()
+                except (PermissionError, OSError):
+                    continue
+                # Keep content refs consistent with the flattened tree (see
+                # _normalize_specialists_refs). Size is computed AFTER rewrite.
+                if archive_path.endswith(_TEXT_SUFFIXES):
+                    data = _normalize_specialists_refs(data)
+                info = tarfile.TarInfo(name=f"{org}/{archive_path}")
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
 
-    return output
+            # Add manifest
+            manifest_json = json.dumps(manifest, indent=2).encode()
+            info = tarfile.TarInfo(name=f"{org}/manifest.json")
+            info.size = len(manifest_json)
+            tar.addfile(info, BytesIO(manifest_json))
+
+        return output
+    finally:
+        if prior_env is None:
+            os.environ.pop(_PROJECT_ROOT_ENV, None)
+        else:
+            os.environ[_PROJECT_ROOT_ENV] = prior_env
