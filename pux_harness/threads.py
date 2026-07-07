@@ -76,6 +76,43 @@ class ThreadStore:
         )
         await self.db.commit()
 
+    async def list_threads(self, org: str | None = None) -> list[dict[str, Any]]:
+        """Return ``pux_threads`` rows (newest first), optionally filtered by org.
+
+        Each row is ``{"thread_id", "org", "metadata", "created_at"}``. Backs the
+        ACP ``session/list`` surface so a client (Hermes daemon, acpx) can
+        enumerate an org's sessions across ``pux acp`` process restarts.
+        """
+        sql = (
+            "SELECT thread_id, org, metadata, created_at FROM pux_threads"
+            + (" WHERE org = ?" if org is not None else "")
+            + " ORDER BY created_at DESC"
+        )
+        params: tuple[Any, ...] = (org,) if org is not None else ()
+        cur = await self.db.execute(sql, params)
+        rows = await cur.fetchall()
+        return [
+            {"thread_id": r[0], "org": r[1], "metadata": r[2], "created_at": r[3]}
+            for r in rows
+        ]
+
+    async def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        """Return one ``pux_threads`` row by id, or ``None`` if absent.
+
+        Backs the ACP ``session/load`` existence check: ``load_session`` verifies
+        the requested ``session_id`` is ours (and belongs to this org) before
+        handing the client a handle to resume.
+        """
+        cur = await self.db.execute(
+            "SELECT thread_id, org, metadata, created_at FROM pux_threads "
+            "WHERE thread_id = ?",
+            (thread_id,),
+        )
+        r = await cur.fetchone()
+        if r is None:
+            return None
+        return {"thread_id": r[0], "org": r[1], "metadata": r[2], "created_at": r[3]}
+
 
 @asynccontextmanager
 async def open_thread_store(
