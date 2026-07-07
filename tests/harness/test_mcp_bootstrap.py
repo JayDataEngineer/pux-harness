@@ -31,15 +31,18 @@ from pux_harness.agent.tool_servers import ToolServerSpec
 
 class _FakeResp:
     def __init__(self, *, payload=None, error=None, chunks=None,
-                 chunk_error=None):
+                 chunk_error=None, status=200):
         self._payload = payload
         self._error = error
         self._chunks = chunks
         self._chunk_error = chunk_error
+        self.status_code = status
 
     def raise_for_status(self):
         if self._error:
             raise self._error
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self):
         return self._payload
@@ -358,6 +361,47 @@ def test_fetch_release_network_failure_returns_none(monkeypatch):
         return _FakeResp(error=RuntimeError("boom"))
     monkeypatch.setattr(mb.httpx, "get", _fake_get)
     assert mb.fetch_release("o/r", "latest") is None
+
+
+def test_fetch_release_retries_unauth_on_401_with_dead_token(monkeypatch):
+    """A present-but-INVALID token (expired/revoked PAT) makes GitHub 401 the
+    request EVEN for public releases that return 200 unauth — sending a bad
+    credential is worse than sending none. The release token is OPTIONAL
+    (rate-limit lift only), so on 401 fetch_release drops the credential and
+    retries unauth. Proven live 2026-07-06: a dead PAT in .env 401'd
+    /releases/latest where the same URL returned 200 unauth."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_dead")
+    calls = []
+
+    def _fake_get(url, **kwargs):
+        hdrs = kwargs.get("headers", {})
+        calls.append(hdrs)
+        if "Authorization" in hdrs:           # first, authed -> 401
+            return _FakeResp(payload=None, status=401)
+        return _FakeResp(payload={"assets": []}, status=200)  # retry unauth -> 200
+
+    monkeypatch.setattr(mb.httpx, "get", _fake_get)
+    assert mb.fetch_release("github/github-mcp-server", "latest") == {"assets": []}
+    assert len(calls) == 2
+    assert "Authorization" in calls[0]          # tried the token first
+    assert "Authorization" not in calls[1]      # then dropped it
+
+
+def test_fetch_release_no_retry_when_already_unauth(monkeypatch):
+    """No token in env → no Authorization header → a 401 (genuinely private repo
+    or similar) must NOT loop: there's no credential to drop, so it surfaces as a
+    failure (None), not an infinite retry."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
+    calls = []
+
+    def _fake_get(url, **kwargs):
+        calls.append(kwargs.get("headers", {}))
+        return _FakeResp(payload=None, status=401)
+
+    monkeypatch.setattr(mb.httpx, "get", _fake_get)
+    assert mb.fetch_release("o/private", "latest") is None
+    assert len(calls) == 1  # single attempt, no retry (nothing to drop)
 
 
 def test_download_writes_bytes(monkeypatch, tmp_path):

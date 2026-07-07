@@ -132,15 +132,37 @@ def _api_headers() -> dict[str, str]:
 
 def fetch_release(repo: str, version: str) -> dict[str, Any] | None:
     """GET the release metadata (``latest`` → ``/releases/latest``; else
-    ``/releases/tags/<version>``). ``None`` on any network/HTTP failure."""
+    ``/releases/tags/<version>``). ``None`` on any network/HTTP failure.
+
+    The release fetch is OPTIONAL-auth: a Bearer token (if present) lifts the
+    rate limit (5000/hr vs 60 unauth), but PUBLIC releases return 200 with NO
+    token. A present-but-INVALID token (expired/revoked PAT) makes GitHub 401
+    the request EVEN for public releases — sending a bad credential is worse
+    than sending none. So on 401 with a token set, we drop the credential and
+    retry unauth (the documented contract: public releases work without a
+    token). The token's separate job — authenticating the SERVER itself — is
+    wired through the spec's ``env`` and is unaffected here."""
     url = (
         f"{_API}/repos/{repo}/releases/latest"
         if version == "latest"
         else f"{_API}/repos/{repo}/releases/tags/{version}"
     )
+    headers = _api_headers()
     try:
-        r = httpx.get(url, headers=_api_headers(), timeout=_TIMEOUT,
+        r = httpx.get(url, headers=headers, timeout=_TIMEOUT,
                       follow_redirects=True)
+        if r.status_code == 401 and "Authorization" in headers:
+            _log.warning(
+                "mcp_bootstrap: token rejected (401) for %s@%s; retrying the "
+                "release fetch unauth (the release token is optional — a dead "
+                "PAT must not block a PUBLIC release download). The server's "
+                "own PAT is a separate concern.", repo, version,
+            )
+            r = httpx.get(
+                url,
+                headers={k: v for k, v in headers.items() if k != "Authorization"},
+                timeout=_TIMEOUT, follow_redirects=True,
+            )
         r.raise_for_status()
         return r.json()
     except Exception as e:  # noqa: BLE001 — any failure → None (caller skips)
