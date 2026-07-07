@@ -56,7 +56,7 @@ from deepagents import RubricMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
-from pux_harness.agent.model import get_model
+from pux_harness.agent.model import driver_multimodal, get_model
 from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
     _build_general_purpose_sub,
@@ -237,17 +237,30 @@ def _build_context(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
     return mw
 
 
-def _build_browser_vision(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
-    """``BrowserVisionMiddleware`` when the multimodal driver is on (default for
-    mimo-v2.5); ``None`` (skip) when ``PUX_BROWSER_VISION=0`` — clean
-    absent-from-list, not mounted-but-off. Listed LAST in the registry so it
-    mounts INNERMOST: the raw tool string is still inline before
-    ContextMiddleware offloads it (so ``screenshot_path`` stays findable).
-    No-op for every non-``pux_sandbox_browser_*`` tool, so it costs nothing on
-    the rest of the surface. One instance per scope mirrors the context spec."""
+def _build_browser_vision(ctx: StackCtx, scope: Scope) -> AgentMiddleware | None:
+    """``BrowserVisionMiddleware`` — vision-in-the-loop for browser actions.
+    ``None`` (skip) only when ``PUX_BROWSER_VISION=0`` (clean absent-from-list,
+    not mounted-but-off). Listed LAST in the registry so it mounts INNERMOST:
+    the raw tool string is still inline before ContextMiddleware offloads it
+    (so ``screenshot_path`` stays findable). No-op for every
+    non-``pux_sandbox_browser_*`` tool, so it costs nothing on the rest of the
+    surface. One instance per scope mirrors the context spec.
+
+    MODE is selected by the driver's per-scope capability
+    (``model.driver_multimodal``): SUPERVISOR checks the ``base`` role, SUBAGENT
+    the ``worker`` role. A multimodal driver (the ``fast`` tier, or any org whose
+    base/worker pins mimo-v2.5) gets native image blocks; a text-only driver (the
+    shipped DEFAULT tier's glm-5.2 supervisor) gets a text pointer to
+    ``describe_image`` so vision is delegated to the multimodal role instead of
+    dropped. Org/env overrides on the role are honored automatically — the same
+    priority stack that resolves the driving model resolves its capability."""
     if not browser_vision_enabled():
         return None
-    return BrowserVisionMiddleware(ctx.exec_client)
+    role = "base" if scope is Scope.SUPERVISOR else "worker"
+    return BrowserVisionMiddleware(
+        ctx.exec_client,
+        multimodal_driver=driver_multimodal(role=role, org=ctx.org),
+    )
 
 
 def _log_rubric_evaluation(ev: dict) -> None:

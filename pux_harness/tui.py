@@ -40,6 +40,7 @@ from pathlib import Path
 
 import yaml
 
+from pux_harness.agent.model import dcode_model_ref
 from pux_harness.kit._paths import project_root
 from pux_harness.tui_branding import get_branding, get_pux_banner
 
@@ -306,8 +307,16 @@ def _run_in_process(
     _patch_banner(org)
 
     argv = ["dcode", "-a", org]
-    if model:
-        argv += ["-M", model]
+    # Always PIN dcode's model so it never drifts to its own default
+    # (~/.deepagents/config.toml `[models] recent`, e.g. deepseek-v4-flash —
+    # the silent base-model drift). An explicit ``--model`` wins; otherwise
+    # resolve the harness's base role for THIS org + the active tier
+    # (``PUX_TIER``/``--fast``) to the dcode ``provider:id`` form. When no
+    # dcode provider is configured, ``dcode_model_ref`` returns None and we let
+    # dcode pick (honest — we can't fabricate a ref).
+    ref = model or dcode_model_ref(role="base", org=org)
+    if ref:
+        argv += ["-M", ref]
     if task is not None:
         # Headless: -n runs one task and exits. Auto-approve file ops (-y) and
         # allow a safe shell set (-S) so the agent can actually act unattended.

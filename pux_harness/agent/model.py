@@ -1,9 +1,10 @@
 """Model spec — roles resolved from a shipped ``models.yaml``.
 
 The single source of truth is ``models.yaml`` next to this module: it pins the
-provider (``base_url`` + which env var holds the api key) and the role→model-id
-map (``base`` / ``worker`` / ``multimodal`` / ``grader``). No model id is
-hardcoded anywhere else in the harness — every consumer asks
+provider (``base_url`` + which env var holds the api key), a per-id capability
+registry (``models:``, e.g. ``multimodal: true/false``), a set of named TIERS
+(``tiers:`` — each a full role→id map), and the dcode provider name. No model id
+is hardcoded anywhere else in the harness — every consumer asks
 ``get_model(role=..., org=...)`` and the resolution picks the concrete id.
 
 Resolution priority for a role (highest wins):
@@ -13,20 +14,33 @@ Resolution priority for a role (highest wins):
   3. ``PUX_<ROLE>_MODEL`` env var       — deployment-level (e.g. PUX_GRADER_MODEL);
                                          ``PUX_MODEL`` is honored for the base role
                                          as legacy back-compat.
-  4. ``models.yaml`` ``roles:``         — the shipped default.
+  4. the ACTIVE TIER's role map         — selected by ``PUX_TIER`` (set by
+                                         ``--tier``/``--fast``), defaulting to
+                                         ``models.yaml``'s ``default_tier``.
+
+Tier is the COARSE selector (a whole role map per "mode": the shipped ``default``
+= SOTA supervisor + cheap workers; ``fast`` = everything cheap). Per-role
+overrides (org, env, frontmatter) still win ABOVE the tier — the tier is the
+floor, so an org's explicit ``models:`` pin is respected in every tier.
+
+Capability (``is_multimodal``) is a property of the MODEL ID, read from the
+``models:`` registry. Unknown ids default to non-multimodal (fail-safe: a driver
+of unknown capability takes the describe_image fallback, never image blocks it
+can't read). ``driver_multimodal`` resolves a role to its id then its capability
+— the seam ``BrowserVisionMiddleware`` uses to decide image-block vs text-pointer.
 
 Provider config (``base_url``, ``api_key_env``, ``max_tokens``, ``temperature``)
 comes from ``models.yaml``'s ``provider:`` block, with the legacy env overrides
 (``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still winning
 for back-compat.
 
-A cloner repoints at their own provider by editing ``models.yaml`` — one file,
-no code changes, no scattered hardcodes.
-
-Historical note: pre-17.B.0 this module had a single ``DEFAULT_MODEL``/``get_model(model=None)``
-that every consumer shared; the rubric gate needs an independent
-grader model, which would have meant a second hardcode — the spec exists to make
-that a role resolution instead.
+Historical notes:
+  - Pre-17.B.0 a single ``DEFAULT_MODEL``/``get_model(model=None)`` was shared by
+    every consumer; the rubric gate needs an independent grader model → roles.
+  - Pre-tier the file had a flat ``roles:`` map (one role set, the default). That
+    made the WEAK model the shipped supervisor — backwards for a "cheap vs SOTA"
+    dial. ``tiers:`` + ``default_tier`` replaced it: the default is SOTA, ``fast``
+    is the opt-in cheap mode.
 """
 from __future__ import annotations
 
@@ -49,6 +63,8 @@ ROLE_KEYS: tuple[str, ...] = tuple(f"{r}_model" for r in ROLES)
 # Legacy single-model-era env vars still honored (back-compat).
 _LEGACY_DEFAULT_MODEL_ENV = "PUX_MODEL"        # base role only
 _LEGACY_BASE_URL_ENV = "OPENCODE_BASE_URL"
+# The runtime tier selector (set by --tier/--fast). Falls back to default_tier.
+_TIER_ENV = "PUX_TIER"
 
 
 @lru_cache(maxsize=1)
@@ -61,37 +77,87 @@ def _spec() -> dict:
     data = yaml.safe_load(_YAML.read_text()) or {}
     if not isinstance(data, dict):
         raise RuntimeError(f"models.yaml: top level must be a mapping, got {type(data).__name__}")
-    if "provider" not in data or "roles" not in data:
+    for key in ("provider", "tiers", "default_tier"):
+        if key not in data:
+            raise RuntimeError(
+                f"models.yaml must define `provider:`, `tiers:`, `default_tier:`; "
+                f"missing: {key}")
+    tiers = data["tiers"]
+    if not isinstance(tiers, dict) or not tiers:
+        raise RuntimeError(f"models.yaml `tiers:` must be a non-empty mapping, got {type(tiers).__name__}")
+    for tname, tmap in tiers.items():
+        if not isinstance(tmap, dict):
+            raise RuntimeError(f"models.yaml tier {tname!r} must be a mapping, got {type(tmap).__name__}")
+        missing = [k for k in ROLE_KEYS if k not in tmap]
+        if missing:
+            raise RuntimeError(f"models.yaml tier {tname!r} missing role key(s): {missing}")
+    default_tier = data["default_tier"]
+    if not isinstance(default_tier, str) or default_tier not in tiers:
         raise RuntimeError(
-            "models.yaml must define `provider:` and `roles:`; "
-            f"got top-level keys: {sorted(data)}"
-        )
-    roles = data["roles"]
-    if not isinstance(roles, dict):
-        raise RuntimeError(f"models.yaml `roles:` must be a mapping, got {type(roles).__name__}")
-    missing = [k for k in ROLE_KEYS if k not in roles]
-    if missing:
-        raise RuntimeError(f"models.yaml `roles:` missing: {missing}")
+            f"models.yaml `default_tier: {default_tier!r}` must name a tier in `tiers:` "
+            f"(known: {sorted(tiers)})")
+    if "models" in data and not isinstance(data["models"], dict):
+        raise RuntimeError(f"models.yaml `models:` must be a mapping, got {type(data['models']).__name__}")
+    if "dcode" in data and not isinstance(data["dcode"], dict):
+        raise RuntimeError(f"models.yaml `dcode:` must be a mapping, got {type(data['dcode']).__name__}")
     return data
 
 
 def validate_models_spec() -> None:
     """Offline contract entry point — exercises ``_spec()`` so a malformed
     ``models.yaml`` fails ``--check-contract``, not the first live run. Raises
-    RuntimeError on any problem; returns None when the spec is well-formed."""
-    _spec()
+    RuntimeError on any problem; returns None when the spec is well-formed.
+
+    Also cross-checks each tier's ``multimodal_model`` is flagged multimodal in
+    the ``models:`` registry (when the id is KNOWN) — a non-multimodal vision
+    model would silently break ``describe_image`` at runtime, so fail it here."""
+    spec = _spec()
+    registry = spec.get("models") or {}
+    for tname, tmap in spec["tiers"].items():
+        mm = tmap["multimodal_model"]
+        caps = registry.get(mm)
+        if isinstance(caps, dict) and caps.get("multimodal") is False:
+            raise RuntimeError(
+                f"models.yaml tier {tname!r}: multimodal_model {mm!r} is flagged "
+                f"non-multimodal in the `models:` registry — vision (describe_image) "
+                f"would break. Pick a multimodal-capable id or flag it true.")
 
 
 def _provider() -> dict:
     return _spec()["provider"]
 
 
-def _role_default(role: str) -> str:
-    roles = _spec()["roles"]
+def _tiers() -> dict:
+    return _spec()["tiers"]
+
+
+def active_tier() -> str:
+    """The tier roles resolve from: ``PUX_TIER`` (set by --tier/--fast) if it
+    names a real tier, else ``default_tier``. Raises ValueError on an UNKNOWN
+    ``PUX_TIER`` so a typo fails loud rather than silently falling back."""
+    env_tier = os.environ.get(_TIER_ENV)
+    tiers = _tiers()
+    if env_tier:
+        if env_tier not in tiers:
+            raise ValueError(
+                f"PUX_TIER={env_tier!r} is not a known tier; known: {sorted(tiers)}")
+        return env_tier
+    return _spec()["default_tier"]
+
+
+def _tier_role(role: str, tier: str) -> str:
+    roles = _tiers()[tier]
     key = f"{role}_model"
-    if key not in roles:
-        raise ValueError(f"unknown model role {role!r}; known roles: {ROLES}")
+    # _spec() already guaranteed every tier carries every ROLE_KEY.
     return roles[key]
+
+
+def _models_registry() -> dict:
+    return _spec().get("models") or {}
+
+
+def _dcode_block() -> dict:
+    return _spec().get("dcode") or {}
 
 
 def _org_role_override(org: str, role_key: str) -> str | None:
@@ -138,8 +204,8 @@ def resolve_model_id(
         legacy = os.environ.get(_LEGACY_DEFAULT_MODEL_ENV)
         if legacy:
             return legacy
-    # 4. shipped default.
-    return _role_default(role)
+    # 4. the active tier's role map.
+    return _tier_role(role, active_tier())
 
 
 def get_model(
@@ -167,3 +233,47 @@ def get_model(
         max_tokens=int(os.environ.get("PUX_MAX_TOKENS", provider.get("max_tokens", 8192))),
         temperature=float(os.environ.get("PUX_TEMPERATURE", provider.get("temperature", 0.2))),
     )
+
+
+# --- capability + dcode seams ----------------------------------------------
+
+
+def is_multimodal(model_id: str) -> bool:
+    """True iff ``model_id`` is flagged ``multimodal: true`` in the ``models:``
+    registry. Unknown ids default to False (fail-safe: a driver of unknown
+    capability takes the describe_image fallback, never image blocks it can't
+    read)."""
+    caps = _models_registry().get(model_id)
+    if not isinstance(caps, dict):
+        return False
+    return bool(caps.get("multimodal", False))
+
+
+def driver_multimodal(*, role: str = "base", org: str | None = None) -> bool:
+    """True iff the model resolved for ``role`` (against ``org`` + the active
+    tier) is multimodal-capable. The seam ``BrowserVisionMiddleware`` uses to
+    decide image-block (multimodal driver) vs text-pointer (non-multimodal →
+    call ``describe_image``). No key, no network — pure id resolution + lookup."""
+    return is_multimodal(resolve_model_id(role=role, org=org))
+
+
+def dcode_provider() -> str | None:
+    """dcode's provider name for our endpoint (``models.yaml`` ``dcode.provider``),
+    or None when unset. ``pux tui`` forwards ``<provider>:<id>`` to dcode so it
+    never falls back to its own default model."""
+    provider = _dcode_block().get("provider")
+    return provider if isinstance(provider, str) and provider else None
+
+
+def dcode_model_ref(
+    *, role: str = "base", org: str | None = None, model: str | None = None,
+) -> str | None:
+    """The dcode ``provider:model`` string for ``role`` (e.g.
+    ``opencode-go-openai:glm-5.2``), or None when no dcode provider is
+    configured. Resolves the id through the same priority stack as
+    ``resolve_model_id`` so the TUI forwards exactly what the harness would
+    drive."""
+    provider = dcode_provider()
+    if not provider:
+        return None
+    return f"{provider}:{resolve_model_id(role=role, org=org, model=model)}"

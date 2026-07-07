@@ -12,21 +12,38 @@
 #   1. subagent frontmatter `model:`   — agent-level (subagents only; a literal id)
 #   2. org profile.yaml `models:` map  — org-level role override
 #   3. env PUX_<ROLE>_MODEL             — deployment-level (e.g. PUX_GRADER_MODEL)
-#   4. `roles:` below                   — these shipped defaults
+#   4. the ACTIVE TIER's role map below — selected by --tier/--fast (sets PUX_TIER),
+#                                         defaulting to `default_tier`
 #
-# THE ROLES
-#   base_model       the primary driving agent (the CTO). The shipped default is
-#                    mimo-v2.5 (cheap, capable) so a cloner gets a working agent
-#                    with no edits; bump to a heavier reasoning model (e.g.
-#                    glm-5.2) here if your driving agent should think harder.
+# THE ROLES (the keys inside every tier)
+#   base_model       the primary driving agent (the CTO / supervisor). The shipped
+#                    DEFAULT tier uses glm-5.2 (SOTA text reasoning) so the driving
+#                    agent thinks hard. `--fast` / the `fast` tier cheapens it to
+#                    mimo-v2.5 for rate-limit fallback or trivial tasks.
 #   worker_model     default for subagents/specialists whose frontmatter omits
-#                    `model:`. Decoupled from base so an org can set base!=worker.
-#   multimodal_model vision — describe_image PRIMARY path (decoupled from base
-#                    so an org can pin a vision model != the driver).
-#   grader_model     the RubricMiddleware verify-gate grader. Runs
-#                    up to max_iterations × per agent output, so the CHEAP model
-#                    is the right default; bump per-org where a rubric needs more
-#                    reasoning.
+#                    `model:`. Decoupled from base so an org can set base!=worker
+#                    (the default tier pairs a SOTA supervisor with cheap workers —
+#                    exactly the smart-coordinator / cheap-doers split the dynamic-
+#                    subagent happy path assumes).
+#   multimodal_model vision — the model `describe_image` / `multimodal` route to.
+#                    MUST be a multimodal-capable id (see the `models:` registry) —
+#                    a non-multimodal driver falls back to calling `describe_image`
+#                    (which uses THIS role) rather than reading image blocks itself.
+#   grader_model     the RubricMiddleware verify-gate grader. Runs up to
+#                    max_iterations × per agent output, so the CHEAP model is the
+#                    right default; bump per-org where a rubric needs more reasoning.
+#
+# THE `models:` REGISTRY
+#   Per-id capability flags. Capability is a property of the MODEL id, not the
+#   tier — glm-5.2 is non-multimodal everywhere it appears. `is_multimodal(id)`
+#   reads this; an UNKNOWN id defaults to non-multimodal (fail-safe: a driver of
+#   unknown capability gets the describe_image fallback, never image blocks it
+#   can't read). The DEFAULT tier's multimodal_model must be flagged true here.
+#
+# THE `dcode:` BLOCK
+#   The TUI (dcode) names our opencode endpoint `opencode-go-openai` and uses the
+#   SAME ids (see ~/.deepagents/config.toml). `pux tui` forwards the resolved base
+#   model as `<dcode.provider>:<id>` so dcode never falls back to its own default.
 
 provider:
   # OpenAI-compatible endpoint. Override per-deployment with OPENCODE_BASE_URL.
@@ -38,8 +55,41 @@ provider:
   max_tokens: 8192
   temperature: 0.2
 
-roles:
-  base_model: mimo-v2.5
-  worker_model: mimo-v2.5
-  multimodal_model: mimo-v2.5
-  grader_model: mimo-v2.5
+# Per-id capability registry. Only `multimodal:` is tracked today. Unknown ids
+# (not listed here) default to multimodal: false — the fail-safe path.
+models:
+  glm-5.2:           {multimodal: false}
+  glm-5.1:           {multimodal: false}
+  mimo-v2.5:         {multimodal: true}
+  mimo-v2.5-pro:     {multimodal: true}
+  kimi-k2.7-code:    {multimodal: false}
+  kimi-k2.6:         {multimodal: false}
+  deepseek-v4-pro:   {multimodal: false}
+  deepseek-v4-flash: {multimodal: false}
+
+# Named tiers — a coherent role map per "mode". `default_tier` is the shipped
+# default; --tier <name> (or --fast) selects another at run time.
+tiers:
+  # The shipped happy path: a SOTA text-reasoning supervisor driving cheap
+  # (multimodal) workers. glm-5.2 is NOT multimodal, so the supervisor reaches
+  # vision through `describe_image` (-> multimodal_model) via the
+  # BrowserVisionMiddleware text-pointer fallback, not native image blocks.
+  default:
+    base_model: glm-5.2
+    worker_model: mimo-v2.5
+    multimodal_model: mimo-v2.5
+    grader_model: mimo-v2.5
+  # Everything cheap — opt in with --fast (or PUX_TIER=fast) for rate-limit
+  # fallback or trivial tasks. mimo-v2.5 is multimodal, so even here the driver
+  # reads browser screenshots natively.
+  fast:
+    base_model: mimo-v2.5
+    worker_model: mimo-v2.5
+    multimodal_model: mimo-v2.5
+    grader_model: mimo-v2.5
+
+default_tier: default
+
+# dcode (the TUI) provider name for our opencode endpoint — see the block comment.
+dcode:
+  provider: opencode-go-openai

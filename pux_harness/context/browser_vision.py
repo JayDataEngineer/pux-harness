@@ -47,9 +47,18 @@ HONEST FAILURE
     no image). The image is an enhancement, never a replacement; a missing
     image is honest, never a silent fallback that pretends vision works.
 
-GATING
-    Default ON — the shipped ``base_model`` is mimo-v2.5 (multimodal). A cloner
-    who pins a TEXT-only driver sets ``PUX_BROWSER_VISION=0``.
+GATING / MODE
+    Default ON regardless of driver — vision is always wired. ``PUX_BROWSER_VISION=0``
+    fully disables it (clean absent-from-list). The MODE is selected per-scope by
+    the driver's capability (``model.driver_multimodal``, threaded in by
+    ``stack._build_browser_vision``): a MULTIMODAL driver (e.g. the ``fast`` tier's
+    mimo-v2.5) gets the native image block above; a TEXT-only driver (the shipped
+    DEFAULT tier's glm-5.2 supervisor) gets a TEXT POINTER — "screenshot saved at
+    <path>; call ``describe_image(image_path=<path>, prompt=...)`` to inspect it"
+    — so a non-multimodal driver reaches vision through the ``multimodal`` role
+    (``describe_image`` routes there) instead of an image block it cannot read.
+    No base64 fetch in the text-pointer mode (cheaper — the image never leaves the
+    container; the typed tool re-reads it on demand).
 """
 from __future__ import annotations
 
@@ -107,9 +116,23 @@ class BrowserVisionMiddleware(AgentMiddleware):
     """Attach each browser tool's screenshot as a native image block, delivered
     as a companion HumanMessage alongside the text ToolMessage result."""
 
-    def __init__(self, exec_client: Any, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        exec_client: Any,
+        *,
+        enabled: bool = True,
+        multimodal_driver: bool = True,
+    ) -> None:
         self.exec_client = exec_client
         self.enabled = enabled
+        # True  -> attach the screenshot as a native image block (the driver can
+        #          read images directly). False -> emit a text pointer to
+        #          describe_image (the driver is text-only; vision is delegated
+        #          to the multimodal role). See the GATING/MODE note above. The
+        #          default (True) preserves the pre-fallback behavior for any
+        #          direct construction; stack._build_browser_vision threads the
+        #          real per-scope capability in.
+        self.multimodal_driver = multimodal_driver
 
     # request is langchain's ToolCallRequest (or a SimpleNamespace stand-in in
     # tests) — read tool_call defensively, mirroring ContextMiddleware.
@@ -122,9 +145,11 @@ class BrowserVisionMiddleware(AgentMiddleware):
         return "tool"
 
     def _enrich(self, result: Any) -> Any:
-        """Return ``Command([text_tool_message, human_image_message])`` iff
-        ``result`` is a browser ToolMessage whose JSON carries a screenshot_path
-        we can fetch. Otherwise return ``result`` unchanged."""
+        """Return ``Command([text_tool_message, companion])`` iff ``result`` is a
+        browser ToolMessage whose JSON carries a ``screenshot_path``. The
+        companion is a native image block when the driver is multimodal, or a
+        text pointer to ``describe_image`` when the driver is text-only.
+        Otherwise return ``result`` unchanged."""
         if not isinstance(result, ToolMessage):
             return result
         if isinstance(result.content, list):
@@ -141,6 +166,21 @@ class BrowserVisionMiddleware(AgentMiddleware):
         path = payload.get("screenshot_path")
         if not isinstance(path, str) or not path:
             return result
+        if not self.multimodal_driver:
+            # Text-only driver: it cannot read an image block. Point it at the
+            # typed describe_image tool (which routes to the multimodal role) so
+            # vision is DELEGATED, not silently dropped. No base64 fetch — the
+            # image stays in the container; describe_image re-reads it on demand.
+            # The path is the in-container screenshot_path, which is exactly what
+            # describe_image(image_path=...) expects.
+            human = HumanMessage(content=[{"type": "text", "text": (
+                f"[screenshot captured for {result.name} tool_call "
+                f"{result.tool_call_id} at {path}] You cannot view images "
+                f"directly. To inspect the screenshot, call "
+                f"describe_image(image_path={path!r}, "
+                f"prompt=\"<what to check about the page>\")."
+            )}])
+            return Command(update={"messages": [result, human]})
         b64 = _screenshot_b64(self.exec_client, path)
         if not b64:
             return result  # fetch failed — ship the text result unchanged
@@ -174,6 +214,7 @@ class BrowserVisionMiddleware(AgentMiddleware):
 
 
 def browser_vision_enabled() -> bool:
-    """Default ON (mimo-v2.5 is the shipped driver and is multimodal). A cloner
-    with a text-only driver sets ``PUX_BROWSER_VISION=0``."""
+    """Default ON — vision is always wired (a text-only driver gets the
+    describe_image text-pointer mode, not a silent drop). A cloner who wants
+    vision fully off sets ``PUX_BROWSER_VISION=0``."""
     return os.getenv("PUX_BROWSER_VISION", "1") != "0"

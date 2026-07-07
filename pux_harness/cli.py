@@ -73,6 +73,47 @@ def _print_block(label: str, body: str) -> None:
     print(body.rstrip() if isinstance(body, str) else body)
 
 
+def _add_tier_flags(p: Any) -> None:
+    """Add ``--tier <name>`` + ``--fast`` (mutually exclusive) to an in-process
+    subparser. ``serve``/``acp``/``direct``/``tui`` build orgs (and so resolve
+    models) in THIS process, so a tier flag here is authoritative. Client
+    commands (``dispatch``/``run``) talk to an already-running server that
+    resolved its tier at startup — a client flag would be misleading, so they
+    don't get one. ``--fast`` is sugar for ``--tier fast``."""
+    g = p.add_mutually_exclusive_group()
+    g.add_argument(
+        "--tier", default=None, metavar="NAME",
+        help="model tier to resolve roles from (sets PUX_TIER for this process; "
+             "e.g. 'default' = SOTA supervisor + cheap workers, 'fast' = all "
+             "cheap). Known tiers are read from models.yaml; an unknown name "
+             "fails loud. Default: models.yaml's default_tier.",
+    )
+    g.add_argument(
+        "--fast", action="store_true",
+        help="shorthand for --tier fast (cheap models throughout — the rate-limit "
+             "fallback / trivial-task mode)",
+    )
+
+
+def _apply_tier_flag(args: Any) -> None:
+    """Translate ``--tier``/``--fast`` into ``PUX_TIER`` in-process, then validate
+    it eagerly (``active_tier`` raises ValueError on an unknown tier) so a typo
+    dies at the CLI, not at the first model build. An explicit flag overrides a
+    pre-existing ``PUX_TIER`` env; passing neither leaves the env (or the default
+    tier) in control. No-op for subcommands that don't carry the flags."""
+    fast = getattr(args, "fast", False)
+    tier = getattr(args, "tier", None)
+    if not fast and not tier:
+        return
+    if fast:
+        os.environ["PUX_TIER"] = "fast"
+    else:
+        os.environ["PUX_TIER"] = tier
+    from pux_harness.agent.model import active_tier  # noqa: PLC0415 — lazy import
+
+    active_tier()  # raises ValueError on an unknown PUX_TIER
+
+
 # --- Client subcommands (Agent Protocol REST) ---------------------------------
 
 
@@ -189,10 +230,12 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # Server-mode commands
-    sub.add_parser("serve", help="start the Agent Protocol server (uvicorn)")
+    p_serve = sub.add_parser("serve", help="start the Agent Protocol server (uvicorn)")
+    _add_tier_flags(p_serve)
 
     p_acp = sub.add_parser("acp", help="ACP stdio server for editor integration")
     p_acp.add_argument("--org", default=os.environ.get("PUX_ORG", "general"))
+    _add_tier_flags(p_acp)
 
     # TUI launcher (dcode wrapper)
     p_tui = sub.add_parser("tui", help="launch dcode TUI with org branding + agents")
@@ -205,6 +248,7 @@ def main() -> None:
     p_tui.add_argument("-S", "--shell-allow", default=None,
                        help="shell allow-list (dcode -S); headless defaults to 'recommended'")
     p_tui.add_argument("task", nargs="?", default=None, help="optional direct task (headless)")
+    _add_tier_flags(p_tui)
 
     # In-process runner
     p_dir = sub.add_parser("direct", help="in-process deepagents runner (no server)")
@@ -214,6 +258,7 @@ def main() -> None:
     p_dir.add_argument("--recursion-limit", type=int, default=60)
     p_dir.add_argument("--thread", default=None,
                        help="continue an existing thread id (resume in-process)")
+    _add_tier_flags(p_dir)
 
     # Sandbox lifecycle
     p_sb = sub.add_parser("sandbox", help="Docker sandbox lifecycle")
@@ -274,6 +319,7 @@ def main() -> None:
                           help="output path (default: <org>.tar.gz)")
 
     args = ap.parse_args()
+    _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (serve/acp/direct/tui)
 
     # --- Server mode ---
     if args.cmd == "serve":
