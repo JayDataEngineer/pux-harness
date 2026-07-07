@@ -661,6 +661,10 @@ def _validate_jobs(name: str, pol: policy_mod.Policy) -> list[Violation]:
             v.append(Violation("error", "jobs-shape",
                                f"{name}/{jname}: timeout must be >= 0, "
                                f"got {spec.timeout}"))
+        if spec.when and not isinstance(spec.when, str):
+            v.append(Violation("error", "jobs-shape",
+                               f"{name}/{jname}: 'when' must be a string "
+                               f"(a shell predicate), got {type(spec.when).__name__}"))
     return v
 
 

@@ -9,6 +9,12 @@ Failure semantics: **warn-and-continue**. One bad file doesn't kill 500.
 Each job logs failures but the runner continues to the next. The caller
 (``prepare()``) gets a full results list with per-job status.
 
+A job may declare ``when:`` — a shell predicate run in-container before the
+job itself. Exit 0 runs the job; non-zero skips it (status ``"skipped"``).
+This makes a prep step a seamless optional capability: e.g. diarize only
+when media is staged in ``data/`` — absent input => silent skip, not a
+noisy failure.
+
 Idempotency is delegated to the scripts themselves — file caches,
 SurrealDB UPSERTs, and batch-mode skip-already-done make repeat runs cheap.
 """
@@ -29,7 +35,7 @@ class JobResult:
     """Outcome of one prep job."""
 
     name: str
-    status: str  # "ok" | "failed" | "timeout"
+    status: str  # "ok" | "failed" | "timeout" | "skipped"
     error: str | None = None  # stderr snippet on failure
     duration: float = 0.0  # wall-clock seconds
 
@@ -56,6 +62,21 @@ def run_jobs(pol: Policy | None, exec_client: DockerExecClient) -> list[JobResul
             results.append(JobResult(name=spec.name, status="failed",
                                      error="job has no script"))
             continue
+
+        # Conditional skip: ``when`` is a shell predicate (exit 0 -> run,
+        # non-zero -> skip). Lets an org declare "diarize only when media is
+        # staged in data/" so the job is a seamless optional pre-run step —
+        # absent input => silent skip, never a noisy failure.
+        if spec.when:
+            try:
+                _, gate_rc = exec_client.exec(spec.when, timeout=10)
+            except Exception as exc:  # pragma: no cover - exec infra failure
+                log.warning("job %s: when-predicate errored (%s); running", spec.name, exc)
+                gate_rc = 0
+            if gate_rc != 0:
+                log.info("job %s: skipped (when-predicate exit %s)", spec.name, gate_rc)
+                results.append(JobResult(name=spec.name, status="skipped"))
+                continue
 
         cmd = f"python3 {spec.script}"
         if spec.args:

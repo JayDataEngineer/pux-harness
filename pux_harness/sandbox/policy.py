@@ -174,6 +174,7 @@ class JobSpec:
     args: list[str] = field(default_factory=list)
     timeout: int = 0  # seconds; 0 = no limit
     description: str = ""
+    when: str = ""  # shell predicate; exit 0 -> run, non-zero -> skip (status "skipped")
 
 
 @dataclass
@@ -312,6 +313,7 @@ def _policy_from_dict(d: Mapping) -> Policy:
             args=[str(x) for x in (j.get("args") or [])],
             timeout=int(j.get("timeout", 0) or 0),
             description=str(j.get("description", "") or ""),
+            when=str(j.get("when", "") or ""),
         ))
     pol.jobs = jobs
     # tool_servers: a list of foreign MCP server declarations (strings for
