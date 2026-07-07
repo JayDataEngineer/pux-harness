@@ -19,8 +19,10 @@ Usage::
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from dataclasses import replace
 from typing import Sequence
 
 from langchain_core.tools import BaseTool
@@ -124,6 +126,34 @@ class McpSessionManager:
     def tools(self) -> list[BaseTool]:
         return list(self._tools)
 
+    @staticmethod
+    async def _maybe_bootstrap(spec: ToolServerSpec) -> ToolServerSpec:
+        """Resolve a stdio server's binary BEFORE building its connection.
+
+        Specs without a ``github:`` block (or non-stdio) pass through untouched
+        — the operator's ``command`` must already be on PATH (or the probe fails
+        loud at ``tools/list``, the pre-existing behavior). For a stdio spec WITH
+        a ``github:`` block, ``ensure_server`` makes the binary present (PATH →
+        cache → release-fallback download) and we return a COPY with
+        ``command`` rewritten to the resolved path. The download runs in a
+        thread (no event-loop blocking); a bootstrap failure raises ValueError,
+        which the caller's ``except`` maps to the existing per-server skip +
+        ERROR log — a broken download is indistinguishable from a broken server.
+        """
+        if spec.transport != "stdio" or not spec.github:
+            return spec
+        from pux_harness.agent.mcp_bootstrap import ensure_server  # noqa: PLC0415
+        path = await asyncio.to_thread(ensure_server, spec)
+        if path is None:
+            raise ValueError(
+                f"github bootstrap could not resolve binary "
+                f"{spec.github['binary']!r} for server {spec.name!r} (not on "
+                f"PATH, not in the .pux cache, and release fetch failed)"
+            )
+        if str(path) == spec.command:
+            return spec
+        return replace(spec, command=str(path))
+
     async def open(self) -> None:
         """Probe every spec's server and load tools.
 
@@ -147,6 +177,7 @@ class McpSessionManager:
         connections: dict[str, dict] = {}
         for spec in self.specs:
             try:
+                spec = await self._maybe_bootstrap(spec)
                 connections[spec.name] = _to_connection(spec)
             except ValueError as exc:
                 logger.error(
