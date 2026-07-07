@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.graph import build_graph
+from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
 from pux_harness.threads import open_thread_store
 from pux_harness.agent.orgs import discover_orgs, org_agent_slugs
 from pux_harness.agent.profile import default_rubric
@@ -198,8 +199,17 @@ def _get_graph(org: str) -> CompiledStateGraph:
     if org not in app.state.graphs:
         from langgraph.store.memory import InMemoryStore  # noqa: PLC0415
         store = InMemoryStore()
+        # ``serve`` hosts BOTH the AG-UI SSE surface (the live web path —
+        # CopilotKit ``useInterrupt`` resolves an ask_user) AND the REST lane
+        # (polled; the benched HTTP lane + the MCP server's backend). One graph
+        # serves both, so ask_user uses the web/interrupt branch: correct for
+        # AG-UI, and a documented pause-and-hang limit over REST/MCP (the
+        # operator opts an org into ask_user only when it runs over AG-UI).
+        # ``PUX_AUTONOMOUS`` drops ask_user entirely (headless serve).
         app.state.graphs[org] = build_graph(
             org, checkpointer=app.state.saver, store=store,
+            facts=RuntimeFacts(transport="serve",
+                               autonomous=autonomous_from_env()),
             mcp_tools=app.state.mcp.get(org, ()),
         )
     return app.state.graphs[org]

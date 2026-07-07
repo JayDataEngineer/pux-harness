@@ -31,6 +31,7 @@ from pux_harness.agent.contract import (
 from pux_harness.sandbox.docker_exec import get_exec_client
 from pux_harness.agent.graph import build_graph, shared_backend, shared_exec
 from pux_harness.agent.profile import default_rubric
+from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
 from pux_harness.agent.tool_servers import resolve_tool_servers
 from pux_harness.threads import open_thread_store
 from pux_harness.sandbox.tools import (
@@ -56,8 +57,17 @@ def _build_agent(
     checkpointer from ``open_thread_store``). ``pux direct`` no longer
     uses an ephemeral ``MemorySaver`` — it shares the same
     ``.pux/agent-protocol.sqlite`` as ``serve`` / ``acp``, so threads survive the
-    process and show up in ``pux resume`` / ``pux show``."""
-    agent = build_graph(org, checkpointer=saver, mcp_tools=mcp_tools or ())
+    process and show up in ``pux resume`` / ``pux show``.
+
+    ``direct`` is the interactive CLI runner, so an opted-in ``ask_user`` uses
+    the turn-based branch (pose the question + end the turn; the user's next
+    input is the answer). ``PUX_AUTONOMOUS`` drops ask_user entirely (headless
+    batch runs)."""
+    agent = build_graph(
+        org, checkpointer=saver,
+        facts=RuntimeFacts(transport="direct", autonomous=autonomous_from_env()),
+        mcp_tools=mcp_tools or (),
+    )
     return agent, shared_backend()
 
 

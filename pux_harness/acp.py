@@ -43,6 +43,7 @@ from langchain_core.tools import BaseTool
 from pux_harness.agent.graph import build_graph
 from pux_harness.agent.model import driver_multimodal, resolve_model_id
 from pux_harness.agent.orgs import discover_orgs
+from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
 from pux_harness.agent.tool_servers import resolve_tool_servers
 from pux_harness.kit._paths import project_root
 from pux_harness.threads import open_thread_store
@@ -52,6 +53,7 @@ DEFAULT_ORG = "general"
 
 def _make_factory(
     org: str, saver, mcp_tools: list[BaseTool] | None = None,
+    facts: RuntimeFacts | None = None,
 ) -> Callable[[AgentSessionContext], CompiledStateGraph]:
     """Build a graph factory bound to ``org`` + the SHARED persistent saver.
 
@@ -67,12 +69,18 @@ def _make_factory(
     called once and cached by ``AgentServerACP`` (it keys sessions by
     ``thread_id`` in the checkpointer, not by rebuilding the graph), so the org
     cannot vary per session — it is fixed at server startup.
+
+    ``facts`` carries the ACP runtime: ``transport="acp"`` makes an opted-in
+    ``ask_user`` use the turn-based branch (the editor permission popover has no
+    free-text field, so an interrupt the client can't resume would dead-end) +
+    ``autonomous`` (``PUX_AUTONOMOUS``) drops ask_user entirely.
     """
 
     _tools = list(mcp_tools) if mcp_tools else []
+    _facts = facts or RuntimeFacts(transport="acp")
 
     def factory(_context: AgentSessionContext) -> CompiledStateGraph:
-        return build_graph(org, checkpointer=saver, mcp_tools=_tools)
+        return build_graph(org, checkpointer=saver, facts=_facts, mcp_tools=_tools)
 
     return factory
 
@@ -261,7 +269,11 @@ async def _acp_main(org: str) -> None:
         sys.stderr.write(f"pux acp: tool_servers resolution failed: {exc}\n")
     async with open_thread_store() as store:
         acp_agent = _RegisteringAgentServerACP(
-            agent=_make_factory(org, saver=store.saver, mcp_tools=mcp_tools),
+            agent=_make_factory(
+                org, saver=store.saver, mcp_tools=mcp_tools,
+                facts=RuntimeFacts(transport="acp",
+                                   autonomous=autonomous_from_env()),
+            ),
             store=store,
             org=org,
             models=_advertised_models(org),

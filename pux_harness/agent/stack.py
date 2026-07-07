@@ -48,6 +48,7 @@ listed LAST in the registry so it mounts innermost.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -95,6 +96,7 @@ from pux_harness.sandbox.tools.declared import (
 __all__ = [
     "Scope",
     "RuntimeFacts",
+    "autonomous_from_env",
     "MiddlewareSpec",
     "StackCtx",
     "StackPlan",
@@ -143,6 +145,17 @@ class RuntimeFacts:
     tool_servers_active: bool = False
     provider: str | None = None
     tier: str | None = None
+
+
+def autonomous_from_env() -> bool:
+    """True when the process is running an autonomous / headless flow (no human
+    on the other end to resume an ``ask_user`` interrupt). Reads ``PUX_AUTONOMOUS``
+    — any of ``1`` / ``true`` / ``yes`` / ``on`` (case-insensitive). The
+    ``ask_user`` construction gate keys on this: autonomous → the tool is dropped
+    entirely (the model can't call what isn't there)."""
+    return os.environ.get("PUX_AUTONOMOUS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 @dataclass(frozen=True)
