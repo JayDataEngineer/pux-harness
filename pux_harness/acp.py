@@ -41,7 +41,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.graph import build_graph
-from pux_harness.agent.model import resolve_model_id
+from pux_harness.agent.model import driver_multimodal, resolve_model_id
 from pux_harness.agent.orgs import discover_orgs
 from pux_harness.agent.tool_servers import resolve_tool_servers
 from pux_harness.kit._paths import project_root
@@ -148,6 +148,18 @@ class _RegisteringAgentServerACP(AgentServerACP):
             **kwargs,
         )
         caps = resp.agent_capabilities
+        # Truthful image cap (#69). The base class hardcodes
+        # ``prompt_capabilities.image=True`` for every org; but image backing
+        # depends on the org's BASE (supervisor) model — the role that first
+        # receives the prompt's ImageContentBlocks. A text-only base
+        # (e.g. glm-5.2) would make the editor offer image-attach on a model
+        # that can't ingest image blocks. Gate on the SAME seam
+        # ``BrowserVisionMiddleware`` uses; backing for multimodal bases
+        # (mimo-v2.5) is LIVE-PROVEN by the browser-vision work.
+        if caps.prompt_capabilities is not None:
+            caps.prompt_capabilities.image = driver_multimodal(
+                role="base", org=self._org
+            )
         caps.load_session = True
         sess = caps.session_capabilities or SessionCapabilities()
         if sess.list is None:
