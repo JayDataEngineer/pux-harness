@@ -237,6 +237,10 @@ def main() -> None:
     p_acp.add_argument("--org", default=os.environ.get("PUX_ORG", "general"))
     _add_tier_flags(p_acp)
 
+    # MCP server (FastMCP SSE wrapper over the Agent Protocol). Port via
+    # PUX_MCP_PORT (default 9987); requires `pux serve` running.
+    sub.add_parser("mcp", help="FastMCP server (SSE) wrapping the Agent Protocol")
+
     # TUI launcher (dcode wrapper)
     p_tui = sub.add_parser("tui", help="launch dcode TUI with org branding + agents")
     p_tui.add_argument("--org", default=os.environ.get("PUX_ORG", "general"))
@@ -332,6 +336,12 @@ def main() -> None:
         from pux_harness.acp import run_acp
 
         run_acp(args.org)
+
+    # --- MCP server (FastMCP SSE over the Agent Protocol) ---
+    elif args.cmd == "mcp":
+        from pux_harness.mcp_server import main as _mcp
+
+        _mcp()
 
     # --- TUI launcher ---
     elif args.cmd == "tui":
