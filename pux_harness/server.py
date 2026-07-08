@@ -94,6 +94,17 @@ class ThreadSearch(BaseModel):
     agent_id: str | None = None
 
 
+class AssistantSearch(BaseModel):
+    """``POST /assistants/search`` body (the SDK ``assistants.search``).
+    ``graph_id`` narrows to one org (= one assistant); ``metadata`` is accepted
+    for wire compatibility but ignored (org metadata is declarative)."""
+
+    metadata: dict[str, Any] | None = None
+    graph_id: str | None = None
+    limit: int = 10
+    offset: int = 0
+
+
 class RunCreate(BaseModel):
     input: Any = None  # str | {"messages": [...]} | dict
     metadata: dict[str, Any] = {}
@@ -153,6 +164,55 @@ def _agent_descriptor(org: str) -> dict[str, Any]:
     }
 
 
+def _assistant_descriptor(org: str) -> dict[str, Any]:
+    """The langgraph-api ``Assistant`` shape — what the SDK ``assistants`` client
+    + Studio's agent picker consume. An org IS an assistant: ``assistant_id`` and
+    ``graph_id`` both carry the org name (one compiled graph per org). Read-only
+    (orgs are declarative — created on disk, not via POST /assistants)."""
+    slugs = org_agent_slugs(org)
+    ts = getattr(app.state, "started_at", None) or _now()
+    return {
+        "assistant_id": org,
+        "graph_id": org,
+        "name": org,
+        "description": f"Pux org '{org}'; specialists: {', '.join(slugs) or '(none)'}",
+        "metadata": {"created_by": "system", "specialists": slugs},
+        "config": {},
+        "context": {},
+        "version": 1,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def _json_schema(model: Any) -> dict[str, Any]:
+    """Coerce a langgraph/pydantic schema object to a JSON Schema dict — the
+    shape ``/assistants/{id}/schemas`` returns for each of state/input/output/
+    config. Falls back to ``{"type": "object"}`` when the compiled graph doesn't
+    expose a given schema (e.g. a stub graph in tests, or an older langgraph).
+
+    Subtlety: ``config_schema`` is a bound METHOD (calling it yields the schema
+    model), while ``input_schema``/``output_schema`` ARE the schema model classes
+    themselves — so only invoke non-class callables. Instantiating a class with
+    required fields would ValidationError and silently drop a real schema."""
+    if model is None:
+        return {"type": "object"}
+    if not isinstance(model, type) and callable(model):
+        try:
+            model = model()
+        except Exception:  # noqa: BLE001 - schema extraction must never 500
+            return {"type": "object"}
+    dump = getattr(model, "model_json_schema", None)
+    if callable(dump):
+        try:
+            return dump()
+        except Exception:  # noqa: BLE001
+            return {"type": "object"}
+    if isinstance(model, dict):
+        return model
+    return {"type": "object"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # The shared checkpointer + pux_threads index live in ONE sqlite file owned
@@ -166,6 +226,10 @@ async def lifespan(app: FastAPI):
         app.state.runs: dict[str, asyncio.Task] = {}
         app.state.run_meta: dict[str, dict[str, Any]] = {}
         app.state.mcp: dict[str, list[BaseTool]] = {}
+        # Stable per-process timestamp for the assistant descriptors' created_at/
+        # updated_at — orgs are declarative (discovered from disk), so this server
+        # start is the natural "when this assistant began being served".
+        app.state.started_at = _now()
         # ONE shared long-term-memory store (BaseStore) for every org + the
         # /store/* REST surface. Namespaces isolate tenants/threads, so a single
         # store is correct (and the only way a REST ``put_item`` is visible to a
@@ -360,6 +424,49 @@ async def agent_get(agent_id: str) -> dict[str, Any]:
     if agent_id not in discover_orgs():
         raise HTTPException(status_code=404, detail=f"unknown agent {agent_id!r}")
     return _agent_descriptor(agent_id)
+
+
+# --- assistants (the langgraph-api surface Studio + the SDK ``assistants`` client hit) ---
+# An org maps 1:1 to an assistant: read-only search/get/get_schemas. The mutating
+# paths (create/update/delete/versions) don't apply — orgs are declarative on
+# disk — so they're deliberately absent (FastAPI's default 405/404 is the honest
+# "unsupported" signal, not a silent no-op).
+
+
+@app.post("/assistants/search")
+async def assistants_search(body: AssistantSearch = AssistantSearch()) -> list[dict[str, Any]]:
+    orgs = discover_orgs()
+    if body.graph_id:
+        orgs = [o for o in orgs if o == body.graph_id]
+    return [_assistant_descriptor(o) for o in orgs][body.offset : body.offset + body.limit]
+
+
+@app.get("/assistants/{assistant_id}")
+async def assistant_get(assistant_id: str) -> dict[str, Any]:
+    if assistant_id not in discover_orgs():
+        raise HTTPException(status_code=404, detail=f"unknown assistant {assistant_id!r}")
+    return _assistant_descriptor(assistant_id)
+
+
+@app.get("/assistants/{assistant_id}/schemas")
+async def assistant_schemas(assistant_id: str) -> dict[str, Any]:
+    """The assistant's input/output/config/state JSON Schemas (the SDK
+    ``assistants.get_schemas`` path — what Studio reads to render the run form).
+    Derived LIVE from the org's compiled graph; ``{"type": "object"}`` placeholders
+    where the graph doesn't expose a given schema."""
+    if assistant_id not in discover_orgs():
+        raise HTTPException(status_code=404, detail=f"unknown assistant {assistant_id!r}")
+    graph = _get_graph(assistant_id)
+    return {
+        "graph_id": assistant_id,
+        "state_schema": _json_schema(
+            getattr(graph, "state_schema", None) or getattr(graph, "schema", None)
+        ),
+        "input": _json_schema(getattr(graph, "input_schema", None)),
+        "output": _json_schema(getattr(graph, "output_schema", None)),
+        "config_schema": _json_schema(getattr(graph, "config_schema", None)),
+        "context_schema": {"type": "object"},
+    }
 
 
 # --- threads ------------------------------------------------------------------
