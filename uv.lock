@@ -1505,6 +1505,7 @@ dependencies = [
     { name = "langchain-mcp-adapters" },
     { name = "langchain-openai" },
     { name = "langgraph-checkpoint-sqlite" },
+    { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1535,6 +1536,7 @@ requires-dist = [
     { name = "langchain-openai" },
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=3.0" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.0" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.49.0" },
 ]
