@@ -223,6 +223,17 @@ def cmd_jobs_status(org: str) -> None:
 
 
 def main() -> None:
+    # Bootstrap FIRST, before argparse: some argparse defaults read os.environ
+    # at parser-build time (e.g. ``--org`` default = $PUX_ORG), so ``./.env`` must
+    # be loaded NOW for those defaults to see it. This is the shared kit seam
+    # (``pux_harness.kit.bootstrap_env_and_logging``) — the SAME function
+    # serve/direct/acp and exported runners use, so pux is seamless when run
+    # from a FOREIGN codebase: the consumer's ``.env`` is picked up without an
+    # ``export``. ``pin_stderr=False`` here (serve/direct log to stdout fine);
+    # ``pux acp`` re-invokes with ``pin_stderr=True`` to defend its stdio wire.
+    from pux_harness.kit import bootstrap_env_and_logging  # noqa: PLC0415
+
+    bootstrap_env_and_logging()
     ap = argparse.ArgumentParser(
         prog="pux",
         description="Pux — deepagents-based agent orchestrator.",
@@ -321,6 +332,11 @@ def main() -> None:
     p_export.add_argument("--org", required=True)
     p_export.add_argument("--output", "-o", default=None,
                           help="output path (default: <org>.tar.gz)")
+    p_export.add_argument(
+        "--project-root", default=None,
+        help="tree containing orgs/ + root AGENTS.md to export FROM (default: "
+             "$PUX_PROJECT_ROOT or CWD). Lets a standalone consumer app export "
+             "an org that lives in ITS OWN tree, not the orchestrator's.")
 
     args = ap.parse_args()
     _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (serve/acp/direct/tui)
@@ -412,7 +428,8 @@ def main() -> None:
         from pux_harness.export import export_org
 
         output = _Path(args.output) if args.output else None
-        result = export_org(args.org, output)
+        project_root = _Path(args.project_root) if args.project_root else None
+        result = export_org(args.org, output, project_root=project_root)
         print(f"exported {args.org!r} -> {result}")
         # Print summary
         import tarfile as _tar
