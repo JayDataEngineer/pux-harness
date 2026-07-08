@@ -77,7 +77,6 @@ from pux_harness.manifest import (
     manifest_metadata,
 )
 from pux_harness.pack_hooks import (
-    PACK_HOOK_REGISTRY,
     HookContext,
     PackHook,
     provenance_from_results,
@@ -636,6 +635,8 @@ def pack_org(
     project_root: Path | None = None,
     hooks: list[PackHook] | None = None,
     gitleaks_runner: Callable | None = None,
+    oci: bool | Path | None = False,
+    oras_runner: Callable | None = None,
 ) -> Path:
     """Pack an org as a self-contained ``.tar.gz`` archive (the ``pux pack`` op).
 
@@ -763,6 +764,21 @@ def pack_org(
             info = tarfile.TarInfo(name=f"{org}/manifest.json")
             info.size = len(manifest_json)
             tar.addfile(info, BytesIO(manifest_json))
+
+        # 8. (P5) Optional layered OCI artifact — the content-addressed, registry-
+        # pushable form of the SAME content (additive: the .tar.gz above is
+        # unchanged). ``oras`` shells out to a local oci-layout; provenance.json
+        # records SHA-256 layer digests → tamper-evident (signing reserved P6).
+        # Reuses ``files``/``scaffold``/``inventory`` already computed. Fail-clear
+        # (``OciError``) if ``oras`` is absent — the .tar.gz still ships. The layout
+        # is a sibling of the tar (or the explicit Path passed as ``oci``); the CLI
+        # re-reads provenance.json from there (Path uses __slots__ — no stashing).
+        if oci:
+            from pux_harness.oci import emit_oci_artifact  # noqa: PLC0415 — lazy (oci imports pack)
+            oci_layout = oci if isinstance(oci, Path) else output.parent / f"{org}.oci"
+            emit_oci_artifact(
+                org, files, scaffold, inventory, oci_layout, oras_runner=oras_runner,
+            )
 
         return output
     finally:

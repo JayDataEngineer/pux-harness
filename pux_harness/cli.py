@@ -342,6 +342,15 @@ def main() -> None:
         help="tree containing orgs/ + root AGENTS.md to pack FROM (default: "
              "$PUX_PROJECT_ROOT or CWD). Lets a standalone consumer app pack "
              "an org that lives in ITS OWN tree, not the orchestrator's.")
+    p_pack.add_argument(
+        "--oci", action="store_true",
+        help="also emit a layered OCI artifact (oras) — the content-addressed, "
+             "registry-pushable form; provenance.json records SHA-256 layer "
+             "digests (tamper-evident). Fail-clear if oras is absent. (P5)")
+    p_pack.add_argument(
+        "--oci-layout", default=None,
+        help="oci-layout dir to emit into (default: sibling of the tarball, "
+             "<org>.oci). Implies --oci.")
 
     # `export` is retained as a PARSER so `pux export ...` yields the clear
     # deprecation message in dispatch (not an opaque argparse "invalid choice").
@@ -467,13 +476,17 @@ def main() -> None:
     # --- Pack (manifest-driven default-deny archive; successor to `export`) ---
     elif args.cmd == "pack":
         from pathlib import Path as _Path
+        from pux_harness.oci import OciError
         from pux_harness.pack import pack_org
         from pux_harness.pack_hooks import PackHookError
 
         output = _Path(args.output) if args.output else None
         project_root = _Path(args.project_root) if args.project_root else None
+        # --oci-layout implies --oci; an explicit layout Path is passed through,
+        # else a bool (pack_org derives a sibling <org>.oci layout). (P5)
+        oci_arg = _Path(args.oci_layout) if args.oci_layout else bool(args.oci)
         try:
-            result = pack_org(args.org, output, project_root=project_root)
+            result = pack_org(args.org, output, project_root=project_root, oci=oci_arg)
         except PackHookError as exc:
             # A pack-time hook REFUSED the pack (P4) — a syntax-broken function
             # or a leaked secret. Print the failing hook + its findings + every
@@ -489,6 +502,16 @@ def main() -> None:
             for r in exc.all_results:
                 flag = "OK" if r.ok else "FAIL"
                 _sys.stderr.write(f"    [{flag}] {r.name}\n")
+            raise SystemExit(1)
+        except OciError as exc:
+            # pack_org writes the .tar.gz BEFORE the OCI emit, so the validated
+            # archive still shipped — only the ADDITIONAL OCI artifact was refused
+            # (typically ``oras`` absent). Honest: report both, exit non-zero
+            # since the requested --oci output was not produced.
+            import sys as _sys
+            _sys.stderr.write(
+                f"oci emit refused for org {args.org!r} (the .tar.gz pack is "
+                f"unaffected — OCI is additional):\n  {exc}\n")
             raise SystemExit(1)
         print(f"packed {args.org!r} -> {result}")
         # Print summary
@@ -513,6 +536,21 @@ def main() -> None:
                             h["name"] for h in prov["hooks"] if h.get("ok")
                         )
                         print(f"  hooks OK: {names}")
+        # Surface the OCI artifact (P5) — the layered, content-addressed form's
+        # manifest digest + the agent-library layer digest (the tamper anchor).
+        if oci_arg:
+            layout = (_Path(args.oci_layout) if args.oci_layout
+                      else result.parent / f"{args.org}.oci")
+            prov_path = layout / "provenance.json"
+            if prov_path.is_file():
+                oci_prov = json.loads(prov_path.read_text())
+                art = oci_prov.get("artifact", {})
+                print(f"  oci artifact: {art.get('digest')}  (layout: {layout})")
+                lib = next((layer for layer in oci_prov.get("layers", [])
+                            if layer.get("type") == "agent-library"), None)
+                if lib:
+                    print(f"  library layer (integrity): {lib.get('digest')}  "
+                          f"[{lib.get('size')} B]")
 
     # --- `export` is DEPRECATED → HARD ERROR (Decision 5: no silent alias) ---
     # The verb is retained as a parser so `pux export ...` yields this clear
