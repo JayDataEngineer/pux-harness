@@ -57,7 +57,7 @@ import os
 import tarfile
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -75,6 +75,13 @@ from pux_harness.manifest import (
     collect_pack_files,
     load_manifest,
     manifest_metadata,
+)
+from pux_harness.pack_hooks import (
+    PACK_HOOK_REGISTRY,
+    HookContext,
+    PackHook,
+    provenance_from_results,
+    run_pack_hooks,
 )
 
 
@@ -627,6 +634,8 @@ def pack_org(
     org: str,
     output: Path | None = None,
     project_root: Path | None = None,
+    hooks: list[PackHook] | None = None,
+    gitleaks_runner: Callable | None = None,
 ) -> Path:
     """Pack an org as a self-contained ``.tar.gz`` archive (the ``pux pack`` op).
 
@@ -642,6 +651,13 @@ def pack_org(
     (:func:`pux_harness.manifest.collect_pack_files` via ``package.include``
     globs in ``org.yaml``); shared deps are inclusion-by-reference (only what
     the org actually cites). ``data/``/``.pux/`` are never packed.
+
+    Before the tarball is written, the collected files run through the
+    **pack-time validation hooks** (``PACK_HOOK_REGISTRY`` — AST + gitleaks, P4):
+    a syntax-broken agent function or a leaked secret REFUSES the pack
+    (:class:`pux_harness.pack_hooks.PackHookError` — verify-or-die). Pass
+    ``hooks=[]`` to skip validation (test/portability seam); ``gitleaks_runner``
+    injects the subprocess runner for offline-deterministic tests.
 
     Implementation note: the downstream resolvers (``discover_orgs``,
     ``_org_path``, ``_resolve_shared_agents``, ``_resolve_tool_servers``) all
@@ -685,16 +701,29 @@ def pack_org(
         files.update(_resolve_shared_sandbox(org, root))
         files.update(_resolve_tool_servers(org))
 
-        # 4. Runtime scaffold (F3): vendor the slim kit + emit pyproject/run.py/
+        # 4. Pack-time validation hooks (P4): AST + gitleaks gate the pack
+        # BEFORE the tarball is written. A syntax-broken agent function or a
+        # leaked secret REFUSES the pack (PackHookError; verify-or-die). The
+        # hooks validate what the operator/agent AUTHORED (org + shared
+        # primitives), not the trusted/generated scaffold. Results seed the
+        # manifest's provenance block (the audit surface P5 extends).
+        hook_results = run_pack_hooks(
+            HookContext(org=org, org_dir=org_dir, files=files, manifest=manifest),
+            registry=hooks,
+            gitleaks_runner=gitleaks_runner,
+        )
+
+        # 5. Runtime scaffold (F3): vendor the slim kit + emit pyproject/run.py/
         # README so the archive is a standalone RUNNABLE package — a consumer
         # runs the org without pux-harness installed.
         scaffold = _build_runtime_scaffold(org)
 
-        # 5. Build manifest inventory (accounts for primitives + the scaffold +
-        # the declared audit surface from the parsed manifest).
+        # 6. Build manifest inventory (accounts for primitives + the scaffold +
+        # the declared audit surface from the parsed manifest) + hook provenance.
         inventory = _build_manifest(org, files, scaffold, manifest)
+        inventory["provenance"] = provenance_from_results(hook_results)
 
-        # 5. Write tar.gz
+        # 7. Write tar.gz
         if output is None:
             output = Path(f"{org}.tar.gz")
 

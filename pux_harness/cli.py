@@ -468,10 +468,28 @@ def main() -> None:
     elif args.cmd == "pack":
         from pathlib import Path as _Path
         from pux_harness.pack import pack_org
+        from pux_harness.pack_hooks import PackHookError
 
         output = _Path(args.output) if args.output else None
         project_root = _Path(args.project_root) if args.project_root else None
-        result = pack_org(args.org, output, project_root=project_root)
+        try:
+            result = pack_org(args.org, output, project_root=project_root)
+        except PackHookError as exc:
+            # A pack-time hook REFUSED the pack (P4) — a syntax-broken function
+            # or a leaked secret. Print the failing hook + its findings + every
+            # hook run so far, then exit non-zero (no archive written).
+            import sys as _sys
+            _sys.stderr.write(
+                f"pack REFUSED — hook {exc.result.name!r} failed for org "
+                f"{args.org!r} (no archive written):\n"
+            )
+            for finding in exc.result.findings:
+                _sys.stderr.write(f"  - {finding}\n")
+            _sys.stderr.write("  hooks run:\n")
+            for r in exc.all_results:
+                flag = "OK" if r.ok else "FAIL"
+                _sys.stderr.write(f"    [{flag}] {r.name}\n")
+            raise SystemExit(1)
         print(f"packed {args.org!r} -> {result}")
         # Print summary
         import tarfile as _tar
@@ -487,6 +505,14 @@ def main() -> None:
                     for cat, items in cats.items():
                         if items:
                             print(f"  {cat}: {len(items)} files")
+                    # Surface the hook provenance (P4) — the validation gate's
+                    # audit record that every shipped file passed AST + gitleaks.
+                    prov = manifest.get("provenance")
+                    if prov and prov.get("hooks"):
+                        names = ", ".join(
+                            h["name"] for h in prov["hooks"] if h.get("ok")
+                        )
+                        print(f"  hooks OK: {names}")
 
     # --- `export` is DEPRECATED → HARD ERROR (Decision 5: no silent alias) ---
     # The verb is retained as a parser so `pux export ...` yields this clear
