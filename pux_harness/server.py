@@ -24,13 +24,29 @@ https://langchain-ai.github.io/agent-protocol/):
   POST   /runs/wait                   ephemeral blocking run (create+run+return)
   GET    /runs/{run_id}/wait          block for a background run's final output
   POST   /runs/{run_id}/cancel        cancel a background run
+  POST   /runs/stream                 ephemeral run -> SSE event stream
+  POST   /threads/{thread_id}/runs/stream  thread run -> SSE event stream
+
+**SSE wire format:** standard SSE frames ``event: <mode>\\ndata: <json>\\n\\n``
+— the exact bytes the ``langgraph_sdk`` ``SSEDecoder`` parses, so a ``RunClient``
+consumes our stream with no adapter. Events: a leading ``metadata`` (run_id),
+then ``messages`` (token + tool-call chunks), ``updates`` (per-node diffs), and
+``values`` (full state after each step); ``error`` on exception. An
+``interrupt()`` (e.g. ``ask_user``) surfaces as a ``__interrupt__`` key in the
+final ``values``/``updates`` events — the client reads it + resumes by POSTing a
+new run with ``command={"resume": ...}`` on the same thread.
+
+**Interrupt correctness (the #3 fix):** ``ainvoke``/``astream`` RETURN on
+``interrupt()`` (they do not hang) — ``state.next`` is non-empty. So the polled
+endpoints report ``status="interrupted"`` + the interrupt payload, never a
+silent ``status="success"`` with a stale tool-call message; the stream emits the
+interrupt as an event. Resume drives ``ainvoke(Command(resume=...))``.
 
 **Implementation choice:** thin FastAPI implementing the published spec, NOT
-``langgraph-api`` (the Platform runtime). Rationale: minimalist (we own ~250
-LOC vs adopting an opinionated runtime), and the REST contract is identical
-either way — swapping the server impl behind these endpoints is invisible to
-clients, so the choice is reversible. SSE streaming (run lifecycle + tool +
-nested-subagent events) is deferred.
+``langgraph-api`` (the Platform runtime). Rationale: minimalist (we own the LOC
+vs adopting an opinionated runtime), and the REST contract is identical either
+way — swapping the server impl behind these endpoints is invisible to clients,
+so the choice is reversible.
 """
 from __future__ import annotations
 
@@ -39,11 +55,14 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 from pydantic import BaseModel
 
 from langchain_core.tools import BaseTool
@@ -77,6 +96,10 @@ class RunCreate(BaseModel):
     input: Any = None            # str | {"messages": [...]} | dict
     metadata: dict[str, Any] = {}
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
+    # Resume an interrupted run: ``{"resume": <value>}`` drives
+    # ``Command(resume=<value>)`` on the same thread (the value becomes the
+    # ``interrupt()`` return value). Absent => a fresh-input run.
+    command: dict[str, Any] | None = None
 
 
 class EphemeralRun(BaseModel):
@@ -84,6 +107,7 @@ class EphemeralRun(BaseModel):
     input: Any = None
     metadata: dict[str, Any] = {}
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
+    command: dict[str, Any] | None = None   # resume — see RunCreate.command
 
 
 def _now() -> str:
@@ -220,10 +244,12 @@ def _get_graph(org: str) -> CompiledStateGraph:
         store = InMemoryStore()
         # ``serve`` hosts BOTH the AG-UI SSE surface (the live web path —
         # CopilotKit ``useInterrupt`` resolves an ask_user) AND the REST lane
-        # (polled; the benched HTTP lane + the MCP server's backend). One graph
-        # serves both, so ask_user uses the web/interrupt branch: correct for
-        # AG-UI, and a documented pause-and-hang limit over REST/MCP (the
-        # operator opts an org into ask_user only when it runs over AG-UI).
+        # (SSE stream + polled endpoints). One graph serves both, so ask_user
+        # uses the web/interrupt branch on both — which is correct now that the
+        # REST lane is interrupt-aware: ``ainvoke`` RETURNS on interrupt (it
+        # does not hang), the run reports ``status="interrupted"``, and the
+        # client resumes via ``command={"resume": ...}`` (over SSE the interrupt
+        # is a stream event; over the polled lane it's the run's status).
         # ``PUX_AUTONOMOUS`` drops ask_user entirely (headless serve).
         app.state.graphs[org] = build_graph(
             org, checkpointer=app.state.saver, store=store,
@@ -246,24 +272,58 @@ async def _require_thread(thread_id: str) -> str:
     return row[0]
 
 
-async def _execute(org: str, thread_id: str, raw_input: Any, recursion_limit: int) -> str:
-    """Run one org graph invocation on a thread; return the final answer text.
+@dataclass
+class RunOutcome:
+    """Result of one graph invocation on a thread.
 
-    Injects the org's default rubric when the caller supplied
-    none — this is what arms an opted-in org's ``RubricMiddleware`` gate. A
-    caller-supplied ``rubric`` key (e.g. ``--rubric`` from the CLI, flowing
-    through ``_normalize_input``) wins and is left untouched."""
-    graph = _get_graph(org)
-    config = build_invoke_config(
-        thread_id, recursion_limit, org, transport="serve"
-    )
-    state = _normalize_input(raw_input)
+    ``interrupted`` is True when the graph paused on an ``interrupt()`` (e.g.
+    ``ask_user``): ``ainvoke`` RETURNS in that state (it does not hang) with
+    ``state.next`` non-empty. The polled run endpoints report this as
+    ``status="interrupted"`` (never a silent ``success``); the client resumes by
+    POSTing a new run carrying ``command={"resume": ...}`` on the same thread.
+    """
+    output: str
+    interrupted: bool
+    interrupts: list[dict[str, Any]]
+
+
+def _graph_input(org: str, body: Any) -> Any:
+    """Resolve the ainvoke/astream input for a run body.
+
+    A resume ``command`` -> ``Command(**command)`` (drives the interrupted
+    node's ``interrupt()`` return value). Otherwise the fresh ``input``,
+    normalized + injected with the org's default rubric (the gate that arms an
+    opted-in org's ``RubricMiddleware``; a caller-supplied ``rubric`` key wins).
+    """
+    if getattr(body, "command", None):
+        return Command(**body.command)
+    state = _normalize_input(body.input)
     if "rubric" not in state:
         dr = default_rubric(org)
         if dr:
             state["rubric"] = dr
-    result = await graph.ainvoke(state, config=config)
-    return _final_answer(result)
+    return state
+
+
+async def _invoke_once(
+    org: str, thread_id: str, body: Any, recursion_limit: int
+) -> RunOutcome:
+    """Run one org graph invocation on a thread; return the outcome with
+    interrupt status. Handles both fresh input and resume ``Command`` payloads."""
+    graph = _get_graph(org)
+    config = build_invoke_config(
+        thread_id, recursion_limit, org, transport="serve"
+    )
+    result = await graph.ainvoke(_graph_input(org, body), config=config)
+    snap = await graph.aget_state(config)
+    # ainvoke returns on interrupt with state.next non-empty (the pending node).
+    interrupted = bool(snap.next)
+    interrupts: list[dict[str, Any]] = []
+    for task in snap.tasks:
+        for intr in getattr(task, "interrupts", None) or []:
+            interrupts.append(_jsonable(getattr(intr, "value", intr)))
+    output = "" if interrupted else _final_answer(result)
+    return RunOutcome(output=output, interrupted=interrupted, interrupts=interrupts)
 
 
 # --- health -------------------------------------------------------------------
@@ -375,14 +435,16 @@ async def thread_history(thread_id: str) -> list[dict[str, Any]]:
 @app.post("/runs/wait")
 async def run_ephemeral(body: EphemeralRun) -> dict[str, Any]:
     """Create a persistent thread, run on it synchronously, return the final
-    output. The thread is kept (resumable) — a superset of the spec's
-    'ephemeral' semantics, more useful for a single-user local agent."""
+    output (or an ``interrupted`` status when the graph paused on ``ask_user`` —
+    resume by POSTing again with ``command={"resume": ...}``). The thread is
+    kept (resumable) — a superset of the spec's 'ephemeral' semantics, more
+    useful for a single-user local agent."""
     if body.agent_id not in discover_orgs():
         raise HTTPException(status_code=404, detail=f"unknown agent {body.agent_id!r}")
     thread_id = str(uuid.uuid4())
     await app.state.store.register_thread(thread_id, body.agent_id, body.metadata)
     try:
-        answer = await _execute(body.agent_id, thread_id, body.input, body.recursion_limit)
+        outcome = await _invoke_once(body.agent_id, thread_id, body, body.recursion_limit)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - surface as a failed run, not a 500 stack
@@ -393,15 +455,14 @@ async def run_ephemeral(body: EphemeralRun) -> dict[str, Any]:
             "output": "",
             "error": f"{type(exc).__name__}: {exc}",
         }
-    return {
-        "thread_id": thread_id,
-        "agent_id": body.agent_id,
-        "status": "success",
-        "output": answer,
-    }
+    base = {"thread_id": thread_id, "agent_id": body.agent_id}
+    if outcome.interrupted:
+        return {**base, "status": "interrupted", "output": "",
+                "interrupts": outcome.interrupts}
+    return {**base, "status": "success", "output": outcome.output}
 
 
-async def _run_task(run_id: str, org: str, thread_id: str, raw_input: Any, rl: int) -> None:
+async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -> None:
     app.state.run_meta[run_id]["status"] = "running"
     # Run prep jobs after container is up, before the agent loop.
     try:
@@ -418,12 +479,20 @@ async def _run_task(run_id: str, org: str, thread_id: str, raw_input: Any, rl: i
                 app.state.run_meta[run_id]["warnings"] = [
                     f"job {r['name']}: {r['status']}" for r in failed
                 ]
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         # Jobs failing shouldn't block the agent run — warn only.
         pass
     try:
-        answer = await _execute(org, thread_id, raw_input, rl)
-        app.state.run_meta[run_id].update(status="success", output=answer, error=None)
+        outcome = await _invoke_once(org, thread_id, body, rl)
+        if outcome.interrupted:
+            app.state.run_meta[run_id].update(
+                status="interrupted", output="", error=None,
+                interrupts=outcome.interrupts,
+            )
+        else:
+            app.state.run_meta[run_id].update(
+                status="success", output=outcome.output, error=None
+            )
     except Exception as exc:  # noqa: BLE001
         app.state.run_meta[run_id].update(
             status="error", output="", error=f"{type(exc).__name__}: {exc}"
@@ -444,7 +513,7 @@ async def thread_run_create(thread_id: str, body: RunCreate) -> dict[str, Any]:
         "error": None,
     }
     app.state.runs[run_id] = asyncio.create_task(
-        _run_task(run_id, org, thread_id, body.input, body.recursion_limit)
+        _run_task(run_id, org, thread_id, body, body.recursion_limit)
     )
     return app.state.run_meta[run_id]
 
@@ -480,6 +549,76 @@ async def run_cancel(run_id: str) -> dict[str, Any]:
         task.cancel()
     meta["status"] = "cancelled"
     return meta
+
+
+# --- streaming (SSE) ---------------------------------------------------------
+
+def _sse(event: str, data: Any) -> str:
+    """One SSE v1 frame — ``event: <e>\\ndata: <json>\\n\\n`` — the exact wire
+    format the ``langgraph_sdk`` ``SSEDecoder`` parses, so a ``RunClient``
+    consumes our stream with no adapter."""
+    return f"event: {event}\ndata: {json.dumps(_jsonable(data), default=str)}\n\n"
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+async def _stream_run(
+    org: str, thread_id: str, body: Any, recursion_limit: int, run_id: str,
+) -> Any:
+    """Yield v1 SSE frames for one run: a leading ``metadata`` event, then the
+    langgraph stream modes (``messages``/``updates``/``values``), then an
+    ``error`` frame on exception. The interrupt surfaces as a ``__interrupt__``
+    key in the final ``values``/``updates`` events — the client reads it +
+    resumes with ``command={"resume": ...}`` on the same thread."""
+    graph = _get_graph(org)
+    config = build_invoke_config(
+        thread_id, recursion_limit, org, transport="serve"
+    )
+    yield _sse("metadata", {"run_id": run_id})
+    try:
+        async for mode, chunk in graph.astream(
+            _graph_input(org, body), config=config,
+            stream_mode=["messages", "updates", "values"],
+        ):
+            if mode == "messages":
+                msg, meta = chunk
+                yield _sse("messages", [_jsonable(msg), _jsonable(meta)])
+            elif mode == "updates":
+                yield _sse("updates", chunk)
+            else:  # values — carries __interrupt__ on the interrupted step
+                yield _sse("values", chunk)
+    except Exception as exc:  # noqa: BLE001 - emit an error frame, don't crash mid-stream
+        yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+
+@app.post("/runs/stream")
+async def run_stream(body: EphemeralRun) -> StreamingResponse:
+    """Ephemeral run streamed as SSE (create thread + stream + the thread is
+    kept for resume). The wire format is what ``langgraph_sdk`` consumes."""
+    if body.agent_id not in discover_orgs():
+        raise HTTPException(status_code=404, detail=f"unknown agent {body.agent_id!r}")
+    thread_id = str(uuid.uuid4())
+    await app.state.store.register_thread(thread_id, body.agent_id, body.metadata)
+    run_id = str(uuid.uuid4())
+    return StreamingResponse(
+        _stream_run(body.agent_id, thread_id, body, body.recursion_limit, run_id),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
+@app.post("/threads/{thread_id}/runs/stream")
+async def thread_run_stream(thread_id: str, body: RunCreate) -> StreamingResponse:
+    """Stream a run on an existing thread (SSE). POST ``command={"resume": ...}``
+    to resume an interrupted run on the thread."""
+    org = await _require_thread(thread_id)
+    run_id = str(uuid.uuid4())
+    return StreamingResponse(
+        _stream_run(org, thread_id, body, body.recursion_limit, run_id),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 # --- jobs (post-create prep steps) -------------------------------------------

@@ -98,7 +98,7 @@ class RubricGate:
     model via ``get_model(role="grader", org=org)`` — the model is NOT a field
     here; override it per-org under the top-level ``models:`` map, like any
     other role), ``tools.build_grader_tools`` for the grader's sandbox tools,
-    and ``server._execute`` / ``main._run`` for the default-rubric injection.
+    and ``server._invoke_once`` / ``main._run`` for the default-rubric injection.
 
     Beta mitigation: the gate is per-org opt-in (only orgs that add the block)
     and behind ``enabled: true``; orgs without a block are byte-identical to
@@ -734,7 +734,7 @@ def default_rubric(org: str) -> str | None:
 
     Returns ``RubricGate.default`` ONLY when the gate is present + enabled + has
     a default. ``None`` otherwise (no gate, gate disabled, or no default text).
-    ``None`` means ``server._execute`` / ``main._run`` skip injection, so
+    ``None`` means ``server._invoke_once`` / ``main._run`` skip injection, so
     ``RubricMiddleware`` does not run (its contract: "When no rubric is supplied
     on input state, the middleware does not run")."""
     gate = load_rubric_gate(org)
