@@ -19,16 +19,18 @@ Run: ``pux acp --org invest``. Stdin/stdout are the protocol —
 this process must not print to stdout. Errors go to stderr.
 
 The stdout contract is ENFORCED, not just stated: ``run_acp`` calls
-``_bootstrap_env_and_logging`` FIRST — it loads ``./.env`` (the editor's shell
-lacks the user's key export) and pins the root logger to ``stderr``
-(``force=True``) so no library can auto-configure a stdout handler that would
-corrupt the JSON-RPC stream. See ``tests/harness/test_acp_bootstrap.py``.
+``bootstrap_env_and_logging(pin_stderr=True)`` FIRST — the SHARED kit helper
+(``pux_harness.kit``) that loads ``./.env`` (the editor's shell lacks the
+user's key export) and pins the root logger to ``stderr`` (``force=True``) so
+no library can auto-configure a stdout handler that would corrupt the
+JSON-RPC stream. The same helper (``pin_stderr=False``) is the seam that makes
+``pux serve``/``pux direct``/exported runners load their consumer ``.env``
+seamlessly. See ``tests/harness/test_bootstrap.py``.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import os
 import sys
 from collections.abc import Callable
@@ -43,7 +45,6 @@ from acp.schema import (
     SessionListCapabilities,
 )
 from deepagents_acp.server import AgentServerACP, AgentSessionContext
-from dotenv import find_dotenv, load_dotenv
 from langgraph.graph.state import CompiledStateGraph
 
 from langchain_core.tools import BaseTool
@@ -53,6 +54,7 @@ from pux_harness.agent.model import driver_multimodal, resolve_model_id
 from pux_harness.agent.orgs import discover_orgs
 from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
 from pux_harness.agent.tool_servers import resolve_tool_servers
+from pux_harness.kit import bootstrap_env_and_logging
 from pux_harness.kit._paths import project_root
 from pux_harness.threads import open_thread_store
 
@@ -291,43 +293,12 @@ async def _acp_main(org: str) -> None:
         await _mcp_mgr.close()
 
 
-def _bootstrap_env_and_logging() -> None:
-    """Process bootstrap for the stdio ACP server — run BEFORE any env read.
-
-    Two contracts that matter ONLY for ``pux acp`` (the editor spawns us in a
-    shell that may lack the user's key export but ships a project ``.env``):
-
-    1. **Load ``.env``.** ``agent.model.get_model`` reads the provider key
-       straight off ``os.environ[api_key_env]`` (default ``OPENCODE_API_KEY``)
-       — a hard ``KeyError``, not a graceful fallback. Editors launch
-       ``pux acp`` WITHOUT sourcing the user's shell exports, so a key the
-       ``pux serve`` / ``pux direct`` shells see via export lives only in
-       ``./.env`` here. We anchor on the launch CWD via
-       ``find_dotenv(usecwd=True)`` — the bare ``load_dotenv()`` default uses
-       ``usecwd=False``, which searches from THIS module's source dir upward
-       and would find pux's own repo ``.env``, NOT the editor's project one.
-       ``load_dotenv`` never overrides an already-set var (its
-       ``override=False`` default), so the shell-exported path is untouched.
-       ``serve``/``direct`` have the SAME gap (no entrypoint loads ``.env``
-       today) — flagged for the four-mode plan; this fixes the acute stdio path
-       first per [[verify-or-die]].
-
-    2. **Pin logging to stderr.** ACP is stdio JSON-RPC: stdout IS the wire
-       format — a stray log line there corrupts the stream and the editor drops
-       the session. ``force=True`` re-binds the root logger to ``sys.stderr``
-       before deepagents/langchain/acp can auto-configure a handler on stdout.
-       Stdout itself is NOT redirected (it IS the protocol); this pins only the
-       logging layer that would otherwise default to it.
-    """
-    dotenv_path = find_dotenv(usecwd=True)
-    if dotenv_path:
-        load_dotenv(dotenv_path)
-    logging.basicConfig(stream=sys.stderr, force=True)
-
-
 def run_acp(org: str = DEFAULT_ORG) -> None:
     """Run the deepagents org graph as an ACP stdio server (editor = TUI)."""
-    _bootstrap_env_and_logging()
+    # Stdio bootstrap FIRST: load ./.env (editor shell lacks the key export) +
+    # pin logging to stderr (stdout IS the JSON-RPC wire). The shared kit helper
+    # is the same seam serve/direct/exported runners use (pin_stderr=False there).
+    bootstrap_env_and_logging(pin_stderr=True)
     known = discover_orgs()
     if org not in known:
         sys.stderr.write(f"pux acp: unknown org {org!r}; discovered: {known}\n")

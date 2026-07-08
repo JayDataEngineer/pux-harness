@@ -30,6 +30,7 @@ See ``examples/README.md`` for the org + skill format and a full walk-through.
 from __future__ import annotations
 
 from ._paths import project_root
+from ._bootstrap import bootstrap_env_and_logging
 from .compile import compile_org, load_subagents
 from .loaders import (
     build_system_prompt,
@@ -54,6 +55,7 @@ __all__ = [
     "load_org_prompt",
     "build_system_prompt",
     "project_root",
+    "bootstrap_env_and_logging",
 ]
 
 __version__ = "0.1.0"
