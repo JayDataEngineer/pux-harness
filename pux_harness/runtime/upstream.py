@@ -27,14 +27,22 @@ Three graph regimes, ONE ``graph_id``, EXPLICIT (no silent fallback — see
   [[unified-thread-store]] — the owner shifts from pux's ``open_thread_store`` to
   langgraph-api's runtime checkpointer.
 
-This ships the ``general`` graph_id; multi-org discovery is a follow-up.
+MULTI-ORG: every discovered org is its own ``graph_id`` = its own assistant
+(one org per graph_id — the SDK dispatch key). ``langgraph.json`` lists each;
+this module registers one lazy 0-param FACTORY closure per org
+(``graph__<slug>``). langgraph-api classifies any callable attr as a factory
+(``_graph_from_spec`` → ``classify_factory``) and invokes a 0-param factory with
+no args, so the org graph is built lazily on first request — not all up-front at
+import (some orgs need Docker/a key). The manifest is regenerated from the
+orgs/ tree by ``scripts/gen_langgraph_json.py``.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
@@ -122,7 +130,49 @@ def make_graph(org: str) -> CompiledStateGraph:
     return build_graph(org, checkpointer=None, store=None)
 
 
-# langgraph.json -> {"graphs": {"general": "pux_harness.runtime.upstream:general"}}
-# Each graph is a CompiledStateGraph resolved at import; langgraph-api runs it
-# with the runtime's checkpointer + store injected.
-general: CompiledStateGraph = make_graph("general")
+# --- multi-org factory registration --------------------------------------
+# langgraph.json key (graph_id) -> module attr ``graph__<slug>``. Each attr is a
+# lazy 0-param factory closing over its org; langgraph-api calls it on first
+# request. See module docstring + ``scripts/gen_langgraph_json.py``.
+
+def graph_attr_name(org: str) -> str:
+    """Module attr name for ``org``'s graph factory (``graph__<slug>``).
+
+    ``slug`` keeps it a valid Python identifier (hyphens -> underscores) so
+    langgraph.json's ``module:variable`` resolves. The graph_id (langgraph.json
+    KEY) keeps the org's real name (e.g. ``deep-research-engine``)."""
+    slug = re.sub(r"[^0-9a-zA-Z_]", "_", org)
+    if not slug or slug[0].isdigit():
+        slug = f"_{slug}"
+    return f"graph__{slug}"
+
+
+def discover_upstream_orgs() -> list[str]:
+    """Orgs to serve as graph_ids. The full discovered set when the orgs/ tree is
+    reachable; otherwise just ``general`` (standalone-kit fallback so the
+    keystone smoke still has a graph to serve)."""
+    root = _project_root()
+    if root is None:
+        return ["general"]
+    from pux_harness.kit.loaders import discover_orgs
+
+    orgs = discover_orgs(root)
+    return orgs if orgs else ["general"]
+
+
+def _factory_for(org: str) -> Callable[[], CompiledStateGraph]:
+    """A 0-param factory closure building ``org``'s graph lazily."""
+
+    def factory() -> CompiledStateGraph:
+        return make_graph(org)
+
+    factory.__name__ = graph_attr_name(org)
+    factory.__qualname__ = graph_attr_name(org)
+    return factory
+
+
+# Register one factory attr per org at import. langgraph-api resolves
+# ``pux_harness.runtime.upstream:graph__<slug>`` from langgraph.json.
+for _org in discover_upstream_orgs():
+    globals()[graph_attr_name(_org)] = _factory_for(_org)
+del _org

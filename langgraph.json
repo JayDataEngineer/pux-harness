@@ -1,6 +1,17 @@
 {
-  "dependencies": ["."],
+  "dependencies": [
+    "."
+  ],
   "graphs": {
-    "general": "pux_harness.runtime.upstream:general"
+    "_demo": "pux_harness.runtime.upstream:graph___demo",
+    "deep-research-engine": "pux_harness.runtime.upstream:graph__deep_research_engine",
+    "dev-bot": "pux_harness.runtime.upstream:graph__dev_bot",
+    "game-studio": "pux_harness.runtime.upstream:graph__game_studio",
+    "general": "pux_harness.runtime.upstream:graph__general",
+    "invest": "pux_harness.runtime.upstream:graph__invest",
+    "social-media-pipeline": "pux_harness.runtime.upstream:graph__social_media_pipeline",
+    "telegram-agent": "pux_harness.runtime.upstream:graph__telegram_agent",
+    "twitter-agent": "pux_harness.runtime.upstream:graph__twitter_agent",
+    "video-production": "pux_harness.runtime.upstream:graph__video_production"
   }
 }

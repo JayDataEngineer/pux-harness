@@ -57,16 +57,17 @@ def _wait_for_server(base: str, timeout: float = 90.0) -> bool:
     return False
 
 
-async def _drive(base: str) -> dict:
-    """Exercise the SDK surface against the live upstream server. Returns a
-    dict of evidence; raises AssertionError with a clear cause on any drift."""
+async def _drive(base: str, graph_id: str = "general") -> dict:
+    """Exercise the SDK surface against the live upstream server for ONE
+    ``graph_id``. Returns a dict of evidence; raises AssertionError with a clear
+    cause on any drift."""
     c = get_client(url=base)
     out: dict = {}
 
-    # 1. assistants.search -> general is served as an assistant (org==assistant)
+    # 1. assistants.search -> graph_id is served as an assistant (org==assistant)
     assistants = await c.assistants.search()
     graph_ids = {a["graph_id"] for a in assistants}
-    assert "general" in graph_ids, f"general not served: {graph_ids}"
+    assert graph_id in graph_ids, f"{graph_id} not served: {graph_ids}"
     out["assistants"] = sorted(graph_ids)
 
     # 2. threads.create -> upstream mints the thread
@@ -79,7 +80,7 @@ async def _drive(base: str) -> dict:
     events: list[str] = []
     last_values: dict = {}
     async for part in c.runs.stream(
-        tid, "general", input={"messages": [{"role": "user", "content": "hi"}]},
+        tid, graph_id, input={"messages": [{"role": "user", "content": "hi"}]},
         stream_mode=["values"],
     ):
         events.append(part.event)
@@ -97,8 +98,9 @@ async def _drive(base: str) -> dict:
     out["answer"] = "upstream ok"
 
     # 4. store.put/get -> BaseStore surface round-trips
-    await c.store.put_item(("pux", "keystone"), key="k", value={"v": 1})
-    item = await c.store.get_item(("pux", "keystone"), key="k")
+    ns = ("pux", graph_id)
+    await c.store.put_item(ns, key="k", value={"v": 1})
+    item = await c.store.get_item(ns, key="k")
     assert item, "store get returned nothing"
     # Item is a TypedDict (dict-like): value lives under the "value" key.
     val = item["value"] if isinstance(item, dict) else getattr(item, "value", None)
@@ -106,6 +108,14 @@ async def _drive(base: str) -> dict:
     out["store"] = val
 
     return out
+
+
+def _graph_ids_from_manifest() -> list[str]:
+    """Every graph_id declared in langgraph.json (one per org)."""
+    import json
+
+    data = json.loads((ROOT / "langgraph.json").read_text())
+    return sorted(data.get("graphs", {}))
 
 
 def main() -> int:
@@ -116,6 +126,11 @@ def main() -> int:
         "--graph", choices=("keystone", "org"), default="keystone",
         help="keystone=minimal scripted create_agent; org=real org graph via "
              "compile_org (scripted supervisor, no specialist tools)",
+    )
+    ap.add_argument(
+        "--all-orgs", action="store_true",
+        help="drive EVERY graph_id in langgraph.json (multi-org proof). Best with "
+             "--graph org so each org compiles its real (scripted) graph.",
     )
     args = ap.parse_args()
     base = f"http://{args.host}:{args.port}"
@@ -129,7 +144,9 @@ def main() -> int:
         "--no-browser",
         "--no-reload",
     ]
-    print(f"[keystone] launching upstream runtime (graph={args.graph}): {' '.join(cmd)}", flush=True)
+    scope = "ALL orgs" if args.all_orgs else "general"
+    print(f"[keystone] launching upstream runtime (regime={args.graph}, scope={scope})", flush=True)
+    print(f"[keystone] cmd: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -148,14 +165,28 @@ def main() -> int:
             return 2
 
         print(f"[keystone] server healthy at {base}/ok; driving SDK surface", flush=True)
-        evidence = asyncio.run(_drive(base))
-        print("PROVEN — upstream langgraph-api serves pux's graph via the SDK surface:")
-        for k, v in evidence.items():
-            print(f"  {k}: {v}")
+        targets = _graph_ids_from_manifest() if args.all_orgs else ["general"]
+        results: list[tuple[str, str]] = []  # (graph_id, "OK" | cause)
+        for gid in targets:
+            try:
+                ev = asyncio.run(_drive(base, gid))
+                print(f"  [OK]   {gid}: answer={ev['answer']!r} store={ev['store']}")
+                results.append((gid, "OK"))
+            except (AssertionError, Exception) as e:  # noqa: BLE001
+                cause = f"{type(e).__name__}: {e}"
+                print(f"  [FAIL] {gid}: {cause}", file=sys.stderr)
+                results.append((gid, cause))
+
+        ok = [g for g, r in results if r == "OK"]
+        bad = [(g, r) for g, r in results if r != "OK"]
+        print(f"\n[keystone] {len(ok)}/{len(targets)} graph_ids PROVEN upstream")
+        if bad:
+            print("FAILED graph_ids:", file=sys.stderr)
+            for g, r in bad:
+                print(f"  {g}: {r}", file=sys.stderr)
+            return 1
+        print(f"PROVEN — every graph_id serves the full SDK surface upstream")
         return 0
-    except AssertionError as e:
-        print(f"FAILED (contract drift): {e}", file=sys.stderr)
-        return 1
     except Exception as e:  # noqa: BLE001
         print(f"FAILED (unexpected): {type(e).__name__}: {e}", file=sys.stderr)
         return 1
