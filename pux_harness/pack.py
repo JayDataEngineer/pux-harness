@@ -101,6 +101,7 @@ _KIT_DIR = Path(__file__).resolve().parent / "kit"
 # the runner's ``--check`` offline smoke + lets a consumer test their wired graph).
 _KIT_RUNTIME_FILES = (
     "__init__.py", "_bootstrap.py", "_paths.py", "compile.py", "loaders.py", "_testing.py",
+    "capabilities_decl.py",  # CU-3 — the ``capabilities:`` declaration sugar (loaders.py imports it)
 )
 
 # The package-level __init__ for the VENDORED ``pux_harness``. Re-exports the kit

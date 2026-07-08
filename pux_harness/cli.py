@@ -19,6 +19,7 @@ Usage:
   pux check-policy [--org X]   resolve + report an org's policy
   pux jobs run --org X         run prep jobs inside the sandbox
   pux jobs status --org X      show declared prep jobs
+  pux capabilities list        unified catalog of tools/skills/mcp/middleware/jobs
   pux pack --org X             pack org as a manifest-driven portable archive
   pux lock --org X             regenerate org.lock.yaml (pip + MCP pins)
   pux promote-function --org X NAME   graduate a lib function to git-tracked sandbox/ (c->b)
@@ -220,6 +221,32 @@ def cmd_jobs_status(org: str) -> None:
     for j in jobs:
         timeout = f"{j['timeout']}s" if j["timeout"] else "none"
         print(f"  {j['name']:<22} {j['script']:<40} {timeout:<8} {j.get('description', '')}")
+def cmd_capabilities_list(org: str | None, kind: str | None) -> None:
+    """Print the merged ``CapabilityIndex`` — the ONE discovery view over the
+    capability fleet (tools / skills / mcp / middleware / jobs), grouped by
+    ``kind`` then ``provenance`` (the unified vocabulary from CU-2).
+
+    Fleet-wide by default; ``--org`` folds in the org's declared channels
+    (declared tools, authored lib/ functions, skill roots, jobs); ``--kind``
+    filters to one surface. Docker-free — reads catalogs + declarations only."""
+    from pux_harness.agent.capabilities import CapabilityIndex
+
+    rows = CapabilityIndex.load(org)
+    if kind:
+        rows = [r for r in rows if r.kind == kind]
+    scope = f"org {org!r}" if org else "fleet-wide"
+    if not rows:
+        print(f"no capabilities ({scope})")
+        return
+    by_kind: dict[str, list[Any]] = {}
+    for r in rows:
+        by_kind.setdefault(r.kind, []).append(r)
+    print(f"capabilities ({scope}): {len(rows)} rows")
+    for k in sorted(by_kind):
+        provs = sorted({r.provenance for r in by_kind[k]})
+        print(f"  {k:<11} {len(by_kind[k]):>3}  [{', '.join(provs)}]")
+        for r in sorted(by_kind[k], key=lambda x: x.ref):
+            print(f"      {r.ref}")
 
 
 # --- Unified CLI dispatcher ---------------------------------------------------
@@ -329,6 +356,23 @@ def main() -> None:
 
     p_js = jobs_sub.add_parser("status", help="show declared prep jobs")
     p_js.add_argument("--org", required=True)
+
+    # Capabilities — the unified fleet/per-org capability catalog (CU-2).
+    # `pux capabilities list` prints the merged CapabilityIndex: ONE discovery
+    # view over tools / skills / mcp / middleware / jobs.
+    p_caps = sub.add_parser(
+        "capabilities", help="inspect the unified capability catalog")
+    caps_sub = p_caps.add_subparsers(dest="caps_cmd", required=True)
+    p_cl = caps_sub.add_parser(
+        "list", help="list capabilities (fleet-wide, or one org's resolved channels)")
+    p_cl.add_argument(
+        "--org", default=None,
+        help="fold in this org's declared channels (declared tools, lib/ "
+             "functions, skill roots, jobs); default = fleet-wide catalog only")
+    p_cl.add_argument(
+        "--kind", default=None,
+        choices=["tool", "skill", "mcp", "middleware", "job"],
+        help="filter to one capability surface")
 
     # Pack — manifest-driven default-deny portable archive (successor to the
     # deprecated `export`). ``pux pack`` is the validated path; the legacy
@@ -472,6 +516,11 @@ def main() -> None:
             cmd_jobs_run(args.org, args.job)
         elif args.jobs_cmd == "status":
             cmd_jobs_status(args.org)
+
+    # --- Capabilities (unified catalog; CU-2) ---
+    elif args.cmd == "capabilities":
+        if args.caps_cmd == "list":
+            cmd_capabilities_list(args.org, args.kind)
 
     # --- Pack (manifest-driven default-deny archive; successor to `export`) ---
     elif args.cmd == "pack":
