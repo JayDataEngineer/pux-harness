@@ -756,7 +756,13 @@ async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -
         # universal_warmup=True => every serve sandbox also probes the
         # run-completion event endpoint (so a webhook-less client like Hermes
         # can observe this run's finish). direct-mode (main.py) leaves it off.
-        job_results = prepare(org, universal_warmup=True)
+        #
+        # Offloaded to a worker thread: prepare() does blocking Docker I/O
+        # (ensure container + exec warmup_webhook) and would otherwise stall the
+        # SINGLE event loop — during which a webhook-less client's GET /events
+        # poll would time out and mistake serve for dead. to_thread keeps the
+        # loop serving /events, /ok, and new runs while prep runs in parallel.
+        job_results = await asyncio.to_thread(prepare, org, universal_warmup=True)
         from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
 
         _watch_url = SandboxContainer(org=org).watch_url
