@@ -179,6 +179,7 @@ async def start_run(
     thread_id: str,
     task: str,
     recursion_limit: int = DEFAULT_RECURSION_LIMIT,
+    webhook_url: str | None = None,
 ) -> str:
     """Start a background run on an existing thread — returns immediately with a
     run_id (status 'pending'). Poll with list_runs(thread_id), block for the
@@ -189,12 +190,15 @@ async def start_run(
         thread_id: an existing thread (from create_thread).
         task: the prompt to send.
         recursion_limit: LangGraph node-step cap (default 60).
+        webhook_url: optional callback — when the run finishes, pux POSTs its
+            final result (run_id, status, output, event="run.completed") here so
+            you learn completion WITHOUT polling list_runs. (PUX_RUN_WEBHOOK_URL
+            sets a server-side default for runs that omit this.)
     """
-    data, err = await _call(
-        "POST",
-        f"/threads/{thread_id}/runs",
-        json={"input": task, "recursion_limit": recursion_limit},
-    )
+    body: dict[str, Any] = {"input": task, "recursion_limit": recursion_limit}
+    if webhook_url:
+        body["webhook_url"] = webhook_url
+    data, err = await _call("POST", f"/threads/{thread_id}/runs", json=body)
     if err:
         return err
     return _format_run_meta(data)

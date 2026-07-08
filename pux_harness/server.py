@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -60,6 +61,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from langgraph.graph.state import CompiledStateGraph
@@ -113,6 +115,12 @@ class RunCreate(BaseModel):
     # ``Command(resume=<value>)`` on the same thread (the value becomes the
     # ``interrupt()`` return value). Absent => a fresh-input run.
     command: dict[str, Any] | None = None
+    # Push-notification callback: when this background run reaches a terminal
+    # state, its metadata is POSTed here so a fire-and-forget caller (MCP
+    # ``start_run``) learns the run finished WITHOUT polling ``list_runs``.
+    # Falls back to ``PUX_RUN_WEBHOOK_URL`` when unset. Best-effort — see
+    # ``_dispatch_run_webhook``.
+    webhook_url: str | None = None
 
 
 class EphemeralRun(BaseModel):
@@ -647,6 +655,45 @@ async def run_ephemeral(body: EphemeralRun) -> dict[str, Any]:
     return {**base, "status": "success", "output": outcome.output}
 
 
+_log = logging.getLogger(__name__)
+
+#: Best-effort upper bound on a webhook POST — a slow/dead target must not stall
+#: the background run that produced the result beyond this.
+WEBHOOK_TIMEOUT: float = 5.0
+
+
+async def _dispatch_run_webhook(meta: dict[str, Any]) -> None:
+    """Push-notification for a BACKGROUND run's completion.
+
+    Closes the gap an MCP client that fired ``start_run`` and ended its turn
+    otherwise cannot: with nothing pushing completion it must poll
+    ``list_runs``. Here the run's terminal metadata is POSTed to the
+    ``webhook_url`` recorded on the run (per-run ``RunCreate.webhook_url`` or
+    the ``PUX_RUN_WEBHOOK_URL`` default), so the caller learns the run finished
+    with NO polling.
+
+    Fire-and-forget semantics: a down/unreachable target is logged + swallowed —
+    it must NEVER fail the run that produced the result beyond
+    ``WEBHOOK_TIMEOUT`` ([[no-fallbacks-no-aliases]]: this is a notification
+    channel, not a reliability gate; non-delivery degrades to the existing
+    poll-with-``list_runs`` path). The payload drops ``webhook_url`` itself (the
+    caller's callback location is not echoed back) and tags an ``event`` so one
+    receiver can demux multiple run kinds later.
+    """
+    url = meta.get("webhook_url")
+    if not url:
+        return
+    payload = {k: v for k, v in meta.items() if k != "webhook_url"}
+    payload["event"] = "run.completed"
+    try:
+        async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code >= 400:
+                _log.warning("run webhook %s returned HTTP %s", url, resp.status_code)
+    except Exception as exc:  # noqa: BLE001 - best-effort; never fail the run
+        _log.warning("run webhook dispatch to %s failed: %r", url, exc)
+
+
 async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -> None:
     app.state.run_meta[run_id]["status"] = "running"
     # Run prep jobs after container is up, before the agent loop.
@@ -684,6 +731,10 @@ async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -
         app.state.run_meta[run_id].update(
             status="error", output="", error=f"{type(exc).__name__}: {exc}"
         )
+    # Push-notification: tell the out-of-process caller the background run
+    # reached a terminal state (success/interrupted/error) WITHOUT it polling
+    # list_runs. Best-effort — _dispatch_run_webhook swallows delivery failures.
+    await _dispatch_run_webhook(app.state.run_meta[run_id])
 
 
 @app.post("/threads/{thread_id}/runs")
@@ -698,6 +749,7 @@ async def thread_run_create(thread_id: str, body: RunCreate) -> dict[str, Any]:
         "started_at": _now(),
         "output": "",
         "error": None,
+        "webhook_url": getattr(body, "webhook_url", None) or os.environ.get("PUX_RUN_WEBHOOK_URL"),
     }
     app.state.runs[run_id] = asyncio.create_task(
         _run_task(run_id, org, thread_id, body, body.recursion_limit)
