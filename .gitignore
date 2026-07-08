@@ -28,3 +28,5 @@ __pycache__/
 
 # Harness runtime state (the consumer app owns ``.pux/``; never the library)
 .pux/
+# langgraph-api inmem runtime local state (checkpoints/store/ops) from `langgraph dev`
+.langgraph_api/

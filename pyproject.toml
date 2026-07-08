@@ -24,6 +24,9 @@ dependencies = [
 # (see agent/observability.py): the harness runs identically with or without.
 [project.optional-dependencies]
 observability = ["langfuse>=3.0"]
+upstream = [
+    "langgraph-cli[inmem]>=0.4.30",
+]
 
 [build-system]
 requires = ["hatchling"]

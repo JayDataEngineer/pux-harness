@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "general": "pux_harness.runtime.upstream:general"
+  }
+}
