@@ -456,7 +456,12 @@ def _format_jobs(data: Any) -> str:
 
 def main() -> None:
     port = int(os.environ.get("PUX_MCP_PORT", "9987"))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    # Default 0.0.0.0 keeps the dev convenience of "reachable locally". For a
+    # PROD deployment bound to a specific interface (e.g. the Tailscale IP only,
+    # so the MCP surface is reachable from Tailscale peers but NOT the LAN/public),
+    # set PUX_MCP_HOST. Mirrors the PUX_API_HOST knob on `pux serve`.
+    host = os.environ.get("PUX_MCP_HOST", "0.0.0.0")
+    mcp.run(transport="sse", host=host, port=port)
 
 
 if __name__ == "__main__":
