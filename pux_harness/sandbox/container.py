@@ -49,6 +49,7 @@ project label and reuse it; create+start only when none is running (removing a
 stopped stale namesake first). ``destroy()`` saves persisted state, stops
 (10s grace), removes (force).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -75,6 +76,7 @@ _DISPLAY_PORT: dict[str, int] = {"standard": 6080, "kasm": 8444}
 def display_port(backend: str) -> int:
     """Container-side VNC-web port for a ``sandbox.display.backend`` value."""
     return _DISPLAY_PORT.get(backend, 6080)
+
 
 # --- defaults (mirror backend/internal/sandbox/{manager,defaults,cache}.go) ----
 
@@ -149,9 +151,7 @@ def resolve_project_path() -> str:
     """
     p = os.environ.get("PUX_PROJECT_PATH") or str(project_root())
     if "://" in p:  # any URL scheme — ssh://, file://, http://, ...
-        raise ContainerError(
-            f"sandboxes require a local filesystem path; received a URL: {p!r}"
-        )
+        raise ContainerError(f"sandboxes require a local filesystem path; received a URL: {p!r}")
     return os.path.abspath(p)
 
 
@@ -229,7 +229,9 @@ class SandboxContainer:
         client: docker.DockerClient | None = None,
     ):
         self.project_path = project_path or resolve_project_path()
-        self.sandbox_id = _env_str("PUX_SANDBOX_ID", DEFAULT_SANDBOX_ID) if sandbox_id is None else sandbox_id
+        self.sandbox_id = (
+            _env_str("PUX_SANDBOX_ID", DEFAULT_SANDBOX_ID) if sandbox_id is None else sandbox_id
+        )
         self.org = org if org is not None else os.environ.get("PUX_ORG", "")
         self._client = client
         self._name: str | None = None
@@ -348,8 +350,7 @@ class SandboxContainer:
             exports = host_setup.run_host_setup(pol, self.project_path)
             if exports:
                 os.environ.update(exports)
-                log.info("host_setup exported %d env var(s): %s",
-                         len(exports), sorted(exports))
+                log.info("host_setup exported %d env var(s): %s", len(exports), sorted(exports))
 
             # Validate required creds BEFORE touching Docker (cheapest, fails
             # fast, no container leak). Resolve mounts too (unset ${VAR} fails
@@ -392,8 +393,11 @@ class SandboxContainer:
                 fh.write(rules)
             os.chmod(egress_path, 0o600)
             cap_add.append("NET_ADMIN")
-            log.info("staged egress allowlist (%d rules) + NET_ADMIN → %s",
-                     len(pol.egress.allow), egress_path)
+            log.info(
+                "staged egress allowlist (%d rules) + NET_ADMIN → %s",
+                len(pol.egress.allow),
+                egress_path,
+            )
 
         create_kwargs: dict[str, Any] = dict(
             image=image,
@@ -426,24 +430,28 @@ class SandboxContainer:
         disp = pol.sandbox.display if watch_on else None
 
         # Network: shared-infra for isolated; host net for bridged (skips ACLs).
+        # The sandbox image runs its OWN Xvfb on :99 (Dockerfile ENV DISPLAY=:99,
+        # supervisord %(ENV_DISPLAY)s) — it never shares the host's X server. We
+        # do NOT passthrough the host DISPLAY or mount /tmp/.X11-unix: doing so
+        # overwrites :99 with the host's display (e.g. :0), and Xvfb fails with
+        # "Cannot establish any listening sockets" because that display is already
+        # owned by the host. The container's own DISPLAY env wins by not overriding.
         if effective_tier == "bridged":
-            host_display = os.environ.get("DISPLAY", "")
-            if host_display:
-                create_kwargs.setdefault("environment", [])
-                create_kwargs["environment"] = [*env, f"DISPLAY={host_display}"]
-                create_kwargs["volumes"] = [*binds, "/tmp/.X11-unix:/tmp/.X11-unix"]
             create_kwargs["network_mode"] = "host"
         else:
             create_kwargs["network"] = _env_str("OPENSHELL_NETWORK", DEFAULT_NETWORK)
             if disp is not None:
                 # Ephemeral host port (None) on localhost; read back after start.
-                create_kwargs["ports"] = {
-                    f"{display_port(disp.backend)}/tcp": ("127.0.0.1", None)
-                }
+                create_kwargs["ports"] = {f"{display_port(disp.backend)}/tcp": ("127.0.0.1", None)}
 
         self._remove_stale()
-        log.info("creating container %s (image=%s tier=%s runtime=%s)",
-                 self.name, image, effective_tier, runtime or "default")
+        log.info(
+            "creating container %s (image=%s tier=%s runtime=%s)",
+            self.name,
+            image,
+            effective_tier,
+            runtime or "default",
+        )
         try:
             container = self.client.containers.create(**create_kwargs)
         except APIError as exc:
@@ -540,9 +548,7 @@ class SandboxContainer:
             return None
         return self._resolve_watch_url(c, pol.sandbox.display, tier)
 
-    def _ensure_image(
-        self, image: str, build: policy.BuildSpec | None = None
-    ) -> None:
+    def _ensure_image(self, image: str, build: policy.BuildSpec | None = None) -> None:
         """Guarantee ``image`` exists locally. If already present, return. If
         absent AND a ``build`` spec is set, build it from the org's Dockerfile
         (host-side Docker SDK, no compose); else pull. ``build.dockerfile`` is
@@ -559,12 +565,11 @@ class SandboxContainer:
             context = build.context or str(dockerfile_path.parent)
             if not Path(context).is_absolute():
                 context = str(Path(self.project_path) / context)
-            log.info("building image %s (dockerfile=%s context=%s)",
-                     image, build.dockerfile, context)
+            log.info(
+                "building image %s (dockerfile=%s context=%s)", image, build.dockerfile, context
+            )
             try:
-                self.client.images.build(
-                    path=context, dockerfile=dockerfile_path.name, tag=image
-                )
+                self.client.images.build(path=context, dockerfile=dockerfile_path.name, tag=image)
             except (APIError, BuildError) as exc:
                 raise ContainerError(f"build image {image}: {exc}") from exc
             return
@@ -592,8 +597,9 @@ class SandboxContainer:
         # Verbatim port of manager.go::restorePersistedState.
         self._exec(container, _RESTORE_SCRIPT)
 
-    def _install_deps(self, container: docker.models.containers.Container,
-                      pol: policy.Policy) -> None:
+    def _install_deps(
+        self, container: docker.models.containers.Container, pol: policy.Policy
+    ) -> None:
         """Install the org's declared ``sandbox.deps`` (apt + pip) into the
         container. Apt and pip are independent best-effort steps (each via
         ``_exec``, which logs non-zero exit as a warning, never fatal) — a
@@ -602,13 +608,18 @@ class SandboxContainer:
         deps = pol.sandbox.deps
         if not deps.apt and not deps.pip:
             return
-        log.info("installing sandbox deps (%s): apt=%s pip=%s",
-                 pol.sandbox.image or DEFAULT_IMAGE, deps.apt, deps.pip)
+        log.info(
+            "installing sandbox deps (%s): apt=%s pip=%s",
+            pol.sandbox.image or DEFAULT_IMAGE,
+            deps.apt,
+            deps.pip,
+        )
         if deps.apt:
             quoted = " ".join(shlex.quote(p) for p in deps.apt)
-            self._exec(container,
-                       f"apt-get update -qq && apt-get install -y "
-                       f"--no-install-recommends {quoted}")
+            self._exec(
+                container,
+                f"apt-get update -qq && apt-get install -y --no-install-recommends {quoted}",
+            )
         if deps.pip:
             quoted = " ".join(shlex.quote(p) for p in deps.pip)
             self._exec(container, f"python3 -m pip install --no-cache-dir {quoted}")
@@ -752,7 +763,6 @@ def prepare(
 
     results = run_jobs(pol, exec_client)
     return [
-        {"name": r.name, "status": r.status, "error": r.error,
-         "duration": round(r.duration, 1)}
+        {"name": r.name, "status": r.status, "error": r.error, "duration": round(r.duration, 1)}
         for r in results
     ]
