@@ -30,7 +30,18 @@ Archive layout (mirrors the project tree, scoped to what the org uses)::
         sandbox/*.py                 # shared sandbox helpers the org references
         clients/*.py                 # shared clients the org references
         tool_servers.yaml            # (if policy declares tool_servers)
+      pux_harness/                   # VENDORED slim kit (the portable compiler)
+        __init__.py                  # re-exports compile_org
+        kit/                         # compile.py, loaders, _bootstrap, _paths, _testing
+      run.py                         # standalone runner (--check offline / "task")
+      pyproject.toml                 # runtime deps (deepagents, langchain-openai, ...)
+      README.md                      # how to run
       manifest.json                  # machine-readable inventory
+
+The ``pux_harness/`` kit + ``run.py`` + ``pyproject.toml`` + ``README.md`` are
+the **runtime scaffold (F3)**: they turn the primitives archive into a standalone
+RUNNABLE package — a consumer runs the org WITHOUT pux-harness installed
+(``pip install . && python run.py``). See ``_build_runtime_scaffold``.
 """
 from __future__ import annotations
 
@@ -53,6 +64,199 @@ from pux_harness.agent.orgs import (
 )
 from pux_harness.kit._paths import _PROJECT_ROOT_ENV
 from pux_harness.kit._paths import project_root as _default_project_root
+
+
+# --- runtime scaffold (F3): turn the primitives archive into a RUNNABLE package --
+#
+# An export is not done when it carries the org's files — it must RUN without the
+# harness installed. ``_build_runtime_scaffold`` vendors the slim kit + emits a
+# ``pyproject.toml`` (runtime deps), ``run.py`` (entry point), and ``README.md``
+# into the archive. A consumer then: ``pip install .`` (deps) → ``python run.py
+# --check`` (offline compile smoke) → ``python run.py "task"`` (real model).
+#
+# The slim kit is import-self-contained (intra-kit + third-party only; no
+# ``pux_harness.agent`` leakage — locked by the kit-import-isolation tripwire),
+# so vendoring ``pux_harness/kit/`` verbatim makes ``from pux_harness.kit import
+# compile_org`` resolve from the unpacked tree. Read from THIS package's kit dir.
+_KIT_DIR = Path(__file__).resolve().parent / "kit"
+# Runtime kit files (``_testing.py`` IS vendored — its ``ScriptedModel`` powers
+# the runner's ``--check`` offline smoke + lets a consumer test their wired graph).
+_KIT_RUNTIME_FILES = (
+    "__init__.py", "_bootstrap.py", "_paths.py", "compile.py", "loaders.py", "_testing.py",
+)
+
+# The package-level __init__ for the VENDORED ``pux_harness``. Re-exports the kit
+# entry point so ``from pux_harness import compile_org`` mirrors a full install.
+_VENDORED_PKG_INIT = '''"""Vendored slim pux-harness kit — travels with this exported org.
+
+The kit (``pux_harness.kit``) is the portable org+skill compiler: a folder of
+org + skills -> a running deepagents agent, no Docker, no server. This top-level
+``__init__`` re-exports its one entry point; see ``pux_harness/kit/__init__.py``.
+"""
+from pux_harness.kit import compile_org  # noqa: F401
+
+__version__ = "0.1.0"
+'''
+
+# ``run.py`` — the standalone entry point. ``__ORG__`` / ``__MODEL__`` are sentinel
+# replacements (NOT ``.format``) so the template's literal braces (dicts, f-strings)
+# need no escaping.
+_RUN_PY = '''#!/usr/bin/env python3
+"""Standalone runner for the '__ORG__' org — exported from pux-harness.
+
+Usage:
+  pip install .                       # install runtime deps (deepagents, langchain-openai, ...)
+  python run.py --check               # offline smoke: compile the org (no model/key needed)
+  python run.py "your task here"      # run one task against a real model
+
+Model config (via ./.env or shell env):
+  PUX_MODEL=__MODEL__              OpenAI-compatible model id (default shown)
+  OPENAI_API_KEY=...               auto-read by ChatOpenAI
+  OPENAI_BASE_URL=https://...      OpenAI-compatible endpoint (omit for openai.com)
+  PUX_PROJECT_ROOT=<dir>           where orgs/ lives (default: this archive dir)
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# This archive dir holds orgs/ + the vendored pux_harness/. Resolved from THIS
+# file (run.py sits at the archive root) and put first on sys.path so the
+# VENDORED kit is used (not any site-packages pux_harness) — the runner then
+# works from any cwd.
+_ARCHIVE_ROOT = Path(__file__).resolve().parent
+if str(_ARCHIVE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ARCHIVE_ROOT))
+
+from langchain_openai import ChatOpenAI  # noqa: E402
+from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
+
+from pux_harness.kit import bootstrap_env_and_logging, compile_org  # noqa: E402
+
+ORG = "__ORG__"
+DEFAULT_MODEL = "__MODEL__"
+
+
+def _project_root() -> str:
+    return os.environ.get("PUX_PROJECT_ROOT") or str(_ARCHIVE_ROOT)
+
+
+def _build_model() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.environ.get("PUX_MODEL", DEFAULT_MODEL),
+        temperature=float(os.environ.get("PUX_TEMPERATURE", "0.2")),
+        max_tokens=int(os.environ.get("PUX_MAX_TOKENS", "8192")),
+    )
+
+
+def _print_final(result: dict) -> None:
+    msgs = result.get("messages") or []
+    last = msgs[-1] if msgs else None
+    content = getattr(last, "content", last)
+    if isinstance(content, list):
+        content = "\\n".join(
+            str(c.get("text", c)) if isinstance(c, dict) else str(c) for c in content
+        )
+    print(content if content else "(no output)")
+
+
+def main() -> None:
+    bootstrap_env_and_logging()
+    args = sys.argv[1:]
+    if args and args[0] == "--check":
+        from pux_harness.kit._testing import ScriptedModel  # noqa: PLC0415
+        graph = compile_org(ORG, model=ScriptedModel(), tools=[], project_root=_project_root())
+        print(f"OK: {ORG} compiled -> {type(graph).__name__} (project_root={_project_root()})")
+        return
+    task = " ".join(args).strip()
+    if not task:
+        print(f'usage: python run.py "task for the {ORG} org"  (or --check)', file=sys.stderr)
+        raise SystemExit(2)
+    graph = compile_org(
+        ORG, model=_build_model(), tools=[], checkpointer=MemorySaver(),
+        project_root=_project_root(),
+    )
+    _print_final(graph.invoke({"messages": [{"role": "user", "content": task}]}))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+_PYPROJECT = '''[project]
+name = "__ORG__-pux"
+version = "0.1.0"
+description = "Standalone runnable export of the '__ORG__' pux org (vendored slim kit)."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "deepagents",
+    "langchain",
+    "langchain-openai",
+    "langgraph",
+    "langgraph-checkpoint-memory",
+    "pyyaml",
+    "python-dotenv>=1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pux_harness"]
+'''
+
+_README = '''# __ORG__ — standalone pux export
+
+A self-contained, **runnable** export of the **__ORG__** org. It carries the
+org's prompts, agents, skills, policy, and a **vendored** copy of the slim
+`pux_harness.kit` compiler — so it runs **without installing pux-harness**. You
+only need the runtime deps (deepagents, langchain-openai, ...).
+
+## Run
+
+```bash
+cd __ORG__                 # the archive root (this dir)
+pip install .              # installs runtime deps + the vendored kit
+python run.py --check      # offline smoke: compiles the org (no key needed)
+python run.py "your task"  # run one task against a real model
+```
+
+## Configure the model
+
+Drop a `./.env` next to `run.py` (auto-loaded on start):
+
+```
+PUX_MODEL=__MODEL__
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
+```
+
+`PUX_MODEL` is any id your endpoint serves. `OPENAI_API_KEY` / `OPENAI_BASE_URL`
+are read automatically by `ChatOpenAI`. The default (`__MODEL__`) is what this
+org used in the harness — override freely.
+
+## Layout
+
+```
+__ORG__/
+  AGENTS.md             root base prompt
+  orgs/__ORG__/...      the org (agents, skills, policy, sandbox)
+  orgs/_shared/...      shared agents/skills/sandbox the org resolves
+  pux_harness/          vendored slim kit (the portable compiler)
+    kit/                compile_org, loaders, bootstrap, _testing, ...
+  run.py                runner (entry point)
+  pyproject.toml        runtime deps
+  manifest.json         machine-readable inventory
+```
+
+## What this is NOT
+
+No Docker sandbox, no server, no browser-vision/context middleware, no rubric
+gate — the slim kit compiles a plain deepagents agent. For the full harness,
+install `pux-harness` and use `compile_org` from there.
+'''
 
 
 def _collect_org_files(org_dir: Path) -> dict[str, Path]:
@@ -283,12 +487,63 @@ def _resolve_tool_servers(org: str) -> dict[str, Path]:
     return files
 
 
+def _vendor_kit() -> dict[str, bytes]:
+    """The runtime slim-kit files, vendored verbatim into the export.
+
+    A consumer runs the org WITHOUT pux-harness installed: the kit
+    (``pux_harness.kit``) is the portable compiler, so it travels in the archive.
+    Only the runtime files are copied (the kit is import-self-contained — intra-
+    kit + third-party only). Read from THIS package's ``kit/`` dir."""
+    vendored: dict[str, bytes] = {}
+    for name in _KIT_RUNTIME_FILES:
+        vendored[f"pux_harness/kit/{name}"] = (_KIT_DIR / name).read_bytes()
+    vendored["pux_harness/__init__.py"] = _VENDORED_PKG_INIT.encode("utf-8")
+    return vendored
+
+
+def _resolve_default_model(org: str) -> str:
+    """The org's base-role model id, baked into the runner as the default.
+
+    ``resolve_model_id`` is id-only (no key, no network), so this is safe at
+    export time. Falls back to ``glm-5.2`` (the shipped default-tier base) if
+    resolution is unavailable — the consumer overrides via ``PUX_MODEL``."""
+    try:
+        from pux_harness.agent.model import resolve_model_id  # noqa: PLC0415
+
+        return resolve_model_id(role="base", org=org)
+    except Exception:  # noqa: BLE001 — export must never die on model resolution
+        return "glm-5.2"
+
+
+def _build_runtime_scaffold(org: str) -> dict[str, bytes]:
+    """Every generated file that turns the primitives archive into a RUNNABLE
+    package: the vendored slim kit + ``pyproject.toml`` + ``run.py`` + README.
+
+    Keys are archive-relative paths (under ``<org>/``). Values are the file
+    bytes (synthetic — not read from a host Path, so they are written via the
+    same BytesIO path as the manifest, not the host-file loop)."""
+    model = _resolve_default_model(org)
+    scaffold = _vendor_kit()
+    scaffold["run.py"] = _RUN_PY.replace("__ORG__", org).replace("__MODEL__", model).encode("utf-8")
+    scaffold["pyproject.toml"] = _PYPROJECT.replace("__ORG__", org).encode("utf-8")
+    scaffold["README.md"] = _README.replace("__ORG__", org).replace("__MODEL__", model).encode("utf-8")
+    return scaffold
+
+
 def _build_manifest(
     org: str,
     files: dict[str, Path],
+    scaffold: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
-    """Machine-readable inventory of the exported archive."""
+    """Machine-readable inventory of the exported archive.
+
+    ``files`` are the org primitives (host Path sources); ``scaffold`` are the
+    generated runnable-package files (vendored kit + pyproject + run.py + README)
+    — routed to their own ``runtime_scaffold`` category so the org inventory
+    stays separable from the packaging machinery."""
     org_slugs = org_agent_slugs(org)
+    scaffold = scaffold or {}
+    scaffold_keys = set(scaffold)
 
     # Categorize files
     categories: dict[str, list[str]] = {
@@ -303,10 +558,13 @@ def _build_manifest(
         "shared_sandbox": [],
         "shared_clients": [],
         "shared_tool_servers": [],
+        "runtime_scaffold": [],
     }
 
-    for rel in sorted(files):
-        if rel == "AGENTS.md":
+    for rel in sorted(set(files) | scaffold_keys):
+        if rel in scaffold_keys:
+            categories["runtime_scaffold"].append(rel)
+        elif rel == "AGENTS.md":
             categories["root_prompt"].append(rel)
         elif rel.startswith(f"orgs/{org}/agents/"):
             categories["org_agents"].append(rel)
@@ -331,11 +589,11 @@ def _build_manifest(
 
     return {
         "org": org,
-        "description": f"Standalone export of the {org} org",
+        "description": f"Standalone runnable export of the {org} org",
         "agent_roster": org_slugs,
-        "total_files": len(files),
+        "total_files": len(files) + len(scaffold),
         "categories": categories,
-        "files": sorted(files.keys()),
+        "files": sorted(set(files) | scaffold_keys),
     }
 
 
@@ -420,8 +678,13 @@ def export_org(
         files.update(_resolve_shared_sandbox(org, root))
         files.update(_resolve_tool_servers(org))
 
-        # 4. Build manifest
-        manifest = _build_manifest(org, files)
+        # 4. Runtime scaffold (F3): vendor the slim kit + emit pyproject/run.py/
+        # README so the archive is a standalone RUNNABLE package — a consumer
+        # runs the org without pux-harness installed.
+        scaffold = _build_runtime_scaffold(org)
+
+        # 5. Build manifest (accounts for primitives + the scaffold)
+        manifest = _build_manifest(org, files, scaffold)
 
         # 5. Write tar.gz
         if output is None:
@@ -447,6 +710,13 @@ def export_org(
                 # _normalize_specialists_refs). Size is computed AFTER rewrite.
                 if archive_path.endswith(_TEXT_SUFFIXES):
                     data = _normalize_specialists_refs(data)
+                info = tarfile.TarInfo(name=f"{org}/{archive_path}")
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
+
+            # Generated scaffold (vendored kit + pyproject + run.py + README) —
+            # synthetic bytes (no host Path), written via the same BytesIO path.
+            for archive_path, data in sorted(scaffold.items()):
                 info = tarfile.TarInfo(name=f"{org}/{archive_path}")
                 info.size = len(data)
                 tar.addfile(info, BytesIO(data))
