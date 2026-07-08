@@ -19,7 +19,8 @@ Usage:
   pux check-policy [--org X]   resolve + report an org's policy
   pux jobs run --org X         run prep jobs inside the sandbox
   pux jobs status --org X      show declared prep jobs
-  pux export --org X           export org as standalone portable archive
+  pux pack --org X             pack org as a manifest-driven portable archive
+  pux lock --org X             regenerate org.lock.yaml (pip + MCP pins)
   pux promote-function --org X NAME   graduate a lib function to git-tracked sandbox/ (c->b)
   pux archive-function --org X NAME   retire a lib function to lib/.archive/ (reversible)
 """
@@ -329,16 +330,27 @@ def main() -> None:
     p_js = jobs_sub.add_parser("status", help="show declared prep jobs")
     p_js.add_argument("--org", required=True)
 
-    # Export
-    p_export = sub.add_parser("export", help="export org as standalone portable archive")
-    p_export.add_argument("--org", required=True)
-    p_export.add_argument("--output", "-o", default=None,
-                          help="output path (default: <org>.tar.gz)")
-    p_export.add_argument(
+    # Pack — manifest-driven default-deny portable archive (successor to the
+    # deprecated `export`). ``pux pack`` is the validated path; the legacy
+    # ``pux export`` verb HARD-ERRORS (Decision 5: no silent alias).
+    p_pack = sub.add_parser("pack", help="pack org as a manifest-driven portable archive")
+    p_pack.add_argument("--org", required=True)
+    p_pack.add_argument("--output", "-o", default=None,
+                        help="output path (default: <org>.tar.gz)")
+    p_pack.add_argument(
         "--project-root", default=None,
-        help="tree containing orgs/ + root AGENTS.md to export FROM (default: "
-             "$PUX_PROJECT_ROOT or CWD). Lets a standalone consumer app export "
+        help="tree containing orgs/ + root AGENTS.md to pack FROM (default: "
+             "$PUX_PROJECT_ROOT or CWD). Lets a standalone consumer app pack "
              "an org that lives in ITS OWN tree, not the orchestrator's.")
+
+    # `export` is retained as a PARSER so `pux export ...` yields the clear
+    # deprecation message in dispatch (not an opaque argparse "invalid choice").
+    # Its dispatch HARD-ERRORS — there is NO silent alias to `pack`.
+    p_export = sub.add_parser(
+        "export", help="DEPRECATED: use `pack` (hard error — no alias)")
+    p_export.add_argument("--org", required=True)
+    p_export.add_argument("--output", "-o", default=None)
+    p_export.add_argument("--project-root", default=None)
 
     # Dynamic-function lifecycle (OPERATOR commands — not agent tools). Graduate
     # an agent-authored lib function to git-tracked sandbox/ (c->b), or retire
@@ -354,6 +366,19 @@ def main() -> None:
         help="retire a lib function to lib/.archive/ (reversible)")
     p_archive.add_argument("--org", required=True)
     p_archive.add_argument("name", help="function name to archive")
+
+    # Lock — regenerate org.lock.yaml: pin github MCP refs to commit SHAs
+    # (best-effort git ls-remote) + snapshot declared pip/apt deps. The lock
+    # travels with the org (committed by default — Decision 4) so its dep set is
+    # reproducible. Always writable (offline → unresolved refs recorded, not
+    # fatal). See pux_harness/lockfile.py.
+    p_lock = sub.add_parser(
+        "lock", help="regenerate org.lock.yaml (pip + MCP pin snapshot)")
+    p_lock.add_argument("--org", required=True)
+    p_lock.add_argument(
+        "--project-root", default=None,
+        help="tree containing orgs/ to lock against (default: "
+             "$PUX_PROJECT_ROOT or CWD)")
 
     args = ap.parse_args()
     _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (serve/acp/direct/tui)
@@ -439,15 +464,15 @@ def main() -> None:
         elif args.jobs_cmd == "status":
             cmd_jobs_status(args.org)
 
-    # --- Export ---
-    elif args.cmd == "export":
+    # --- Pack (manifest-driven default-deny archive; successor to `export`) ---
+    elif args.cmd == "pack":
         from pathlib import Path as _Path
-        from pux_harness.export import export_org
+        from pux_harness.pack import pack_org
 
         output = _Path(args.output) if args.output else None
         project_root = _Path(args.project_root) if args.project_root else None
-        result = export_org(args.org, output, project_root=project_root)
-        print(f"exported {args.org!r} -> {result}")
+        result = pack_org(args.org, output, project_root=project_root)
+        print(f"packed {args.org!r} -> {result}")
         # Print summary
         import tarfile as _tar
         with _tar.open(result, "r:gz") as tar:
@@ -462,6 +487,20 @@ def main() -> None:
                     for cat, items in cats.items():
                         if items:
                             print(f"  {cat}: {len(items)} files")
+
+    # --- `export` is DEPRECATED → HARD ERROR (Decision 5: no silent alias) ---
+    # The verb is retained as a parser so `pux export ...` yields this clear
+    # migration message (not an opaque argparse "invalid choice"). It never
+    # reaches pack logic — using it is always a deliberate, failing act, which
+    # is what forces updated scripts/muscle memory off the un-validated path.
+    elif args.cmd == "export":
+        import sys as _sys
+        _sys.stderr.write(
+            "`pux export` has been deprecated and replaced by `pux pack` to "
+            "enforce manifest validation, secrets scanning, and OCI packaging "
+            "standards. Please use `pux pack` instead.\n"
+        )
+        raise SystemExit(1)
 
     # --- Dynamic-function lifecycle (operator commands) ---
     elif args.cmd == "promote-function":
@@ -481,6 +520,28 @@ def main() -> None:
         _print_block("archive-function", json.dumps(res, indent=2))
         if not res.get("success"):
             raise SystemExit(1)
+
+    # --- Lock — regenerate org.lock.yaml (Decision 4) ---
+    elif args.cmd == "lock":
+        from pathlib import Path as _Path
+        from pux_harness.lockfile import lock_org
+
+        project_root = _Path(args.project_root) if args.project_root else None
+        result = lock_org(args.org, project_root=project_root)
+        print(f"locked {args.org!r} -> {result}")
+        # The on-disk file is the source of truth — re-read for a faithful
+        # summary (best-effort SHA resolution may have left refs unresolved).
+        import yaml as _yaml
+        data = _yaml.safe_load(result.read_text()) or {}
+        deps = data.get("dependencies", {})
+        mcp = deps.get("mcp_servers", [])
+        resolved = sum(1 for s in mcp if s.get("resolved"))
+        print(f"  mcp_servers: {len(mcp)} ({resolved} resolved to a commit SHA)")
+        for s in mcp:
+            sha = s.get("sha") or "(unresolved)"
+            print(f"    {s['name']}: {s['repo']}@{s['version']} -> {sha}")
+        print(f"  pip: {len(deps.get('pip', []))} declared")
+        print(f"  apt: {len(deps.get('apt', []))} declared")
 
 
 if __name__ == "__main__":

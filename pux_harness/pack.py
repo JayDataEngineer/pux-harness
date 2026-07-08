@@ -1,10 +1,17 @@
-"""Export an org as a standalone portable archive.
+"""Pack an org into a standalone portable, runnable archive (``pux pack``).
 
-``pux export --org <name>`` produces a ``.tar.gz`` containing every primitive
-the org needs to run outside the harness — prompts, agent definitions, skills,
+``pux pack --org <name>`` produces a ``.tar.gz`` containing every primitive the
+org needs to run outside the harness — prompts, agent definitions, skills,
 policy, profile, shared dependencies, and a manifest. The archive is
 self-contained: a consumer can reconstruct the org's agent graph without the
 pux harness.
+
+What ships is now **declared, not implicit**: the org-local tree is collected
+default-deny through the declarative manifest (``pux_harness.manifest`` —
+``package.include`` globs from ``org.yaml``; ``data/``/``.pux/`` permanently
+excluded). The legacy ``pux export`` verb + the hardcoded ``_collect_org_files``
+allowlist are GONE (permanent contract — see ``tests/export``); there is NO
+silent alias. Use ``pux pack``.
 
 Archive layout (mirrors the project tree, scoped to what the org uses)::
 
@@ -64,6 +71,11 @@ from pux_harness.agent.orgs import (
 )
 from pux_harness.kit._paths import _PROJECT_ROOT_ENV
 from pux_harness.kit._paths import project_root as _default_project_root
+from pux_harness.manifest import (
+    collect_pack_files,
+    load_manifest,
+    manifest_metadata,
+)
 
 
 # --- runtime scaffold (F3): turn the primitives archive into a RUNNABLE package --
@@ -260,45 +272,24 @@ install `pux-harness` and use `compile_org` from there.
 
 
 def _collect_org_files(org_dir: Path) -> dict[str, Path]:
-    """Map of archive-relative-path -> host-path for every file in the org dir.
+    """.. removed:: P3
 
-    Paths are normalized so ``orgs/specialists/<name>/`` is exported as
-    ``orgs/<name>/`` — the consumer shouldn't care about the host layout.
+    The hardcoded-dir allowlist (``("agents","skills","sandbox","config")`` +
+    core files, ``data`` excluded by hand-comment) is GONE. Org-local
+    collection is now **default-deny via the declarative manifest** — see
+    :mod:`pux_harness.manifest` (:func:`~pux_harness.manifest.collect_pack_files`,
+    driven by ``package.include``/``exclude`` globs in ``org.yaml``).
+
+    This stub exists ONLY so a stale ``from pux_harness.pack import
+    _collect_org_files`` raises a loud, explicit error instead of an opaque
+    ``ImportError`` — the permanent contract form of "the old allowlist must
+    not come back" (re-adding the real collector here trips
+    ``tests/export/test_export.py::test_legacy_allowlist_collector_is_removed``).
     """
-    files: dict[str, Path] = {}
-    if not org_dir.is_dir():
-        return files
-
-    org_name = org_dir.name
-
-    # Core files (always include if present)
-    for name in (
-        "AGENTS.md", "org.yaml", "profile.yaml", "policy.yaml", "Dockerfile",
-    ):
-        p = org_dir / name
-        if p.is_file():
-            files[f"orgs/{org_name}/{name}"] = p
-
-    # Recursive dirs. ``data`` is DELIBERATELY ABSENT: it holds runtime state
-    # (auth sessions, market data, campaign state), frequently live secrets
-    # (e.g. ``.twitter-session.json`` browser cookies). Bundling it would leak
-    # credentials into the export archive. See test_export.py's
-    # ``test_collect_org_files_excludes_data_dir`` for the permanent contract.
-    for dirname in ("agents", "skills", "sandbox", "config"):
-        d = org_dir / dirname
-        if not d.is_dir():
-            continue
-        for path in sorted(d.rglob("*")):
-            if path.is_file():
-                try:
-                    path.read_bytes()  # verify readability
-                except (PermissionError, OSError):
-                    continue
-                # Normalize: orgs/specialists/<name>/X -> orgs/<name>/X
-                rel_to_org = path.relative_to(org_dir)
-                files[f"orgs/{org_name}/{rel_to_org}"] = path
-
-    return files
+    raise NotImplementedError(
+        "_collect_org_files was removed in P3 (manifest-driven default-deny "
+        "pack). Use pux_harness.manifest.collect_pack_files via pack_org()."
+    )
 
 
 def _resolve_shared_agents(org: str) -> dict[str, Path]:
@@ -329,7 +320,7 @@ def _resolve_shared_skills(
     """Shared skills referenced by agents' ``skills:`` frontmatter.
 
     ``project_root`` defaults to the kit's LIVE resolver (no import-time
-    snapshot) — per-call overridable so ``export_org`` can thread a tmp root."""
+    snapshot) — per-call overridable so ``pack_org`` can thread a tmp root."""
     root = project_root if project_root is not None else _default_project_root()
     files: dict[str, Path] = {}
     shared_skills = _orgs_dir() / "_shared" / "skills"
@@ -534,13 +525,17 @@ def _build_manifest(
     org: str,
     files: dict[str, Path],
     scaffold: dict[str, bytes] | None = None,
+    manifest: Any = None,
 ) -> dict[str, Any]:
-    """Machine-readable inventory of the exported archive.
+    """Machine-readable inventory of the packed archive.
 
     ``files`` are the org primitives (host Path sources); ``scaffold`` are the
     generated runnable-package files (vendored kit + pyproject + run.py + README)
     — routed to their own ``runtime_scaffold`` category so the org inventory
-    stays separable from the packaging machinery."""
+    stays separable from the packaging machinery. ``manifest`` (the parsed
+    :class:`~pux_harness.manifest.Manifest`) adds the declared audit surface
+    (``manifest_version``/``package``/``capabilities``/``dependencies``) under a
+    ``"manifest"`` key — what the org declared it ships/needs/can-do, NOT secrets."""
     org_slugs = org_agent_slugs(org)
     scaffold = scaffold or {}
     scaffold_keys = set(scaffold)
@@ -589,11 +584,12 @@ def _build_manifest(
 
     return {
         "org": org,
-        "description": f"Standalone runnable export of the {org} org",
+        "description": f"Standalone runnable pack of the {org} org",
         "agent_roster": org_slugs,
         "total_files": len(files) + len(scaffold),
         "categories": categories,
         "files": sorted(set(files) | scaffold_keys),
+        "manifest": manifest_metadata(manifest) if manifest else None,
     }
 
 
@@ -627,20 +623,25 @@ def _normalize_specialists_refs(data: bytes) -> bytes:
     return text.replace("orgs/specialists/", "orgs/").encode("utf-8")
 
 
-def export_org(
+def pack_org(
     org: str,
     output: Path | None = None,
     project_root: Path | None = None,
 ) -> Path:
-    """Export an org as a self-contained ``.tar.gz`` archive.
+    """Pack an org as a self-contained ``.tar.gz`` archive (the ``pux pack`` op).
 
-    ``project_root`` is AUTHORITATIVE: the export resolves the org, its shared
+    ``project_root`` is AUTHORITATIVE: the pack resolves the org, its shared
     agents/skills/sandbox, and tool servers against THIS root — even when it is
     a foreign tree (a standalone consumer app that lives next to its own
-    inference code, NOT the orchestrator). That is what makes an export
-    portable: ``export_org`` packages an org from *wherever it lives* without
-    needing a copy inside the orchestrator. It defaults to the kit's LIVE
-    resolver (``$PUX_PROJECT_ROOT`` or the CWD), mirroring ``kit.compile_org``.
+    inference code, NOT the orchestrator). That is what makes a pack portable:
+    ``pack_org`` packages an org from *wherever it lives* without needing a
+    copy inside the orchestrator. It defaults to the kit's LIVE resolver
+    (``$PUX_PROJECT_ROOT`` or the CWD), mirroring ``kit.compile_org``.
+
+    Org-local collection is **manifest-driven + default-deny**
+    (:func:`pux_harness.manifest.collect_pack_files` via ``package.include``
+    globs in ``org.yaml``); shared deps are inclusion-by-reference (only what
+    the org actually cites). ``data/``/``.pux/`` are never packed.
 
     Implementation note: the downstream resolvers (``discover_orgs``,
     ``_org_path``, ``_resolve_shared_agents``, ``_resolve_tool_servers``) all
@@ -663,14 +664,20 @@ def export_org(
 
         org_dir = _org_path(org)
 
+        # Load the declarative manifest FIRST — it drives default-deny
+        # collection of the org-local tree (package.include/exclude globs from
+        # org.yaml; defaults when the org declares no ``package:`` block).
+        manifest = load_manifest(org_dir, org)
+
         # 1. Root AGENTS.md (base prompt)
         root_agents_md = root / "AGENTS.md"
         files: dict[str, Path] = {}
         if root_agents_md.is_file():
             files["AGENTS.md"] = root_agents_md
 
-        # 2. Org-local files
-        files.update(_collect_org_files(org_dir))
+        # 2. Org-local files — MANIFEST-DRIVEN, default-deny (was the
+        # _collect_org_files allowlist). data/.pux pruned during the walk.
+        files.update(collect_pack_files(org_dir, manifest))
 
         # 3. Shared dependencies
         files.update(_resolve_shared_agents(org))
@@ -683,8 +690,9 @@ def export_org(
         # runs the org without pux-harness installed.
         scaffold = _build_runtime_scaffold(org)
 
-        # 5. Build manifest (accounts for primitives + the scaffold)
-        manifest = _build_manifest(org, files, scaffold)
+        # 5. Build manifest inventory (accounts for primitives + the scaffold +
+        # the declared audit surface from the parsed manifest).
+        inventory = _build_manifest(org, files, scaffold, manifest)
 
         # 5. Write tar.gz
         if output is None:
@@ -722,7 +730,7 @@ def export_org(
                 tar.addfile(info, BytesIO(data))
 
             # Add manifest
-            manifest_json = json.dumps(manifest, indent=2).encode()
+            manifest_json = json.dumps(inventory, indent=2).encode()
             info = tarfile.TarInfo(name=f"{org}/manifest.json")
             info.size = len(manifest_json)
             tar.addfile(info, BytesIO(manifest_json))
