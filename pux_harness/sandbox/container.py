@@ -310,6 +310,12 @@ class SandboxContainer:
             "FS_READWRITE=/sandbox/workspace,/sandbox/tmp",
             "DOCKER_HOST=unix:///var/run/docker.sock",
             "HOST_GATEWAY=host.docker.internal",
+            # Where pux serve (Agent Protocol) lives, so in-container prep jobs
+            # (e.g. warmup_webhook) + agent code can reach it. serve binds the
+            # Tailscale IP, so the container uses this host (host.docker.internal
+            # would NOT connect — serve isn't on the docker-gateway iface).
+            f"PUX_API_HOST={_env_str('PUX_API_HOST', '127.0.0.1')}",
+            f"PUX_API_PORT={_env_str('PUX_API_PORT', '9988')}",
         ]
         # Policy creds/cookies (required validated before this point). Appended
         # last → last-wins, matching Docker semantics.
@@ -730,6 +736,7 @@ def prepare(
     org: str,
     project_path: str | None = None,
     exec_client: Any | None = None,
+    universal_warmup: bool = False,
 ) -> list[dict[str, Any]]:
     """Run post-create, pre-agent prep jobs inside the sandbox container.
 
@@ -739,10 +746,19 @@ def prepare(
     Idempotency is delegated to the scripts themselves (file caches +
     SurrealDB UPSERTs make repeat runs cheap).
 
+    ``universal_warmup``: when True (the serve path), additionally run
+    ``warmup_webhook`` for EVERY org — not a policy job, so it covers orgs that
+    declare no ``jobs:`` — verifying the run-completion event endpoint
+    (``pux serve`` ``/events/health``) is reachable from this sandbox, so a
+    webhook-less client (Hermes) can observe completions. The ``direct`` path
+    leaves it False (no serve in direct mode => the check would always fail).
+
     Uses lazy imports to avoid circular dependency with docker_exec.
     """
+    import time  # noqa: PLC0415
+
     from pux_harness.sandbox.docker_exec import DockerExecClient  # noqa: PLC0415
-    from pux_harness.sandbox.jobs import run_jobs  # noqa: PLC0415
+    from pux_harness.sandbox.jobs import JobResult, run_jobs  # noqa: PLC0415
 
     if not project_path:
         project_path = resolve_project_path()
@@ -750,18 +766,42 @@ def prepare(
     try:
         pol = policy.load(org, project_path)
     except policy.NoPolicy:
-        return []
+        pol = None
 
-    specs = policy.job_specs(pol)
-    if not specs:
+    specs = policy.job_specs(pol) if pol is not None else []
+
+    # Universal warmup needs a container even when the org declares no policy
+    # jobs (it is the "for ALL sandboxes" step). Otherwise the historical
+    # short-circuit stands: no declared jobs => no container touched here.
+    if not specs and not universal_warmup:
         return []
 
     if exec_client is None:
         sb = SandboxContainer(project_path=project_path, org=org)
-        container_name = sb.ensure()
-        exec_client = DockerExecClient(container=container_name)
+        exec_client = DockerExecClient(container=sb.ensure())
 
-    results = run_jobs(pol, exec_client)
+    results: list[JobResult] = list(run_jobs(pol, exec_client)) if specs else []
+
+    if universal_warmup:
+        # ALL serve sandboxes: prove the run-completion notification path is
+        # alive from this container before the agent loop. Warn-and-continue.
+        t0 = time.monotonic()
+        try:
+            out, rc = exec_client.exec(
+                "python3 orgs/_shared/sandbox/warmup_webhook.py", timeout=30
+            )
+            results.append(JobResult(
+                name="warmup_webhook",
+                status="ok" if rc == 0 else "failed",
+                error=None if rc == 0 else (out[-500:] if out else f"exit {rc}"),
+                duration=time.monotonic() - t0,
+            ))
+        except Exception as exc:  # noqa: BLE001 - prep must never block the run
+            results.append(JobResult(
+                name="warmup_webhook", status="failed",
+                error=str(exc)[:500], duration=time.monotonic() - t0,
+            ))
+
     return [
         {"name": r.name, "status": r.status, "error": r.error, "duration": round(r.duration, 1)}
         for r in results

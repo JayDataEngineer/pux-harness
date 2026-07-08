@@ -77,6 +77,7 @@ from pux_harness.threads import open_thread_store
 from pux_harness.agent.orgs import discover_orgs, org_agent_slugs
 from pux_harness.agent.profile import default_rubric
 from pux_harness.agent.tool_servers import resolve_tool_servers
+from pux_harness.run_events import EventBus
 
 PUX_API_HOST = os.environ.get("PUX_API_HOST", "127.0.0.1")
 PUX_API_PORT = int(os.environ.get("PUX_API_PORT", "9988"))
@@ -249,6 +250,16 @@ async def lifespan(app: FastAPI):
 
         app.state.base_store = InMemoryStore()
 
+        # Run-completion event bus — the receiver-of-last-resort that lives ON
+        # the pux side (see run_events.py). An MCP client with no webhook
+        # receiver (Hermes) subscribes to GET /events/stream once and gets every
+        # background-run completion across all orgs, instead of polling
+        # list_runs. Persisted to .pux/run_events.jsonl for cross-restart
+        # catch-up (.pux is HARD_EXCLUDE from packs).
+        from pux_harness.kit._paths import project_root  # noqa: PLC0415
+
+        app.state.events = EventBus(log_path=project_root() / ".pux" / "run_events.jsonl")
+
         # Load foreign MCP tool servers for every org that declares them.
         from pux_harness.agent.mcp_client import McpSessionManager  # noqa: PLC0415
 
@@ -417,6 +428,48 @@ async def _invoke_once(org: str, thread_id: str, body: Any, recursion_limit: int
 @app.get("/ok")
 async def health() -> dict[str, Any]:
     return {"ok": True, "orgs": discover_orgs()}
+
+
+# --- run-completion event stream (receiver-of-last-resort for webhook-less
+# MCP clients like Hermes; see run_events.py) ------------------------------
+
+
+@app.get("/events/health")
+async def events_health() -> dict[str, Any]:
+    return app.state.events.health()
+
+
+@app.get("/events")
+async def events_list(since: str | None = None, limit: int = 100) -> dict[str, Any]:
+    """Recent run-completion events (catch-up / poll). ``since`` is an ISO-8601
+    ts; events with ``ts > since`` are returned. A webhook-less client polls
+    this instead of per-thread ``list_runs``."""
+    return {"events": app.state.events.recent(since=since, limit=limit)}
+
+
+@app.get("/events/stream")
+async def events_stream() -> StreamingResponse:
+    """Live SSE feed of EVERY background-run completion across all orgs. A
+    webhook-less MCP client (Hermes) subscribes here once and receives
+    ``event: run.completed`` frames as runs finish — no per-run ``webhook_url``
+    and no receiver to host. Reconnect + ``GET /events?since=<last ts>`` resyncs
+    anything missed (the bus drops to a slow subscriber)."""
+
+    async def gen() -> Any:
+        q = app.state.events.subscribe()
+        try:
+            yield _sse("metadata", {"stream": "run_events"})
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                except TimeoutError:  # asyncio.wait_for raises TimeoutError (3.11+)
+                    yield ": keep-alive\n\n"  # SSE comment — holds the conn open
+                    continue
+                yield _sse(str(ev.get("event", "run.completed")), ev)
+        finally:
+            app.state.events.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 # --- agents (introspection) ---------------------------------------------------
@@ -700,7 +753,10 @@ async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -
     try:
         from pux_harness.sandbox.container import prepare  # noqa: PLC0415
 
-        job_results = prepare(org)
+        # universal_warmup=True => every serve sandbox also probes the
+        # run-completion event endpoint (so a webhook-less client like Hermes
+        # can observe this run's finish). direct-mode (main.py) leaves it off.
+        job_results = prepare(org, universal_warmup=True)
         from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
 
         _watch_url = SandboxContainer(org=org).watch_url
@@ -735,6 +791,14 @@ async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -
     # reached a terminal state (success/interrupted/error) WITHOUT it polling
     # list_runs. Best-effort — _dispatch_run_webhook swallows delivery failures.
     await _dispatch_run_webhook(app.state.run_meta[run_id])
+    # Same completion, second channel: fan to the in-process event bus so an MCP
+    # client with NO webhook receiver (Hermes — "can't make webhooks on the
+    # sandbox") can subscribe to GET /events/stream once and get every background
+    # run's completion across all orgs. Identical payload to the outbound POST.
+    await app.state.events.publish(
+        {k: v for k, v in app.state.run_meta[run_id].items() if k != "webhook_url"}
+        | {"event": "run.completed"}
+    )
 
 
 @app.post("/threads/{thread_id}/runs")
