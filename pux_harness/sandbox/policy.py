@@ -26,6 +26,7 @@ Design notes that survive the port:
   the host but do inside the container via ``/etc/hosts``; the boot script
   resolves them via ``getent`` (no network).
 """
+
 from __future__ import annotations
 
 import ipaddress
@@ -338,8 +339,7 @@ def _policy_from_dict(d: Mapping) -> Policy:
         dynamic_tools = False
     elif not isinstance(dynamic_tools_raw, bool):
         raise PolicyError(
-            f"policy: sandbox.dynamic_tools must be a bool, "
-            f"got {type(dynamic_tools_raw).__name__}"
+            f"policy: sandbox.dynamic_tools must be a bool, got {type(dynamic_tools_raw).__name__}"
         )
     else:
         dynamic_tools = dynamic_tools_raw
@@ -369,14 +369,17 @@ def _policy_from_dict(d: Mapping) -> Policy:
         exports_raw = h.get("exports") or {}
         if not isinstance(exports_raw, Mapping):
             raise PolicyError(
-                f"policy: host_setup entry {h.get('name')!r} exports must be a mapping")
-        hooks.append(HostSetupHook(
-            name=str(h.get("name", "") or ""),
-            helper_script=str(h.get("helper_script", "") or ""),
-            python_deps=[str(x) for x in (h.get("python_deps") or [])],
-            args=[str(x) for x in (h.get("args") or [])],
-            exports={str(k): str(v) for k, v in exports_raw.items()},
-        ))
+                f"policy: host_setup entry {h.get('name')!r} exports must be a mapping"
+            )
+        hooks.append(
+            HostSetupHook(
+                name=str(h.get("name", "") or ""),
+                helper_script=str(h.get("helper_script", "") or ""),
+                python_deps=[str(x) for x in (h.get("python_deps") or [])],
+                args=[str(x) for x in (h.get("args") or [])],
+                exports={str(k): str(v) for k, v in exports_raw.items()},
+            )
+        )
     pol.host_setup = hooks
     # jobs: a list of in-sandbox prep steps (run after create(), produce
     # artifacts, not env exports). Absent or empty -> no jobs.
@@ -387,14 +390,16 @@ def _policy_from_dict(d: Mapping) -> Policy:
     for j in jobs_raw:
         if not isinstance(j, Mapping):
             raise PolicyError("policy: each jobs entry must be a mapping")
-        jobs.append(JobSpec(
-            name=str(j.get("name", "") or ""),
-            script=str(j.get("script", "") or ""),
-            args=[str(x) for x in (j.get("args") or [])],
-            timeout=int(j.get("timeout", 0) or 0),
-            description=str(j.get("description", "") or ""),
-            when=str(j.get("when", "") or ""),
-        ))
+        jobs.append(
+            JobSpec(
+                name=str(j.get("name", "") or ""),
+                script=str(j.get("script", "") or ""),
+                args=[str(x) for x in (j.get("args") or [])],
+                timeout=int(j.get("timeout", 0) or 0),
+                description=str(j.get("description", "") or ""),
+                when=str(j.get("when", "") or ""),
+            )
+        )
     pol.jobs = jobs
     # tool_servers: a list of foreign MCP server declarations (strings for
     # catalog refs, or mappings for inline/catalog-ref-with-override). Absent
@@ -512,7 +517,10 @@ def env_vars(p: Policy | None, env: Mapping[str, str] | None = None) -> list[str
     if p.browser.cookies_env:
         v = e.get(p.browser.cookies_env, "")
         if v:
-            out.append(f"{p.browser.cookies_env}={v}")
+            # Avoid duplicate: if cookies_env is already in credentials.required,
+            # it was injected above — only add the SEED_COOKIES_ENV pointer here.
+            if p.browser.cookies_env not in p.credentials.required:
+                out.append(f"{p.browser.cookies_env}={v}")
             out.append(f"SEED_COOKIES_ENV={p.browser.cookies_env}")
     if p.browser.proxy:
         out.append(f"SB_SERVER_PROXY={p.browser.proxy}")
@@ -544,9 +552,7 @@ def _expand_placeholders(
     return expanded, first
 
 
-def resolve_mounts(
-    p: Policy | None, env: Mapping[str, str] | None = None
-) -> list[ResolvedMount]:
+def resolve_mounts(p: Policy | None, env: Mapping[str, str] | None = None) -> list[ResolvedMount]:
     """Walk ``p.Workspace.Mounts``: expand ``${VAR}``, require absolute
     container paths, normalize mode. Raises ``UnresolvedMount`` on the first
     unset var (fail-fast) and ``PolicyError`` on a bad path/mode."""
