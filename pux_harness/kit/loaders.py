@@ -32,6 +32,7 @@ from typing import Any
 import yaml
 
 from . import _paths
+from .capabilities_decl import desugar_agent_capabilities
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -456,6 +457,14 @@ def _load_agent_spec(
         path = d / f"{look}.md"
         if path.is_file():
             fm, body = _split_frontmatter(path.read_text())
+            # CU-3: desugar an opt-in ``capabilities:`` block (kind ∈ {tool,
+            # skill}) into this agent's ``tools:`` / ``skills:`` — BEFORE the
+            # ``extends:`` merge so a parent's ``capabilities:`` becomes the
+            # parent's tools/skills and the existing inheritance machinery
+            # operates on the desugared form. A malformed block raises
+            # ``CapabilitiesSugarError`` (the contract surfaces it as
+            # ``capabilities-sugar-agent``); ``None``/no-block is a no-op.
+            fm = desugar_agent_capabilities(fm, slug)
             extends = fm.pop("extends", None)
             if extends is not None:
                 if not isinstance(extends, str) or not extends.strip():

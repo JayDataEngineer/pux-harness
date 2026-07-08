@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +91,10 @@ from pux_harness.sandbox.tools import (
     prefixed,
 )
 from pux_harness.kit._paths import project_root
+from pux_harness.kit.capabilities_decl import (
+    CapabilitiesSugarError,
+    desugar_agent_capabilities,
+)
 from pux_harness.agent.orgs import (
     _agent_search_dirs,
     _load_agent_spec,
@@ -135,11 +139,18 @@ _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 @dataclass(frozen=True)
 class Violation:
     """One contract failure. ``severity`` is "error" (fails green) or "warn"
-    (SHOULD). The green gate treats only errors as blocking."""
+    (SHOULD). The green gate treats only errors as blocking.
+
+    ``kind`` (optional) tags the violation with the unified capability taxonomy
+    (``tool`` / ``skill`` / ``mcp`` / ``middleware`` / ``job``) so the unified
+    ``_validate_capabilities`` pass + the ``pux capabilities`` CLI can report
+    under ONE taxonomy. ``None`` = the violation is not a capability-channel
+    violation (org-structural, policy-section, etc.)."""
 
     severity: str  # "error" | "warn"
     rule: str
     message: str
+    kind: str | None = None
 
     def __str__(self) -> str:
         return f"[{self.severity.upper()}] {self.rule}: {self.message}"
@@ -222,6 +233,36 @@ def _agent_extends_chain_violations(slug: str, org: str) -> list[Violation]:
         chain.append(parent)
         visited.add(parent)
         cur = parent
+
+
+def _capabilities_sugar_agent_violations(slug: str, org: str) -> list[Violation]:
+    """Validate an agent's opt-in frontmatter ``capabilities:`` block (CU-3) —
+    a dedicated rule so a malformed block (wrong kind for the home, bad shape,
+    unknown kind) fires the precise ``capabilities-sugar-agent`` message,
+    independent of ``_load_agent_spec``'s own desugar (which raises + would
+    surface as a generic ``agent-resolves``). Reads RAW frontmatter (NO merge),
+    runs ``desugar_agent_capabilities`` on a copy to validate, returns ``[]`` for
+    an agent with no ``capabilities:`` (the common case) or unreadable
+    frontmatter (``agent-resolves`` / ``no-legacy-agent-py`` own that). Callers
+    skip the load when this returns non-empty so the same fault isn't reported
+    twice."""
+    path = _first_agent_md(slug, org)
+    if path is None:
+        return []  # agent-resolves owns a missing .md
+    try:
+        fm, _ = _split_frontmatter(path.read_text())
+    except ValueError:
+        return []  # agent-resolves owns bad frontmatter
+    if "capabilities" not in fm:
+        return []
+    try:
+        desugar_agent_capabilities(dict(fm), slug)  # validate on a copy
+    except CapabilitiesSugarError as exc:
+        return [Violation(
+            "error", "capabilities-sugar-agent",
+            f"{org}/{slug}: malformed capabilities: block — {exc}",
+        )]
+    return []
 
 
 def _org_extends_chain_violations(name: str) -> list[Violation]:
@@ -413,6 +454,14 @@ def check_org(name: str) -> list[Violation]:
         if extends_vs:
             v.extend(extends_vs)
             continue
+        # CU-3: validate an opt-in frontmatter ``capabilities:`` block (specific
+        # rule) BEFORE the desugar inside ``_load_agent_subagent`` raises a
+        # generic ``agent-resolves``. A malformed block skips the load so the
+        # same fault isn't reported twice.
+        sugar_vs = _capabilities_sugar_agent_violations(slug, name)
+        if sugar_vs:
+            v.extend(sugar_vs)
+            continue
         try:
             sub = _load_agent_subagent(slug, name)
         except Exception as exc:
@@ -474,17 +523,18 @@ def check_org(name: str) -> list[Violation]:
                                    f"pux_sandbox_* specialist, a declared "
                                    f"sandbox tool, or a pux_dyn_* dynamic tool"))
 
-    # Declared sandbox tools are their own channel (policy-independent): validate
-    # every org unconditionally, even those with no ``policy.yaml``. No-op when
-    # the org declares no ``sandbox/tools/tools.yaml``.
-    v.extend(_validate_sandbox_tools(name))
-    # The exec-guard (declared ⇒ taken out of ``execute``) is wired through
-    # ``RoutingMiddleware``; if an org that DECLARES tools also removes routing,
-    # the guard is silently off and the dual-path re-opens. Warn (not error):
-    # an org may legitimately shed routing, but not silently while declaring tools.
-    v.extend(_validate_declared_exec_guard(name))
+    # The model add-on capability channels (declared sandbox tools, the
+    # exec-guard, jobs, MCP tool_servers) are validated in ONE unified pass
+    # below — ``_validate_capabilities`` delegates to the UNCHANGED leaf
+    # validators and tags each violation with the unified ``kind`` taxonomy.
+    # Declared tools + exec-guard are policy-independent (every org); jobs +
+    # tool_servers are policy-gated (run only when ``pol`` resolved below).
 
-    # Rule 5: policy.yaml parses + valid schema + known sections.
+    # Rule 5: policy.yaml parses + valid schema + known sections. ``pol`` is
+    # hoisted here so the unified capability pass (after this block) can gate
+    # the policy-dependent leaves on it — it stays ``None`` for orgs with no
+    # policy.yaml or a malformed one.
+    pol: policy_mod.Policy | None = None
     policy_path = org_dir / "policy.yaml"
     if policy_path.is_file():
         try:
@@ -500,7 +550,6 @@ def check_org(name: str) -> list[Violation]:
                                    f"{name}: policy.yaml unknown sections "
                                    f"{bad}; allowed: "
                                    f"{sorted(KNOWN_POLICY_SECTIONS)}"))
-            pol = None
             try:
                 pol = policy_mod.load(name, _orgs_dir().parent)
                 policy_mod.resolve_mounts(pol)
@@ -512,13 +561,21 @@ def check_org(name: str) -> list[Violation]:
             if pol is not None:
                 v.extend(_validate_host_setup(name, pol))
                 v.extend(_validate_build_spec(name, pol))
-                v.extend(_validate_jobs(name, pol))
-                v.extend(_validate_tool_servers(name, pol))
+                # ``_validate_jobs`` (kind=job) + ``_validate_tool_servers``
+                # (kind=mcp) are routed through the unified capability pass
+                # below so they report under the ``kind`` taxonomy too.
                 v.extend(_validate_protocols(name, pol))
         elif parsed is not None:
             v.append(Violation("error", "policy-shape",
                                f"{name}: policy.yaml top-level must be a "
                                f"mapping, got {type(parsed).__name__}"))
+
+    # ONE unified capability pass — the CU-2 front-door. Wraps the four
+    # model-add-on leaf validators (sandbox tools, exec-guard, jobs,
+    # tool_servers) and tags each violation by ``kind``. Same violations as
+    # the scattered calls it replaces (gate: the contract suite), now one row
+    # of vocabulary.
+    v.extend(_validate_capabilities(name, pol))
 
     # Optional per-org harness profile. Off by default — most orgs
     # ship none. If present, it must parse into HarnessProfileConfig (unknown
@@ -773,6 +830,43 @@ def _validate_declared_exec_guard(name: str) -> list[Violation]:
     if prof is not None and prof.excluded_middleware:
         removed |= set(prof.excluded_middleware)
     return _declared_exec_guard_violation(True, "routing" in removed, name)
+
+
+def _validate_capabilities(
+    name: str, pol: policy_mod.Policy | None,
+) -> list[Violation]:
+    """ONE contract pass over the org's capability channels — the unified
+    front-door (``docs/capability-unification.md`` CU-2). Delegates to the
+    UNCHANGED leaf validators (each remains the engine behind it), then tags
+    every resulting ``Violation`` with the unified ``kind`` taxonomy
+    (``tool | skill | mcp | middleware | job``) so the report + the
+    ``pux capabilities`` CLI speak one vocabulary.
+
+    Wraps the model add-on channels only — ``_validate_protocols`` (the
+    ACP/Agent-Protocol SURFACE, not a model add-on) stays a separate pass.
+    Skill well-formedness is fleet-level (``check_skill_roots``), not per-org.
+
+    Leaves:
+    - ``_validate_sandbox_tools`` (kind=tool) + ``_validate_declared_exec_guard``
+      (kind=tool): run for every org (declared tools are policy-independent).
+    - ``_validate_jobs`` (kind=job) + ``_validate_tool_servers`` (kind=mcp):
+      policy-gated — only when ``pol`` resolved (a policy.yaml exists + parsed).
+
+    Kind-tagging is purely additive: the leaf ``rule``/``severity``/``message``
+    are untouched, so every existing membership-based contract assertion
+    (``any(v.rule == ...)``) holds unchanged. The contract suite gates the move:
+    the SAME violations must surface on the negative fixtures, just tagged.
+    """
+    out: list[Violation] = []
+    for leaf_kind, leaf in (
+        ("tool", lambda: _validate_sandbox_tools(name)),
+        ("tool", lambda: _validate_declared_exec_guard(name)),
+        ("job", lambda: _validate_jobs(name, pol) if pol is not None else []),
+        ("mcp", lambda: _validate_tool_servers(name, pol) if pol is not None else []),
+    ):
+        for violation in leaf():
+            out.append(replace(violation, kind=leaf_kind))
+    return out
 
 
 # --- global checks (rules 6-7) -------------------------------------------

@@ -51,7 +51,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import httpx
 from deepagents import RubricMiddleware
@@ -71,14 +71,12 @@ from pux_harness.agent.orgs import (
     _org_path,
     build_system_prompt,
     load_subagents,
-    supervisor_skills_roots,
 )
 from pux_harness.agent.profile import (
     HarnessProfileConfig,
     MiddlewareOverrides,
     apply_profile_to_tools,
     load_ask_user_enabled,
-    load_dynamic_tools_enabled,
     load_middleware_overrides,
     load_model_retry,
     load_tool_retry,
@@ -91,13 +89,12 @@ from pux_harness.context.browser_vision import (
 from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
 from pux_harness.context.session_guide import SessionGuideMiddleware
+from pux_harness.agent.capabilities import CapabilityResolver
 from pux_harness.sandbox.tools import build_grader_tools
 from pux_harness.sandbox.tools.declared import (
-    build_declared_tools,
     build_script_redirects,
     load_declared_specs,
 )
-from pux_harness.sandbox.tools.dynamic import build_dynamic_tools
 
 __all__ = [
     "Scope",
@@ -623,32 +620,27 @@ def build_stack(
     )
     ctx_tools = list(ctx.emitted_tools_supervisor)
 
-    # Declared sandbox tools: org-local ``sandbox/tools/tools.yaml`` -> typed
-    # ``pux_sandbox_*`` StructuredTools whose ``func`` exec's the script
-    # IN-CONTAINER. Empty for orgs that declare none (byte-identical stack).
-    # They share the specialist prefix, so they key into the same ``tool_map``
-    # and resolve through the same agent ``tools:`` allowlist as REGISTRY
-    # specialists (``_resolve_tools`` admits anything present in the map).
-    declared = build_declared_tools(_org_path(org) / "sandbox", exec_client)
-
-    # Dynamic (level c) tools — opt-in via ``sandbox.dynamic_tools: true``. The
-    # four ``pux_dyn_*`` tools let the agent author + call persistent Python
-    # under ``orgs/<org>/lib/`` (see ``docs/dynamic-tools-and-packaging.md``
-    # Part 1). Byte-identical stack ([]) for orgs that do not opt in. Rides the
-    # SAME surface as specialists/declared so a subagent can be granted one via
-    # its ``tools:`` allowlist.
-    dynamic = (
-        build_dynamic_tools(_org_path(org) / "lib", exec_client)
-        if load_dynamic_tools_enabled(org)
-        else []
+    # The capability facade — ONE front-door for the org-local tool + skill
+    # channels (declared sandbox tools, dynamic lib/ functions, skills roots),
+    # with the runtime-resolved specialists + mcp fed in. Dispatches by `kind`
+    # to the unchanged leaf resolvers (build_declared_tools /
+    # build_dynamic_tools / supervisor_skills_roots); CU-1 is ZERO behavior
+    # change — the composed lists below are byte-identical to the former inline
+    # build (parity: ``tests/harness/test_capability_resolver.py``). The
+    # declared + dynamic tools share the specialist prefix, so they key into the
+    # same ``tool_map`` and resolve through the same agent ``tools:`` allowlist
+    # as REGISTRY specialists. See ``capabilities.py`` +
+    # ``docs/capability-unification.md``.
+    caps = CapabilityResolver(exec_client).resolve(
+        org, specialists=specialists, mcp_tools=mcp_tools,
     )
 
     # Tools: MCP tools first (so profile overrides can shape them), then every
     # specialist + declared + dynamic + the retrieval surface. Declared + dynamic
     # tools ride the SAME surface as specialists so the supervisor can call them
     # AND a subagent can be granted one via its ``tools:`` allowlist.
-    tools_surface: list[BaseTool] = [*specialists, *declared, *dynamic]
-    supervisor_tools: list[BaseTool] = [*mcp_tools, *tools_surface, *ctx_tools]
+    tools_surface: list[BaseTool] = caps.tools_surface
+    supervisor_tools: list[BaseTool] = [*caps.mcp, *tools_surface, *ctx_tools]
     if profile is not None:
         supervisor_tools = apply_profile_to_tools(supervisor_tools, profile)
 
@@ -725,7 +717,7 @@ def build_stack(
         supervisor_middleware=supervisor_middleware,
         supervisor_prompt=prompt,
         subagents=subagents,
-        supervisor_skills=supervisor_skills_roots(org),
+        supervisor_skills=caps.skill_roots,
     )
 
 

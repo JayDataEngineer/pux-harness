@@ -24,7 +24,8 @@ from typing import Any
 
 import yaml
 
-from pux_harness.agent.orgs import _orgs_dir
+from pux_harness.agent.orgs import _org_path, _orgs_dir
+from pux_harness.kit.capabilities_decl import org_mcp_items_from_dict
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -296,6 +297,38 @@ def load_catalog() -> dict[str, ToolServerSpec]:
 # --- resolution --------------------------------------------------------------
 
 
+def _org_yaml_mcp_items(org: str) -> list:
+    """CU-3 sugar: the ``mcp`` entries from this org's OWN ``org.yaml``
+    ``capabilities:`` block, in the same shape ``resolve_tool_servers`` consumes
+    (a bare catalog-ref string, or a ``{ref, tools}`` mapping). Reads the org's
+    OWN ``org.yaml`` only — NO inheritance, because mcp is security-scoped (the
+    same reason ``policy.yaml`` is never inherited). Returns ``[]`` when the org
+    ships no ``org.yaml`` or no ``capabilities:`` block.
+
+    A malformed block (wrong kind for the home, bad shape) raises
+    ``CapabilitiesSugarError`` — surfaced by ``validate_tool_servers`` (which
+    calls ``resolve_tool_servers`` with ``permissive=True`` and catches
+    ``ValueError``) as a ``tool-servers`` contract violation. Never silently
+    skipped."""
+    # ``_org_path`` raises ``FileNotFoundError`` for an org that isn't on disk
+    # (a scratch test org, an exported-runner stub) — that means there's no
+    # ``org.yaml`` mcp sugar to merge, so return ``[]`` (not propagate): mcp is
+    # optional, and the only declaration site for such an org is policy.yaml.
+    try:
+        path = _org_path(org) / "org.yaml"
+    except FileNotFoundError:
+        return []
+    if not path.is_file():
+        return []
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    return org_mcp_items_from_dict(data, org)
+
+
 def resolve_tool_servers(
     org: str,
     env: dict[str, str] | None = None,
@@ -326,10 +359,24 @@ def resolve_tool_servers(
     try:
         pol = policy_mod.load(org, _orgs_dir().parent)
     except NoPolicy:
-        return []
+        pol = None
     except (FileNotFoundError, ValueError):
-        return []
-    items = policy_mod.tool_server_items(pol)
+        # A malformed policy is the ``policy-parse`` rule's job, not
+        # ``tool-servers``' — don't double-report. Fall through with no policy
+        # items; org.yaml mcp sugar is still checked (it's a separate site).
+        pol = None
+    # policy.yaml ``tool_servers:`` items (empty when the org ships no policy or
+    # the policy has no tool_servers block).
+    items = policy_mod.tool_server_items(pol) if pol is not None else []
+    # CU-3 sugar: merge ``mcp`` entries declared in ``org.yaml capabilities:``
+    # (same shape as policy ``tool_servers:`` items — bare catalog-ref string or
+    # ``{ref, tools}`` allowlist override). They resolve IDENTICALLY to policy
+    # entries below, so runtime + the offline ``validate_tool_servers`` contract
+    # (which calls this with ``permissive=True``) cover them in one path.
+    # org.yaml is the org's primary descriptor — its mcp sugar resolves STANDALONE
+    # (an org with org.yaml mcp but no policy.yaml still gets its servers); the
+    # NoPolicy fall-through above is what makes that work.
+    items = [*items, *_org_yaml_mcp_items(org)]
     if not items:
         return []
 
