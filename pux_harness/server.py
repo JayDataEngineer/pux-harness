@@ -164,6 +164,15 @@ async def lifespan(app: FastAPI):
         app.state.runs: dict[str, asyncio.Task] = {}
         app.state.run_meta: dict[str, dict[str, Any]] = {}
         app.state.mcp: dict[str, list[BaseTool]] = {}
+        # ONE shared long-term-memory store (BaseStore) for every org + the
+        # /store/* REST surface. Namespaces isolate tenants/threads, so a single
+        # store is correct (and the only way a REST ``put_item`` is visible to a
+        # graph's memory tools — previously each org built a private InMemoryStore
+        # in ``_get_graph``, invisible across the seam). Ephemeral by default
+        # (matches the localhost single-user model); swap to AsyncSqliteStore for
+        # persistence in a follow-up.
+        from langgraph.store.memory import InMemoryStore  # noqa: PLC0415
+        app.state.base_store = InMemoryStore()
 
         # Load foreign MCP tool servers for every org that declares them.
         from pux_harness.agent.mcp_client import McpSessionManager  # noqa: PLC0415
@@ -240,8 +249,6 @@ except ImportError:
 
 def _get_graph(org: str) -> CompiledStateGraph:
     if org not in app.state.graphs:
-        from langgraph.store.memory import InMemoryStore  # noqa: PLC0415
-        store = InMemoryStore()
         # ``serve`` hosts BOTH the AG-UI SSE surface (the live web path —
         # CopilotKit ``useInterrupt`` resolves an ask_user) AND the REST lane
         # (SSE stream + polled endpoints). One graph serves both, so ask_user
@@ -251,8 +258,11 @@ def _get_graph(org: str) -> CompiledStateGraph:
         # client resumes via ``command={"resume": ...}`` (over SSE the interrupt
         # is a stream event; over the polled lane it's the run's status).
         # ``PUX_AUTONOMOUS`` drops ask_user entirely (headless serve).
+        # The store is the SHARED ``app.state.base_store`` (created in the
+        # lifespan) — so a ``/store/items`` put is visible to the graph's memory
+        # tools, and the REST + graph memory surfaces are one backend.
         app.state.graphs[org] = build_graph(
-            org, checkpointer=app.state.saver, store=store,
+            org, checkpointer=app.state.saver, store=app.state.base_store,
             facts=RuntimeFacts(transport="serve",
                                autonomous=autonomous_from_env()),
             mcp_tools=app.state.mcp.get(org, ()),
@@ -549,6 +559,117 @@ async def run_cancel(run_id: str) -> dict[str, Any]:
         task.cancel()
     meta["status"] = "cancelled"
     return meta
+
+
+# --- store / long-term memory -------------------------------------------------
+# The langgraph Store/Memory REST surface (the MEDIUM-priority Agent Protocol
+# gap). Backed by the SHARED ``app.state.base_store`` the graph also reads/writes
+# (``_get_graph`` passes it to ``build_graph``), so a memory written over REST is
+# visible to a graph's memory tools on the next run, and vice versa — one backend
+# across the seam. Routes + payloads match what ``langgraph_sdk``'s
+# ``StoreClient`` sends verbatim (the contract Studio + the SDK + any
+# langgraph-api client hits): PUT/GET/DELETE ``/store/items``,
+# POST ``/store/items/search``, POST ``/store/namespaces``.
+
+class StorePutItem(BaseModel):
+    namespace: list[str]
+    key: str
+    value: dict[str, Any]
+    index: bool | list[str] | None = None
+    ttl: float | None = None
+
+
+class StoreDeleteItem(BaseModel):
+    namespace: list[str]
+    key: str
+
+
+class StoreSearchItems(BaseModel):
+    namespace_prefix: list[str] = []
+    filter: dict[str, Any] | None = None
+    limit: int = 10
+    offset: int = 0
+    query: str | None = None
+    refresh_ttl: bool | None = None
+
+
+class StoreListNamespaces(BaseModel):
+    prefix: list[str] | None = None
+    suffix: list[str] | None = None
+    max_depth: int | None = None
+    limit: int = 100
+    offset: int = 0
+
+
+def _store_item(item: Any) -> dict[str, Any]:
+    """Serialize a langgraph ``Item`` to the SDK's expected shape: namespace
+    tuple → list, datetimes → ISO-8601 strings (``_jsonable`` mishandles both)."""
+    return {
+        "namespace": list(item.namespace),
+        "key": item.key,
+        "value": item.value,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+    }
+
+
+@app.put("/store/items")
+async def store_put_item(body: StorePutItem) -> dict[str, Any]:
+    """Upsert one item (the SDK ``StoreClient.put_item`` path). Namespace labels
+    may not contain ``.`` — the SDK joins the namespace on it for GET."""
+    for label in body.namespace:
+        if "." in label:
+            raise HTTPException(
+                status_code=422,
+                detail=f"namespace label {label!r} may not contain '.'",
+            )
+    await app.state.base_store.aput(
+        tuple(body.namespace), body.key, body.value, body.index, ttl=body.ttl,
+    )
+    return {}  # the SDK discards the PUT response
+
+
+@app.get("/store/items")
+async def store_get_item(
+    namespace: str, key: str, refresh_ttl: bool | None = None,
+) -> dict[str, Any]:
+    """Read one item by dotted namespace + key (the SDK ``get_item`` path). 404
+    when absent — the SDK raises for it."""
+    ns = tuple(namespace.split(".")) if namespace else ()
+    item = await app.state.base_store.aget(ns, key, refresh_ttl=refresh_ttl)
+    if item is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    return _store_item(item)
+
+
+@app.delete("/store/items")
+async def store_delete_item(body: StoreDeleteItem) -> dict[str, Any]:
+    """Remove one item (the SDK ``delete_item`` path)."""
+    await app.state.base_store.adelete(tuple(body.namespace), body.key)
+    return {}
+
+
+@app.post("/store/items/search")
+async def store_search_items(body: StoreSearchItems) -> dict[str, Any]:
+    """Search within a namespace prefix (the SDK ``search_items`` path). Returns
+    ``{"items": [...]}`` — the SDK unwraps the list itself."""
+    items = await app.state.base_store.asearch(
+        tuple(body.namespace_prefix),
+        query=body.query, filter=body.filter,
+        limit=body.limit, offset=body.offset, refresh_ttl=body.refresh_ttl,
+    )
+    return {"items": [_store_item(i) for i in items]}
+
+
+@app.post("/store/namespaces")
+async def store_list_namespaces(body: StoreListNamespaces) -> list[list[str]]:
+    """List namespaces under a prefix/suffix/depth (the SDK ``list_namespaces``
+    path). Returns the raw list of namespace paths."""
+    ns = await app.state.base_store.alist_namespaces(
+        prefix=body.prefix, suffix=body.suffix, max_depth=body.max_depth,
+        limit=body.limit, offset=body.offset,
+    )
+    return [list(n) for n in ns]
 
 
 # --- streaming (SSE) ---------------------------------------------------------
