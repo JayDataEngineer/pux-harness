@@ -23,6 +23,14 @@ from langchain_openai import ChatOpenAI
 from pux_harness.agent import model, profile
 
 
+def _model_id(m) -> str:
+    """Provider-agnostic model-id accessor — ``ChatOpenAI`` exposes
+    ``model_name``, ``ChatAnthropic`` exposes ``model``. Tests assert the
+    RESOLVED id is plumbed through regardless of which concrete class
+    ``get_model`` built (the harness serves both kinds now)."""
+    return getattr(m, "model_name", None) or getattr(m, "model", None)
+
+
 @pytest.fixture
 def _spec_cleared():
     """``model._spec`` is ``lru_cache``'d for the process; clear it so a test
@@ -59,7 +67,8 @@ def test_validate_models_spec_missing_file(tmp_path, _spec_cleared, monkeypatch)
 def test_validate_models_spec_missing_role(tmp_path, _spec_cleared, monkeypatch):
     """A tier missing one of the four role keys fails loud."""
     (tmp_path / "models.yaml").write_text(
-        "provider:\n  base_url: x\n"
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
         "tiers:\n  t:\n"
         "    base_model: a\n"
         "    worker_model: a\n"
@@ -202,9 +211,12 @@ def test_get_model_builds_on_resolved_id(monkeypatch):
 
 def test_get_model_literal_override(monkeypatch):
     """``get_model(model=...)`` builds on the literal id (the subagent-
-    frontmatter override path)."""
+    frontmatter override path). Covers BOTH provider kinds: glm-5.2 (anthropic)
+    and mimo-v2.5 (openai) — each builds on its own profile's protocol."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
-    assert model.get_model(model="glm-5.2").model_name == "glm-5.2"
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
+    assert _model_id(model.get_model(model="glm-5.2")) == "glm-5.2"
+    assert _model_id(model.get_model(model="mimo-v2.5")) == "mimo-v2.5"
 
 
 # --- per-role declared fallback chains -------------------------------------
@@ -276,20 +288,21 @@ def test_org_override_disables_fallbacks(fake_org_tree):
 
 
 def test_get_model_attaches_fallback_chain(monkeypatch):
-    """``get_model(role=base)`` returns a ``BaseChatModel`` (a
-    ``_FallbackReasoningChatOpenAI``) carrying the declared tier chain — NOT a
-    bare ``RunnableWithFallbacks`` (which crashes ``deepagents.resolve_model``).
-    The primary id is still the resolved role id; the chain ids are the declared
-    fallbacks. Proves the rely-on-upstream wiring (LangChain ``with_fallbacks``)
-    without a live call."""
+    """``get_model(role=base)`` returns a ``BaseChatModel`` (an anthropic-kind
+    ``_FallbackChatAnthropic`` for the shipped glm-5.2 default) carrying the
+    declared tier chain — NOT a bare ``RunnableWithFallbacks`` (which crashes
+    ``deepagents.resolve_model``). The primary id is still the resolved role id;
+    the chain ids are the declared fallbacks. Proves the rely-on-upstream wiring
+    (LangChain ``with_fallbacks``) without a live call."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     m = model.get_model(role="base")
     # MUST be a BaseChatModel — deepagents' resolve_model fast-path requires it.
     assert isinstance(m, BaseChatModel)
     # And NOT a RunnableWithFallbacks (the pre-fix shape that crashed pux serve).
     assert not isinstance(m, RunnableWithFallbacks)
-    assert m.model_name == "glm-5.2"
-    assert [fb.model_name for fb in m._fallback_models] == ["glm-5.1"]
+    assert _model_id(m) == "glm-5.2"
+    assert [_model_id(fb) for fb in m._fallback_models] == ["glm-5.1"]
 
 
 def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
@@ -302,6 +315,7 @@ def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
     startup crash. This is the EXACT gap that let the regression ship: bind_tools
     was proven but the model was never driven through the real deepagents seam."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     from deepagents._models import resolve_model
     m = model.get_model(role="base")
     # Fast-path: the BaseChatModel is returned as-is (no re-init, no string parse).
@@ -316,6 +330,7 @@ def test_fallback_model_builds_in_real_deepagent_factory(monkeypatch):
     the model is the strongest guarantee that ``pux serve`` boots. No network —
     the model is never invoked, only assembled."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     from deepagents import create_deep_agent
     m = model.get_model(role="base")
     graph = create_deep_agent(
@@ -337,12 +352,14 @@ def test_get_model_without_fallbacks_is_plain_chat(monkeypatch):
 
 
 def test_get_model_override_skips_fallback_chain(monkeypatch):
-    """An explicit ``model=`` literal returns a plain ChatOpenAI on that id — the
-    tier chain is NOT attached (a hard pin has no failover)."""
+    """An explicit ``model=`` literal returns a plain model on that id — the
+    tier chain is NOT attached (a hard pin has no failover). glm-5.2 is served
+    via the anthropic profile, so the plain model is a ``ChatAnthropic``."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     m = model.get_model(role="base", model="glm-5.2")
     assert not isinstance(m, RunnableWithFallbacks)
-    assert m.model_name == "glm-5.2"
+    assert _model_id(m) == "glm-5.2"
 
 
 def test_bind_tools_flows_through_fallback_chain(monkeypatch):
@@ -428,12 +445,13 @@ def test_resolve_fallback_ids_returns_a_copy():
 
 
 def _minimal_spec(tmp_path, monkeypatch, tier_body: str) -> None:
-    """Write a minimal VALID spec (one tier with all four role keys, no models
-    registry so the multimodal cross-check is skipped) + ``tier_body`` appended
-    inside the tier, then point ``model._YAML`` at it. Used to assert specific
-    ``<role>_fallbacks`` malformations fail loud."""
+    """Write a minimal VALID spec (one provider profile + one tier with all four
+    role keys, no models registry so the multimodal cross-check is skipped) +
+    ``tier_body`` appended inside the tier, then point ``model._YAML`` at it.
+    Used to assert specific ``<role>_fallbacks`` malformations fail loud."""
     (tmp_path / "models.yaml").write_text(
-        "provider:\n  base_url: x\n"
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
         "tiers:\n  t:\n"
         + tier_body
         + "\ndefault_tier: t\n"

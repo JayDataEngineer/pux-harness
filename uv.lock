@@ -1725,6 +1725,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ag-ui-langgraph" },
+    { name = "anthropic" },
     { name = "deepagents" },
     { name = "deepagents-acp" },
     { name = "deepagents-code" },
@@ -1732,6 +1733,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "langchain-anthropic" },
     { name = "langchain-mcp-adapters" },
     { name = "langchain-openai" },
     { name = "langgraph-checkpoint-sqlite" },
@@ -1758,6 +1760,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ag-ui-langgraph" },
+    { name = "anthropic", specifier = ">=0.100" },
     { name = "deepagents" },
     { name = "deepagents-acp", specifier = ">=0.0.8" },
     { name = "deepagents-code" },
@@ -1765,6 +1768,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.139.0" },
     { name = "fastmcp", specifier = ">=3.4.2" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "langchain-anthropic", specifier = ">=1.4" },
     { name = "langchain-mcp-adapters", specifier = ">=0.3.0" },
     { name = "langchain-openai" },
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=3.0" },

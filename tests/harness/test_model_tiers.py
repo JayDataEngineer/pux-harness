@@ -122,7 +122,8 @@ def test_validate_rejects_tier_missing_role_key(tmp_path, monkeypatch, _spec_cle
     calls validate_models_spec; this is the tier-era equivalent of the old
     ``roles:`` missing-key check)."""
     (tmp_path / "models.yaml").write_text(
-        "provider:\n  base_url: x\n"
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
         "tiers:\n"
         "  default:\n"
         "    base_model: a\n"
@@ -139,7 +140,8 @@ def test_validate_rejects_tier_missing_role_key(tmp_path, monkeypatch, _spec_cle
 def test_validate_rejects_unknown_default_tier(tmp_path, monkeypatch, _spec_cleared):
     """``default_tier`` must NAME a real tier — a typo fails loud."""
     (tmp_path / "models.yaml").write_text(
-        "provider:\n  base_url: x\n"
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
         "tiers:\n"
         "  default: {base_model: a, worker_model: a, multimodal_model: a, grader_model: a}\n"
         "default_tier: defualt\n"   # typo
@@ -156,7 +158,8 @@ def test_validate_rejects_non_multimodal_vision_model(tmp_path, monkeypatch, _sp
     registry fails the contract — vision (describe_image) would silently break
     at runtime, so fail it at --check-contract."""
     (tmp_path / "models.yaml").write_text(
-        "provider:\n  base_url: x\n"
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
         "models:\n  glm-5.2: {multimodal: false}\n  a: {multimodal: true}\n"
         "tiers:\n"
         "  default:\n"
@@ -186,7 +189,8 @@ def test_dcode_model_ref_none_when_no_provider(tmp_path, monkeypatch, _spec_clea
     """With no ``dcode:`` block, the ref is None (the TUI then lets dcode pick —
     honest, never a fabricated ref)."""
     (tmp_path / "models.yaml").write_text(
-        "provider:\n  base_url: x\n"
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
         "tiers:\n"
         "  default: {base_model: a, worker_model: a, multimodal_model: a, grader_model: a}\n"
         "default_tier: default\n"

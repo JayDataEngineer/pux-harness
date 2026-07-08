@@ -36,10 +36,17 @@ of unknown capability takes the describe_image fallback, never image blocks it
 can't read). ``driver_multimodal`` resolves a role to its id then its capability
 — the seam ``BrowserVisionMiddleware`` uses to decide image-block vs text-pointer.
 
-Provider config (``base_url``, ``api_key_env``, ``max_tokens``, ``temperature``)
-comes from ``models.yaml``'s ``provider:`` block, with the legacy env overrides
-(``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still winning
-for back-compat.
+Provider config comes from ``models.yaml``'s ``providers:`` map — named
+profiles each pinning a wire protocol (``kind: openai`` | ``anthropic``), a
+``base_url``, an ``api_key_env``, and generation defaults. A MODEL ID binds to a
+profile in the ``models:`` registry (``provider: <name>``; ids without one use
+``default_provider``). ``get_model`` builds ``ReasoningChatOpenAI`` for an
+openai-kind id, ``ChatAnthropic`` for an anthropic-kind id — so one deployment
+serves models from different vendors/protocols (e.g. glm-5.2 over ZAI's
+Anthropic-compat endpoint, mimo-v2.5 over OpenCode Go's OpenAI-compat router).
+``PUX_MAX_TOKENS`` / ``PUX_TEMPERATURE`` still override per-deployment; the
+OpenCode-Go profile's ``base_url`` still honors the legacy ``OPENCODE_BASE_URL``
+override for back-compat.
 
 Historical notes:
   - Pre-17.B.0 a single ``DEFAULT_MODEL``/``get_model(model=None)`` was shared by
@@ -56,9 +63,11 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+import anthropic
 import openai
 import yaml
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from langchain_core.language_models import BaseChatModel
 from pydantic import PrivateAttr
 
 from pux_harness.agent.reasoning import ReasoningChatOpenAI
@@ -91,6 +100,19 @@ _TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     openai.InternalServerError,
 )
 
+# Transient exceptions for the Anthropic-compat provider (zai-anthropic). Same
+# NARROW policy as the OpenAI set: 401/400/404 (auth / bad-request / not-found)
+# are config/request bugs that would recur on every fallback, so they stay OUT —
+# the call dies loud instead of silently burning a chain. Used by the
+# Anthropic-kind fallback wrapper so a glm-5.2 429/timeout/5xx fails over to
+# glm-5.1 (same provider kind — chains are protocol-homogeneous).
+_ANTHROPIC_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    anthropic.RateLimitError,
+    anthropic.APITimeoutError,
+    anthropic.APIConnectionError,
+    anthropic.InternalServerError,
+)
+
 # Legacy single-model-era env vars still honored (back-compat).
 _LEGACY_DEFAULT_MODEL_ENV = "PUX_MODEL"        # base role only
 _LEGACY_BASE_URL_ENV = "OPENCODE_BASE_URL"
@@ -108,11 +130,34 @@ def _spec() -> dict:
     data = yaml.safe_load(_YAML.read_text()) or {}
     if not isinstance(data, dict):
         raise RuntimeError(f"models.yaml: top level must be a mapping, got {type(data).__name__}")
-    for key in ("provider", "tiers", "default_tier"):
+    for key in ("providers", "default_provider", "tiers", "default_tier"):
         if key not in data:
             raise RuntimeError(
-                f"models.yaml must define `provider:`, `tiers:`, `default_tier:`; "
-                f"missing: {key}")
+                f"models.yaml must define `providers:`, `default_provider:`, "
+                f"`tiers:`, `default_tier:`; missing: {key}")
+    providers = data["providers"]
+    if not isinstance(providers, dict) or not providers:
+        raise RuntimeError(
+            f"models.yaml `providers:` must be a non-empty mapping of named "
+            f"profiles, got {type(providers).__name__}")
+    for pname, prof in providers.items():
+        if not isinstance(prof, dict):
+            raise RuntimeError(
+                f"models.yaml provider {pname!r} must be a mapping, got {type(prof).__name__}")
+        kind = prof.get("kind", "openai")
+        if kind not in ("openai", "anthropic"):
+            raise RuntimeError(
+                f"models.yaml provider {pname!r}: kind {kind!r} must be 'openai' or 'anthropic'")
+        for req in ("base_url", "api_key_env"):
+            val = prof.get(req)
+            if not isinstance(val, str) or not val:
+                raise RuntimeError(
+                    f"models.yaml provider {pname!r}: {req} must be a non-empty string")
+    default_provider = data["default_provider"]
+    if not isinstance(default_provider, str) or default_provider not in providers:
+        raise RuntimeError(
+            f"models.yaml `default_provider: {default_provider!r}` must name a "
+            f"profile in `providers:` (known: {sorted(providers)})")
     tiers = data["tiers"]
     if not isinstance(tiers, dict) or not tiers:
         raise RuntimeError(f"models.yaml `tiers:` must be a non-empty mapping, got {type(tiers).__name__}")
@@ -173,8 +218,53 @@ def validate_models_spec() -> None:
                 f"would break. Pick a multimodal-capable id or flag it true.")
 
 
-def _provider() -> dict:
-    return _spec()["provider"]
+def _providers() -> dict:
+    return _spec()["providers"]
+
+
+def _default_provider_name() -> str:
+    return _spec()["default_provider"]
+
+
+def _provider_profile(name: str) -> dict:
+    """The named profile dict (validated by ``_spec()``). Raises RuntimeError
+    (loud, at first model build) when ``name`` is not a declared profile — a
+    typo in a model's ``provider:`` binding fails here, not as a silent default."""
+    prof = _providers().get(name)
+    if prof is None:
+        raise RuntimeError(
+            f"models.yaml: provider profile {name!r} is not declared in "
+            f"`providers:` (known: {sorted(_providers())})")
+    return prof
+
+
+def _provider_for_model(model_id: str) -> dict:
+    """The provider profile serving ``model_id``: the profile the model names in
+    the ``models:`` registry, else ``default_provider``. Single resolution path
+    so a model's protocol (openai vs anthropic) is unambiguous everywhere."""
+    registry = _models_registry()
+    caps = registry.get(model_id)
+    if isinstance(caps, dict):
+        named = caps.get("provider")
+        if isinstance(named, str) and named:
+            return _provider_profile(named)
+    return _provider_profile(_default_provider_name())
+
+
+def _provider_kind(model_id: str) -> str:
+    """``"openai"`` or ``"anthropic"`` — the wire protocol for ``model_id``."""
+    return _provider_for_model(model_id).get("kind", "openai")
+
+
+def _transient_exceptions_for(model_id: str) -> tuple[type[BaseException], ...]:
+    """The transient-error set for ``model_id``'s provider kind — OpenAI's or
+    Anthropic's SDK exceptions. A fallback chain is protocol-homogeneous (all
+    entries share the primary's kind), so the primary's kind picks the set."""
+    return (
+        _ANTHROPIC_TRANSIENT_EXCEPTIONS
+        if _provider_kind(model_id) == "anthropic"
+        else _TRANSIENT_EXCEPTIONS
+    )
 
 
 def _tiers() -> dict:
@@ -371,39 +461,127 @@ class _FallbackReasoningChatOpenAI(ReasoningChatOpenAI):
         raise last_exc
 
 
+class _FallbackChatAnthropic(ChatAnthropic):
+    """Anthropic-protocol twin of ``_FallbackReasoningChatOpenAI`` — a
+    ``ChatAnthropic`` carrying a LangChain ``with_fallbacks`` chain.
+
+    WHY a SECOND class (not a generic wrapper)
+      Same deepagents seam as the OpenAI variant: ``create_deep_agent``'s
+      ``resolve_model`` fast-path needs ``isinstance(model, BaseChatModel)``, and
+      ``RunnableWithFallbacks`` is a ``Runnable`` not a ``BaseChatModel``. LangChain
+      ships no ``ChatModelWithFallbacks`` adapter, so a fallback-bearing model MUST
+      be a ``BaseChatModel`` subclass we own. This one subclasses ``ChatAnthropic``
+      (so the Anthropic-protocol glm-5.2 primary is driven with native Anthropic
+      behavior) and carries the chain via the same upstream ``with_fallbacks``.
+
+      A chain is protocol-homogeneous (all Anthropic — ``base_fallbacks`` on an
+      anthropic primary must name anthropic ids), so every chain model is also a
+      ``ChatAnthropic`` and the ``bind_tools`` / ``with_structured_output`` /
+      ``_generate`` overrides below mirror ``_FallbackReasoningChatOpenAI`` exactly.
+
+      Profile matching (``_harness_profile_for_model`` → ``get_model_identifier``
+      / ``get_model_provider``) reads ``model`` / ``_get_ls_params()``, inherited
+      unchanged from ``ChatAnthropic`` — so it reports the PRIMARY id (e.g.
+      ``glm-5.2``), not the chain.
+    """
+
+    _fallback_models: list = PrivateAttr(default_factory=list)
+    _fallback_exceptions: tuple = PrivateAttr(default_factory=tuple)
+
+    def _chain(self, runnable):
+        """Wrap a bound/structured ``Runnable`` with the fallback chain (upstream
+        ``with_fallbacks``). No chain → the runnable unchanged."""
+        if not self._fallback_models:
+            return runnable
+        return runnable.with_fallbacks(
+            self._fallback_models, exceptions_to_handle=self._fallback_exceptions)
+
+    def bind_tools(self, tools, **kwargs):  # type: ignore[override]
+        return self._chain(super().bind_tools(tools, **kwargs))
+
+    def with_structured_output(self, schema, **kwargs):  # type: ignore[override]
+        chain = [fb.with_structured_output(schema, **kwargs) for fb in self._fallback_models]
+        bound = super().with_structured_output(schema, **kwargs)
+        if not chain:
+            return bound
+        return bound.with_fallbacks(chain, exceptions_to_handle=self._fallback_exceptions)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        if not self._fallback_models:
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        try:
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        except self._fallback_exceptions:
+            pass
+        last_exc: BaseException | None = None
+        for fb in self._fallback_models:
+            try:
+                return fb._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            except self._fallback_exceptions as exc:
+                last_exc = exc
+        assert last_exc is not None  # _fallback_models non-empty → loop ran ≥1
+        raise last_exc
+
+
 def _instantiate(
     model_id: str,
     *,
-    fallback_models: list[ReasoningChatOpenAI] | None = None,
+    fallback_models: list[BaseChatModel] | None = None,
     fallback_exceptions: tuple[type[BaseException], ...] = (),
-) -> ReasoningChatOpenAI:
-    """Build a ``ReasoningChatOpenAI`` for ``model_id`` with the current provider
-    config. Shared by the primary + every fallback model so a chain is
-    homogeneous in base_url / key / timeout / retries.
+) -> BaseChatModel:
+    """Build the chat model for ``model_id`` against ITS provider profile.
 
-    When ``fallback_models`` is given, returns a ``_FallbackReasoningChatOpenAI``
-    carrying that chain — a ``BaseChatModel`` (so ``deepagents.resolve_model``'s
-    fast-path accepts it, not a ``RunnableWithFallbacks`` which crashes it) whose
-    ``bind_tools`` / ``with_structured_output`` / ``_generate`` wrap the chain
-    via LangChain ``with_fallbacks``.
+    The provider kind (openai vs anthropic — resolved from the model's profile)
+    picks the concrete class: ``ReasoningChatOpenAI`` for OpenAI-compatible
+    endpoints, ``ChatAnthropic`` for Anthropic-compatible ones (e.g. ZAI's
+    glm-5.2, served where its billing balance lives). ``max_tokens`` /
+    ``temperature`` come from the profile (with PUX_MAX_TOKENS / PUX_TEMPERATURE
+    env overrides); the OpenCode-Go profile's ``base_url`` still honors the
+    legacy ``OPENCODE_BASE_URL`` override (matched by api_key_env) for back-compat.
 
-    ``max_retries=6`` lets the OpenAI client ride transient limits (429
-    "provider_rate_limit_exceeded" on the free OpenCode Zen Go router) with
-    built-in exponential backoff (~30-60s across 6 retries) rather than dying on
-    the first 429. Standard client resilience, not a behavior fallback — and the
-    precondition for ``get_model``'s declared fallback chain (each model is
-    independently resilient; ``with_fallbacks`` only fires when retries exhaust)."""
-    provider = _provider()
-    base_url = os.environ.get(_LEGACY_BASE_URL_ENV, provider["base_url"])
-    api_key_env = provider.get("api_key_env", "OPENCODE_API_KEY")
+    When ``fallback_models`` is given, returns the kind's fallback wrapper — a
+    ``BaseChatModel`` subclass (so ``deepagents.resolve_model``'s fast-path
+    accepts it, not a ``RunnableWithFallbacks`` which crashes it) carrying the
+    chain via LangChain ``with_fallbacks``. A chain is protocol-homogeneous
+    (every entry shares the primary's kind), so the wrapper class matches the
+    primary's.
+
+    ``max_retries=6`` lets the client ride transient limits (429s on the free
+    OpenCode Zen Go router; ZAI throttles) with built-in exponential backoff
+    rather than dying on the first 429. Standard client resilience, not a
+    behavior fallback — and the precondition for ``get_model``'s declared
+    fallback chain (each model is independently resilient; ``with_fallbacks``
+    only fires when retries exhaust)."""
+    prof = _provider_for_model(model_id)
+    kind = prof.get("kind", "openai")
+    base_url = prof["base_url"]
+    api_key_env = prof["api_key_env"]  # _spec() validated non-empty
+    # Legacy back-compat: OPENCODE_BASE_URL overrides the OpenCode-Go profile's
+    # base_url (matched by its api_key_env) so existing dev workflows keep working.
+    if api_key_env == "OPENCODE_API_KEY":
+        legacy = os.environ.get(_LEGACY_BASE_URL_ENV)
+        if legacy:
+            base_url = legacy
+    api_key = os.environ[api_key_env]
+    max_tokens = int(os.environ.get("PUX_MAX_TOKENS", prof.get("max_tokens", 8192)))
+    temperature = float(os.environ.get("PUX_TEMPERATURE", prof.get("temperature", 0.2)))
+
+    if kind == "anthropic":
+        kwargs = dict(
+            model=model_id, base_url=base_url, api_key=api_key,
+            max_tokens=max_tokens, temperature=temperature, timeout=180, max_retries=6,
+        )
+        if fallback_models:
+            m = _FallbackChatAnthropic(**kwargs)
+            m._fallback_models = list(fallback_models)
+            m._fallback_exceptions = tuple(fallback_exceptions)
+            return m
+        return ChatAnthropic(**kwargs)
+
+    # openai-compatible
     kwargs = dict(
-        model=model_id,
-        base_url=base_url,
-        api_key=os.environ[api_key_env],
-        timeout=180,
-        max_retries=6,
-        max_tokens=int(os.environ.get("PUX_MAX_TOKENS", provider.get("max_tokens", 8192))),
-        temperature=float(os.environ.get("PUX_TEMPERATURE", provider.get("temperature", 0.2))),
+        model=model_id, base_url=base_url, api_key=api_key, timeout=180, max_retries=6,
+        max_tokens=max_tokens, temperature=temperature,
     )
     if fallback_models:
         m = _FallbackReasoningChatOpenAI(**kwargs)
@@ -415,10 +593,12 @@ def _instantiate(
 
 def get_model(
     *, role: str = "base", org: str | None = None, model: str | None = None,
-) -> ChatOpenAI:
-    """Build a ``ChatOpenAI`` for ``role`` resolved against ``org``, or for the
+) -> BaseChatModel:
+    """Build the chat model for ``role`` resolved against ``org``, or for the
     literal ``model`` id when one is supplied (the subagent-frontmatter override
-    path). Provider config comes from ``models.yaml``; legacy env overrides
+    path). The model's provider profile (from ``models.yaml``) picks the concrete
+    class — ``ReasoningChatOpenAI`` (OpenAI-compatible) or ``ChatAnthropic``
+    (Anthropic-compatible, e.g. ZAI glm-5.2). Legacy env overrides
     (``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still win.
 
     When the role resolves from the active tier AND that tier declares a
@@ -445,7 +625,8 @@ def get_model(
         role, model_id, fb_ids, active_tier(),
     )
     return _instantiate(
-        model_id, fallback_models=chain, fallback_exceptions=_TRANSIENT_EXCEPTIONS,
+        model_id, fallback_models=chain,
+        fallback_exceptions=_transient_exceptions_for(model_id),
     )
 
 

@@ -3,10 +3,11 @@
 # WHY THIS FILE EXISTS
 #   No model id is hardcoded anywhere else in the harness. Every consumer asks
 #   `get_model(role=..., org=...)` (harness/pux_harness/agent/model.py) and this
-#   file decides which concrete model id that role resolves to. A cloner
-#   repoints at their own provider by editing THIS FILE (or overriding per-org
-#   in orgs/<name>/profile.yaml under `models:`, or per-subagent in an agent's
-#   frontmatter `model:`). One file, no code edits, no scattered hardcodes.
+#   file decides which concrete model id that role resolves to + which PROVIDER
+#   PROFILE serves it. A cloner repoints at their own provider by editing THIS
+#   FILE (or overriding per-org in orgs/<name>/profile.yaml under `models:`, or
+#   per-subagent in an agent's frontmatter `model:`). One file, no code edits,
+#   no scattered hardcodes.
 #
 # RESOLUTION ORDER for a role (highest priority first)
 #   1. subagent frontmatter `model:`   — agent-level (subagents only; a literal id)
@@ -14,6 +15,16 @@
 #   3. env PUX_<ROLE>_MODEL             — deployment-level (e.g. PUX_GRADER_MODEL)
 #   4. the ACTIVE TIER's role map below — selected by --tier/--fast (sets PUX_TIER),
 #                                         defaulting to `default_tier`
+#
+# THE PROVIDER PROFILES (`providers:` + `default_provider:`)
+#   Named profiles, each pinning a wire PROTOCOL (`kind: openai` | `anthropic`),
+#   an OpenAI- or Anthropic-compatible `base_url`, and the env var holding the
+#   api key. A MODEL ID is bound to a profile in the `models:` registry
+#   (`provider: <name>`); ids without an explicit profile use `default_provider`.
+#   This is how one deployment serves models from DIFFERENT vendors/protoels at
+#   once — e.g. glm-5.2 over ZAI's Anthropic-compat endpoint (where its billing
+#   balance lives) while mimo-v2.5 rides OpenCode Go's OpenAI-compat router.
+#   No code edits, no per-model hardcodes: add a profile here, tag the id, done.
 #
 # THE ROLES (the keys inside every tier)
 #   base_model       the primary driving agent (the CTO / supervisor). The shipped
@@ -39,45 +50,60 @@
 #   exhausts its own max_retries, the call fails over to the next id in the list.
 #   Declared + WARNING-logged — NOT a silent swap (a 401/400/404 config bug dies
 #   loud instead of burning the chain). Applies ONLY when the role resolved from
-#   the tier; an explicit override (frontmatter / org `models:` / `PUX_<ROLE>_MODEL`)
-#   is a HARD pin — no failover. Each fallback should match the primary's
-#   multimodal capability for vision-bearing roles (a non-multimodal base falling
-#   over to a multimodal id shifts vision behavior mid-run). Keep it shallow —
-#   every entry is another model tried in series.
+#   the tier; an explicit override (frontmatter / org `models:` / PUX_<ROLE>_MODEL)
+#   is a HARD pin — no failover. Each fallback MUST share the primary's PROVIDER
+#   KIND (a chain is protocol-homogeneous — glm-5.2 -> glm-5.1 are both
+#   `zai-anthropic`; you cannot chain an Anthropic id onto an OpenAI primary).
+#   Keep it shallow — every entry is another model tried in series.
 #
 # THE `models:` REGISTRY
-#   Per-id capability flags. Capability is a property of the MODEL id, not the
-#   tier — glm-5.2 is non-multimodal everywhere it appears. `is_multimodal(id)`
-#   reads this; an UNKNOWN id defaults to non-multimodal (fail-safe: a driver of
-#   unknown capability gets the describe_image fallback, never image blocks it
-#   can't read). The DEFAULT tier's multimodal_model must be flagged true here.
+#   Per-id flags + provider binding. `multimodal:` is the capability flag
+#   (`is_multimodal(id)` reads it; UNKNOWN ids default to non-multimodal — the
+#   fail-safe path). `provider:` names a profile in `providers:` (or the
+#   `default_provider` when absent). The DEFAULT tier's multimodal_model must be
+#   flagged true here.
 #
 # THE `dcode:` BLOCK
 #   The TUI (dcode) names our opencode endpoint `opencode-go-openai` and uses the
 #   SAME ids (see ~/.deepagents/config.toml). `pux tui` forwards the resolved base
 #   model as `<dcode.provider>:<id>` so dcode never falls back to its own default.
 
-provider:
-  # OpenAI-compatible endpoint. Override per-deployment with OPENCODE_BASE_URL.
-  base_url: https://opencode.ai/zen/go/v1
-  # Name of the env var that holds the api key (read at call time, never persisted).
-  api_key_env: OPENCODE_API_KEY
-  # Generation defaults applied to every role. Override per-deployment with
-  # PUX_MAX_TOKENS / PUX_TEMPERATURE.
-  max_tokens: 8192
-  temperature: 0.2
+# Named provider profiles — each a wire protocol + endpoint + key env.
+providers:
+  # OpenCode Go — OpenAI-compatible router. Serves the cheap/multimodal ids.
+  # `OPENCODE_BASE_URL` (legacy) still overrides this profile's base_url for
+  # back-compat (matched by api_key_env), so existing dev workflows keep working.
+  opencode-go:
+    kind: openai
+    base_url: https://opencode.ai/zen/go/v1
+    api_key_env: OPENCODE_API_KEY
+    max_tokens: 8192
+    temperature: 0.2
+  # ZAI — Anthropic-compatible endpoint. This is where the ZAI billing balance
+  # lives (the OpenAI-compat /api/paas/v4 endpoint authenticates the same token
+  # but returns code 1113 "insufficient balance" for chat completions). glm-5.2
+  # is served here via the same ANTHROPIC_AUTH_TOKEN ~/.claude uses.
+  zai-anthropic:
+    kind: anthropic
+    base_url: https://api.z.ai/api/anthropic
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+    max_tokens: 8192
+    temperature: 0.2
 
-# Per-id capability registry. Only `multimodal:` is tracked today. Unknown ids
-# (not listed here) default to multimodal: false — the fail-safe path.
+# Profile used by model ids that don't name one in `models:`. opencode-go keeps
+# the shipped behavior (pre-multi-provider everything was the single OpenAI impl).
+default_provider: opencode-go
+
+# Per-id registry: capability flag + which profile serves it.
 models:
-  glm-5.2:           {multimodal: false}
-  glm-5.1:           {multimodal: false}
-  mimo-v2.5:         {multimodal: true}
-  mimo-v2.5-pro:     {multimodal: true}
-  kimi-k2.7-code:    {multimodal: false}
-  kimi-k2.6:         {multimodal: false}
-  deepseek-v4-pro:   {multimodal: false}
-  deepseek-v4-flash: {multimodal: false}
+  glm-5.2:           {provider: zai-anthropic, multimodal: false}
+  glm-5.1:           {provider: zai-anthropic, multimodal: false}
+  mimo-v2.5:         {provider: opencode-go, multimodal: true}
+  mimo-v2.5-pro:     {provider: opencode-go, multimodal: true}
+  kimi-k2.7-code:    {provider: opencode-go, multimodal: false}
+  kimi-k2.6:         {provider: opencode-go, multimodal: false}
+  deepseek-v4-pro:   {provider: opencode-go, multimodal: false}
+  deepseek-v4-flash: {provider: opencode-go, multimodal: false}
 
 # Named tiers — a coherent role map per "mode". `default_tier` is the shipped
 # default; --tier <name> (or --fast) selects another at run time.
@@ -88,11 +114,9 @@ tiers:
   # BrowserVisionMiddleware text-pointer fallback, not native image blocks.
   default:
     base_model: glm-5.2
-    # If glm-5.2 (SOTA, non-multimodal) is persistently rate-limited / down
-    # after its own max_retries, fail over to glm-5.1 — a sibling non-multimodal
-    # text model, so supervisor behavior (incl. the describe_image vision path)
-    # is unchanged on failover. Add deeper ids (e.g. mimo-v2.5) to widen the
-    # chain at the cost of a behavior shift on the deepest failover.
+    # glm-5.2 (zai-anthropic) -> glm-5.1 (zai-anthropic): same provider KIND, so
+    # the chain is protocol-homogeneous + non-multimodal throughout (supervisor
+    # behavior, incl. the describe_image vision path, is unchanged on failover).
     base_fallbacks: [glm-5.1]
     worker_model: mimo-v2.5
     multimodal_model: mimo-v2.5
