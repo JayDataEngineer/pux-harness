@@ -20,6 +20,8 @@ Usage:
   pux jobs run --org X         run prep jobs inside the sandbox
   pux jobs status --org X      show declared prep jobs
   pux export --org X           export org as standalone portable archive
+  pux promote-function --org X NAME   graduate a lib function to git-tracked sandbox/ (c->b)
+  pux archive-function --org X NAME   retire a lib function to lib/.archive/ (reversible)
 """
 from __future__ import annotations
 
@@ -338,6 +340,21 @@ def main() -> None:
              "$PUX_PROJECT_ROOT or CWD). Lets a standalone consumer app export "
              "an org that lives in ITS OWN tree, not the orchestrator's.")
 
+    # Dynamic-function lifecycle (OPERATOR commands — not agent tools). Graduate
+    # an agent-authored lib function to git-tracked sandbox/ (c->b), or retire
+    # one to lib/.archive/ (reversible). See sandbox/tools/dynamic.py.
+    p_promote = sub.add_parser(
+        "promote-function",
+        help="graduate a lib function to git-tracked sandbox/functions/ (c->b)")
+    p_promote.add_argument("--org", required=True)
+    p_promote.add_argument("name", help="function name to promote")
+
+    p_archive = sub.add_parser(
+        "archive-function",
+        help="retire a lib function to lib/.archive/ (reversible)")
+    p_archive.add_argument("--org", required=True)
+    p_archive.add_argument("name", help="function name to archive")
+
     args = ap.parse_args()
     _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (serve/acp/direct/tui)
 
@@ -445,6 +462,25 @@ def main() -> None:
                     for cat, items in cats.items():
                         if items:
                             print(f"  {cat}: {len(items)} files")
+
+    # --- Dynamic-function lifecycle (operator commands) ---
+    elif args.cmd == "promote-function":
+        from pux_harness.agent.orgs import _org_path
+        from pux_harness.sandbox.tools import dynamic as _dyn
+
+        res = _dyn.promote_function(_org_path(args.org) / "lib", args.name)
+        _print_block("promote-function", json.dumps(res, indent=2))
+        if not res.get("success"):
+            raise SystemExit(1)
+
+    elif args.cmd == "archive-function":
+        from pux_harness.agent.orgs import _org_path
+        from pux_harness.sandbox.tools import dynamic as _dyn
+
+        res = _dyn.archive_function(_org_path(args.org) / "lib", args.name)
+        _print_block("archive-function", json.dumps(res, indent=2))
+        if not res.get("success"):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

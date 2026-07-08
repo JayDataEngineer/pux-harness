@@ -345,3 +345,136 @@ def test_runner_executes_against_real_python3(org_lib):
     assert D._extract_result(proc.stdout) == {"ok": True, "value": 60}
     # the bytecache guard keeps a root-owned __pycache__ off the host-visible lib
     assert not (org_lib / "functions" / "__pycache__").exists()
+
+
+# --- graduation (promote_function: lib -> sandbox, c->b, git-tracked) --------
+
+def test_promote_moves_to_sandbox_and_tracks_path(org_lib):
+    """Graduation moves the module lib/functions/<n>.py -> sandbox/functions/<n>.py
+    and the index entry lib/index.yaml -> sandbox/index.yaml. The returned path is
+    under sandbox/ — that is what makes the function travel via Git AND Pack."""
+    t = _tools(org_lib)
+    _invoke(t["pux_dyn_make_function"], name="rsi", description="compute rsi", code=_GOOD)
+    res = D.promote_function(org_lib, "rsi")
+    assert res["success"] is True
+    assert res["path"] == "sandbox/functions/rsi.py"
+    # lib copy gone + de-indexed
+    assert not (org_lib / "functions" / "rsi.py").exists()
+    assert "rsi" not in D.load_dynamic_index(org_lib)
+    # sandbox copy present + indexed, with a promoted stamp + package init
+    sb = org_lib.parent / "sandbox"
+    assert (sb / "functions" / "rsi.py").read_text() == _GOOD
+    assert (sb / "functions" / "__init__.py").is_file()
+    sb_idx = D.load_dynamic_index(sb)
+    assert sb_idx["rsi"]["description"] == "compute rsi"
+    assert "promoted" in sb_idx["rsi"]
+
+
+def test_call_promoted_resolves_sandbox_root(org_lib):
+    """A promoted function is still callable — call_function resolves its owning
+    root (sandbox, since lib no longer has it), cds into the SANDBOX container
+    dir, and bumps the SANDBOX index (not lib)."""
+    fx = _FakeExec(out="\n" + D._RESULT_MARKER + "\n" + json.dumps({"ok": True, "value": 7}))
+    t = _tools(org_lib, fx)
+    _invoke(t["pux_dyn_make_function"], name="f", description="x", code=_GOOD)
+    D.promote_function(org_lib, "f")
+    r = _invoke(t["pux_dyn_call_function"], name="f", arguments={"nums": [1, 2, 3]})
+    assert r["success"] is True and r["value"] == 7
+    cmd, _ = fx.calls[0]
+    cd_target = cmd.split(" &&", 1)[0]
+    assert cd_target.rstrip().endswith("sandbox")  # cd into the SANDBOX root
+    sb = org_lib.parent / "sandbox"
+    assert D.load_dynamic_index(sb)["f"]["usage"] == 1
+    assert "f" not in D.load_dynamic_index(org_lib)  # lib index untouched
+
+
+def test_edit_refuses_promoted(org_lib):
+    """Promoted = operator-owned source; the agent may not rewrite it. edit_function
+    refuses with a pointer at the tracked source, and leaves it untouched."""
+    t = _tools(org_lib)
+    _invoke(t["pux_dyn_make_function"], name="f", description="x", code=_GOOD)
+    D.promote_function(org_lib, "f")
+    r = _invoke(t["pux_dyn_edit_function"], name="f", code=_GOOD)
+    assert r["success"] is False and "PROMOTED" in r["error"]
+    sb = org_lib.parent / "sandbox"
+    assert (sb / "functions" / "f.py").read_text() == _GOOD  # untouched
+
+
+def test_list_merges_lib_and_sandbox_with_source(org_lib):
+    t = _tools(org_lib)
+    _invoke(t["pux_dyn_make_function"], name="a", description="lib fn", code=_GOOD)
+    _invoke(t["pux_dyn_make_function"], name="b", description="to promote", code=_GOOD)
+    D.promote_function(org_lib, "b")
+    r = _invoke(t["pux_dyn_list_functions"])
+    assert r["count"] == 2
+    by = {f["name"]: f for f in r["functions"]}
+    assert by["a"]["source"] == "lib"
+    assert by["b"]["source"] == "sandbox"
+
+
+def test_promote_missing_errors(org_lib):
+    res = D.promote_function(org_lib, "ghost")
+    assert res["success"] is False and "does not exist" in res["error"]
+
+
+def test_promote_twice_errors(org_lib):
+    t = _tools(org_lib)
+    _invoke(t["pux_dyn_make_function"], name="f", description="x", code=_GOOD)
+    assert D.promote_function(org_lib, "f")["success"] is True
+    res = D.promote_function(org_lib, "f")
+    assert res["success"] is False and "already promoted" in res["error"]
+
+
+# --- pruning (archive_function: lib -> lib/.archive/, reversible) ------------
+
+def test_archive_retires_and_keeps_source(org_lib):
+    """Archiving drops the function from the active surface (list/call lose it)
+    but PRESERVES the source under lib/.archive/ so the operator can restore it."""
+    t = _tools(org_lib)
+    _invoke(t["pux_dyn_make_function"], name="old", description="x", code=_GOOD)
+    res = D.archive_function(org_lib, "old")
+    assert res["success"] is True
+    assert ".archive/old." in res["archived_to"]
+    assert not (org_lib / "functions" / "old.py").exists()
+    assert "old" not in D.load_dynamic_index(org_lib)
+    assert _invoke(t["pux_dyn_list_functions"])["count"] == 0
+    archived = list((org_lib / ".archive").glob("old.*.py"))
+    assert len(archived) == 1 and archived[0].read_text() == _GOOD  # reversible
+
+
+def test_archive_missing_errors(org_lib):
+    res = D.archive_function(org_lib, "ghost")
+    assert res["success"] is False and "does not exist" in res["error"]
+
+
+# --- promoted runner against REAL python3 (graduation proof; prove, don't assert) --
+
+def test_promoted_runner_executes_against_real_python3(org_lib):
+    """A PROMOTED function lives at sandbox/functions/<name>.py with the runner
+    cwd = the SANDBOX root. Prove import+run+marker resolves against THAT root
+    (not lib) end-to-end against real python3 — the graduation thesis: a
+    git-tracked, operator-owned function is callable in-container exactly like an
+    agent-authored one, just from the tracked location. Mirrors the lib proof."""
+    import os
+    import subprocess
+
+    # make_function writes the module + the index entry promote_function keys off
+    # (writing the file alone leaves no index entry, so promotion would no-op).
+    t = _tools(org_lib)
+    _invoke(t["pux_dyn_make_function"], name="add", description="sum", code=_GOOD)
+    res = D.promote_function(org_lib, "add")  # lib/functions/add.py -> sandbox/functions/add.py
+    assert res["success"] is True
+    sb = org_lib.parent / "sandbox"
+    runner = D._RUNNER_TEMPLATE.replace("__NAME__", "add")
+    env = {
+        **os.environ,
+        "_PUX_DYN_KWARGS": json.dumps({"nums": [10, 20, 30]}),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    proc = subprocess.run(
+        ["python3", "-c", runner], cwd=str(sb), env=env,
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"promoted runner failed: {proc.stderr}"
+    assert D._extract_result(proc.stdout) == {"ok": True, "value": 60}
+    assert not (sb / "functions" / "__pycache__").exists()

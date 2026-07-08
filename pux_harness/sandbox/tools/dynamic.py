@@ -37,9 +37,15 @@ loop is unchanged. Distinct from skills (operator markdown backbone, host) and
 from declared tools (operator-authored, in-container): lib is AGENT-authored
 executable code.
 
-P1 scope (this module): make / edit / list / call. Pruning (``.archive``) +
-graduation (``pux promote-function`` lib→sandbox) are P2; the manifest + pack
-hooks that scrub ``lib/functions/*.py`` are P3/P4.
+Scope (this module): make / edit / list / call (P1) + graduation + pruning (P2).
+**Graduation** (``pux promote-function``, c→b): a function moves from the
+agent-authored, gitignored ``lib/`` to the operator-owned, git-tracked
+``sandbox/functions/`` — same ``def run`` contract + runner, but its file +
+index entry now travel via Git AND Pack. The agent can still CALL a promoted
+function (same surface) but cannot EDIT it (``edit_function`` refuses; the
+operator owns the source). **Pruning** (``pux archive-function``): retires a lib
+function to ``lib/.archive/`` (the file is kept — reversible). The manifest +
+pack hooks that scrub ``lib/functions/*.py`` are P3/P4.
 """
 
 from __future__ import annotations
@@ -72,11 +78,20 @@ PUX_DYN_PREFIX = "pux_dyn_"
 # Exported so ``contract.py`` can admit them in an agent ``tools:`` allowlist.
 DYNAMIC_TOOL_NAMES = frozenset({"make_function", "edit_function", "list_functions", "call_function"})
 
-# Subpaths RELATIVE TO ``org_lib_dir`` (which is already ``orgs/<org>/lib`` —
-# the caller in ``stack.build_stack`` resolves it via ``_org_path(org)/"lib"``).
-# So functions live at ``<org_lib_dir>/functions`` and the index at its root.
+# Subpaths RELATIVE TO a function ROOT. A root is a dir whose container cwd makes
+# ``from functions.<name> import run`` resolve: it owns ``<root>/functions/`` (the
+# modules + ``__init__.py``) + ``<root>/index.yaml`` (the bookkeeping). Two roots
+# per org, resolved by the caller in ``stack.build_stack`` via ``_org_path(org)``:
+#   * ``orgs/<org>/lib``      — AGENT-authored (level c): gitignored, packs.
+#   * ``orgs/<org>/sandbox``  — OPERATOR-promoted (level b): git-tracked, packs.
+# The I/O below is root-agnostic: pass either root and the same functions load.
 _FUNCTIONS_SUBPATH = Path("functions")
 _INDEX_SUBPATH = Path("index.yaml")
+_ARCHIVE_SUBPATH = Path(".archive")
+
+# The promoted-functions root is the lib root's ``sandbox`` sibling
+# (``orgs/<org>/sandbox``). See ``_sandbox_root``.
+_SANDBOX_ROOT_NAME = "sandbox"
 
 # snake_case + leading letter — mirrors ``declared._NAME_RE`` (langchain needs
 # snake_case; rejects uppercase). Module filenames derive from this, so it must
@@ -116,23 +131,36 @@ _sys.stdout.write(_json.dumps({"ok": True, "value": _out}, default=str))
 
 # --- paths (host + container) ----------------------------------------------
 
-def _functions_dir(org_lib_dir: Path) -> Path:
-    return org_lib_dir / _FUNCTIONS_SUBPATH
+def _functions_dir(root: Path) -> Path:
+    return root / _FUNCTIONS_SUBPATH
 
 
-def _index_path(org_lib_dir: Path) -> Path:
-    return org_lib_dir / _INDEX_SUBPATH
+def _index_path(root: Path) -> Path:
+    return root / _INDEX_SUBPATH
 
 
-def _container_lib_dir(org_lib_dir: Path) -> Path:
-    """The org ``lib`` dir as seen IN-CONTAINER.
+def _sandbox_root(org_lib_dir: Path) -> Path:
+    """The promoted-functions root: ``orgs/<org>/sandbox`` (sibling of ``lib``).
 
-    Same mapping as ``declared._container_dir``: the project is bind-mounted
-    1:1 at ``WORKSPACE_ROOT`` (``/sandbox/workspace``), so the container path is
-    ``WORKSPACE_ROOT / <org_lib_dir relative to the project root>``. Pure path
-    math — works whether or not the dir exists yet (it is created on first
-    ``make_function``)."""
-    rel = org_lib_dir.relative_to(project_root())
+    A graduated function (``pux promote-function``) moves here from the
+    agent-authored, gitignored ``lib/`` (level c) to the operator-owned,
+    git-tracked ``sandbox/`` (level b). Same ``def run(**kwargs)`` contract + same
+    runner; only the ownership/tracking changed. Symmetric with ``lib``:
+    ``<root>/functions/<name>.py`` + ``<root>/index.yaml``; the runner cds to the
+    root so ``from functions.<name> import run`` resolves against
+    ``<root>/functions/__init__.py``."""
+    return org_lib_dir.parent / _SANDBOX_ROOT_NAME
+
+
+def _container_root_dir(root: Path) -> Path:
+    """A function root (lib OR sandbox) as seen IN-CONTAINER.
+
+    Same 1:1 bind-mount mapping as ``declared._container_dir``: the project is
+    mounted at ``WORKSPACE_ROOT`` (``/sandbox/workspace``), so the container path
+    is ``WORKSPACE_ROOT / <root relative to the project root>`` — pure path math,
+    works for the lib root and the sandbox root alike, whether or not the dir
+    exists yet (created on first ``make_function`` / ``promote_function``)."""
+    rel = root.relative_to(project_root())
     return Path(WORKSPACE_ROOT) / rel
 
 
@@ -182,6 +210,26 @@ def _ensure_lib_skeleton(org_lib_dir: Path) -> None:
             "Auto-created by pux_dyn_make_function on first use. Each module\n"
             "exposes ``run(**kwargs)``; call_function exec's\n"
             '``from functions.<name> import run`` in-container.\n"""\n'
+        )
+
+
+def _ensure_sandbox_skeleton(sandbox_root: Path) -> None:
+    """Create ``sandbox/functions/`` + its ``__init__.py`` for promoted functions.
+
+    Idempotent. Same package-init discipline as ``_ensure_lib_skeleton`` so the
+    runner (cwd = the sandbox root) resolves ``from functions.<name> import run``
+    against ``sandbox/functions/__init__.py``. Distinct docstring so an operator
+    browsing ``sandbox/functions/`` sees these are promoted, not agent-authored."""
+    fns = _functions_dir(sandbox_root)
+    fns.mkdir(parents=True, exist_ok=True)
+    init = fns / "__init__.py"
+    if not init.exists():
+        init.write_text(
+            '"""Promoted dynamic functions (graduated c->b via pux promote-function).\n\n'
+            "Operator-owned + git-tracked. Each module exposes ``run(**kwargs)``;\n"
+            "call_function exec's ``from functions.<name> import run`` with this\n"
+            'dir\'s parent (the sandbox root) as cwd. The agent can CALL these but\n'
+            "cannot EDIT them (edit_function refuses promoted names).\n\"\"\"\n"
         )
 
 
@@ -245,6 +293,88 @@ def _bump_call(org_lib_dir: Path, name: str, success: bool) -> None:
     if success:
         entry["success"] = int(entry.get("success", 0)) + 1
     save_dynamic_index(org_lib_dir, funcs)
+
+
+# --- graduation + pruning (operator commands; lib <-> sandbox) --------------
+
+def _resolve_root(org_lib_dir: Path, name: str) -> Path | None:
+    """Which root (lib or sandbox) currently owns ``name``? ``None`` if absent.
+
+    lib is checked first: an agent's working copy (if one exists) shadows a
+    promoted baseline of the same name — the agent edits the live lib version and
+    ``call_function`` reflects it, not the frozen promoted one. This keeps the
+    agent's authoring loop coherent even after a same-named promotion."""
+    if name in load_dynamic_index(org_lib_dir):
+        return org_lib_dir
+    sandbox = _sandbox_root(org_lib_dir)
+    if name in load_dynamic_index(sandbox):
+        return sandbox
+    return None
+
+
+def promote_function(org_lib_dir: Path, name: str) -> dict[str, Any]:
+    """Graduate ``name`` from lib (c) to sandbox (b): git-tracked, operator-owned.
+
+    Moves ``lib/functions/<name>.py`` -> ``sandbox/functions/<name>.py`` and the
+    index entry ``lib/index.yaml`` -> ``sandbox/index.yaml``. After promotion the
+    agent can still CALL the function (same runner, same ``pux_dyn_call_function``
+    surface) but can no longer EDIT it — ``edit_function`` refuses promoted names;
+    the operator owns the source now (edit ``sandbox/functions/<name>.py``
+    directly). Returns a result dict (``success``/``error`` +, on success, the
+    tracked destination path under ``sandbox/`` — that path is what makes the
+    function travel via Git AND Pack)."""
+    funcs = load_dynamic_index(org_lib_dir)
+    if name not in funcs:
+        sandbox = _sandbox_root(org_lib_dir)
+        if name in load_dynamic_index(sandbox):
+            return {"success": False, "error": f"function {name!r} is already promoted to sandbox/"}
+        return {"success": False, "error": f"function {name!r} does not exist in lib/"}
+    sandbox = _sandbox_root(org_lib_dir)
+    sb_funcs = load_dynamic_index(sandbox)
+    if name in sb_funcs:
+        return {"success": False, "error": f"function {name!r} is already promoted to sandbox/"}
+    _ensure_sandbox_skeleton(sandbox)
+    src = _functions_dir(org_lib_dir) / f"{name}.py"
+    dst = _functions_dir(sandbox) / f"{name}.py"
+    if not src.is_file():
+        # index says it exists but the module is gone (manual delete?) — don't
+        # fabricate a promoted file; surface the inconsistency.
+        return {"success": False, "error": f"function {name!r} is in the index but its module is missing at {src}"}
+    dst.write_text(src.read_text())
+    src.unlink()
+    entry = funcs.pop(name)
+    entry["promoted"] = _now_iso()
+    sb_funcs[name] = entry
+    save_dynamic_index(org_lib_dir, funcs)
+    save_dynamic_index(sandbox, sb_funcs)
+    log.info("dynamic: promoted function %r lib -> sandbox (git-tracked)", name)
+    return {"success": True, "name": name, "path": str(dst.relative_to(project_root()))}
+
+
+def archive_function(org_lib_dir: Path, name: str) -> dict[str, Any]:
+    """Retire ``name`` to ``lib/.archive/`` (reversible — the file is KEPT).
+
+    Removes it from the active index (so ``list_functions``/``call_function`` no
+    longer see it) but preserves the source under
+    ``lib/.archive/<name>.<timestamp>.py`` so the operator can restore it (copy it
+    back + ``make_function``, or re-promote). Only lib functions archive: a
+    promoted function lives in tracked ``sandbox/`` — revert it via git if truly
+    unwanted. Returns a result dict (``success``/``error`` + the archive path)."""
+    funcs = load_dynamic_index(org_lib_dir)
+    if name not in funcs:
+        return {"success": False, "error": f"function {name!r} does not exist in lib/"}
+    src = _functions_dir(org_lib_dir) / f"{name}.py"
+    archive_dir = org_lib_dir / _ARCHIVE_SUBPATH
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dst = archive_dir / f"{name}.{stamp}.py"
+    if src.is_file():
+        dst.write_text(src.read_text())
+        src.unlink()
+    del funcs[name]
+    save_dynamic_index(org_lib_dir, funcs)
+    log.info("dynamic: archived function %r -> %s", name, dst)
+    return {"success": True, "name": name, "archived_to": str(dst.relative_to(project_root()))}
 
 
 # --- args schemas (pydantic via create_model — deterministic, mirrors declared) --
@@ -365,6 +495,19 @@ def _make_edit(org_lib_dir: Path, label: str):
     def _run(name: str, code: str) -> str:
         funcs = load_dynamic_index(org_lib_dir)
         if name not in funcs:
+            # A promoted function is operator-owned source (git-tracked under
+            # sandbox/) — the agent may not rewrite it. Refuse with a precise
+            # pointer so the operator knows where the canonical copy lives.
+            if name in load_dynamic_index(_sandbox_root(org_lib_dir)):
+                return _result({
+                    "success": False,
+                    "error": (
+                        f"function {name!r} is PROMOTED — it is git-tracked "
+                        f"operator source at sandbox/functions/{name}.py. The "
+                        f"agent cannot edit promoted functions; ask the operator "
+                        f"to change the source (then it travels via Git + Pack)."
+                    ),
+                })
             return _result({
                 "success": False,
                 "error": (
@@ -389,8 +532,9 @@ def _make_edit(org_lib_dir: Path, label: str):
 
 def _make_list(org_lib_dir: Path):
     def _run(**kwargs: Any) -> str:
-        funcs = load_dynamic_index(org_lib_dir)
-        if not funcs:
+        lib_funcs = load_dynamic_index(org_lib_dir)
+        sb_funcs = load_dynamic_index(_sandbox_root(org_lib_dir))
+        if not lib_funcs and not sb_funcs:
             return _result({
                 "success": True,
                 "count": 0,
@@ -398,17 +542,22 @@ def _make_list(org_lib_dir: Path):
                 "note": "no functions yet; use pux_dyn_make_function to create one.",
             })
         # Bounded by index size, NEVER code — the cheap listing that lets the
-        # model recall what exists without re-loading bodies.
-        summary = [
-            {
-                "name": n,
-                "description": e.get("description", ""),
-                "usage": e.get("usage", 0),
-                "success": e.get("success", 0),
-                "version": e.get("version", 1),
-            }
-            for n, e in sorted(funcs.items())
-        ]
+        # model recall what exists without re-loading bodies. Promoted (sandbox)
+        # functions are merged in and marked so the model knows which are
+        # operator-owned (call only) vs agent-authorable (lib).
+        def _summarize(funcs: dict[str, dict[str, Any]], source: str):
+            return [
+                {
+                    "name": n,
+                    "source": source,
+                    "description": e.get("description", ""),
+                    "usage": e.get("usage", 0),
+                    "success": e.get("success", 0),
+                    "version": e.get("version", 1),
+                }
+                for n, e in sorted(funcs.items())
+            ]
+        summary = _summarize(lib_funcs, "lib") + _summarize(sb_funcs, "sandbox")
         return _result({"success": True, "count": len(summary), "functions": summary})
 
     return _run
@@ -416,8 +565,8 @@ def _make_list(org_lib_dir: Path):
 
 def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
     def _run(name: str, arguments: dict | None = None) -> str:
-        funcs = load_dynamic_index(org_lib_dir)
-        if name not in funcs:
+        root = _resolve_root(org_lib_dir, name)
+        if root is None:
             return _result({
                 "success": False,
                 "error": (
@@ -437,9 +586,11 @@ def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
             return _result({"success": False, "error": f"arguments are not JSON-serializable: {exc}"})
 
         runner = _RUNNER_TEMPLATE.replace("__NAME__", name)
-        container_dir = _container_lib_dir(org_lib_dir)
+        container_dir = _container_root_dir(root)
         # ``PYTHONDONTWRITEBYTECODE=1`` keeps the container from leaving a
-        # root-owned ``__pycache__`` on the (host-visible) lib dir.
+        # root-owned ``__pycache__`` on the (host-visible) function dir. The cwd
+        # is the owning root (lib OR sandbox) so ``from functions.<name>`` resolves
+        # against that root's ``functions/__init__.py``.
         cmd = (
             f"cd {shlex.quote(str(container_dir))} && "
             f"_PUX_DYN_KWARGS={shlex.quote(kwargs_json)} "
@@ -449,11 +600,11 @@ def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
         try:
             out, exit_code = exec_client.exec(cmd, timeout=DEFAULT_DYN_TIMEOUT)
         except Exception as exc:  # exec infra failure, not the function's fault
-            _bump_call(org_lib_dir, name, success=False)
+            _bump_call(root, name, success=False)
             return _result({"success": False, "error": f"exec failed: {exc}", "command": cmd})
 
         if exit_code != 0:
-            _bump_call(org_lib_dir, name, success=False)
+            _bump_call(root, name, success=False)
             return _result({
                 "success": False,
                 "error": f"function exited with code {exit_code}",
@@ -462,7 +613,7 @@ def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
             })
         payload = _extract_result(out)
         if payload is None:
-            _bump_call(org_lib_dir, name, success=False)
+            _bump_call(root, name, success=False)
             return _result({
                 "success": False,
                 "error": (
@@ -472,13 +623,13 @@ def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
                 "output": _tail(out),
             })
         if not payload.get("ok"):
-            _bump_call(org_lib_dir, name, success=False)
+            _bump_call(root, name, success=False)
             return _result({
                 "success": False,
                 "error": payload.get("error", "unknown run() failure"),
                 "output": _tail(out),
             })
-        _bump_call(org_lib_dir, name, success=True)
+        _bump_call(root, name, success=True)
         # THE THESIS: only the bounded ``value`` returns to the model — the
         # function body (however large) never enters context.
         return _result({"success": True, "value": payload.get("value")})
