@@ -1,35 +1,39 @@
 """Upstream-runtime graph declaration for ``langgraph-api`` — the OFFICIAL
-Agent Protocol server. ``langgraph.json`` points ``langgraph dev`` (localhost)
-and ``langgraph build`` (Docker image) here.
+Agent Protocol server. ``langgraph.json`` points ``langgraph build`` (the k3s
+Docker image) — and ``langgraph dev`` (local smoke of THIS lane) — here.
 
-UPSTREAM CONTRACT BINDING (the pi-pivot): the threads / runs / store /
-assistants / SSE REST surface is owned by ``langgraph-api`` (LangChain's
-reference Agent Protocol server), NOT by pux's hand-rolled ``server.py``. Each
-org = one ``graph_id`` = one assistant; the wire format is ``langgraph_sdk``'s,
-so every consumer that already talks to ``server.py`` keeps working unchanged
-against the upstream runtime. See [[protocol-surface-map]],
-[[rely-on-upstream]], [[no-legacy-left-behind]].
+TWO PROTOCOLS, TWO SURFACES (per the pi-pivot scoping):
+  * LOCAL  -> Agent CLIENT Protocol (ACP): ``deepagents-acp`` stdio JSON-RPC
+              (editors). Served by ``pux acp``; NOT here.
+  * k3s    -> Agent Protocol (AP): ``langgraph-api`` HTTP REST (threads/runs/
+              store/assistants/SSE). THIS module + ``langgraph.json``.
+This is the k3s/AP lane. langgraph-api OWNS the REST surface — pux's hand-rolled
+``server.py`` REST lane is retire-eligible (see [[protocol-surface-map]],
+[[rely-on-upstream]], [[no-legacy-left-behind]]). Each org = one ``graph_id`` =
+one assistant; the wire format is ``langgraph_sdk``'s, so consumers keep working.
 
-Two regimes, ONE ``graph_id``, explicit (no silent fallback — see
-[[no-fallbacks-no-aliases]]):
+Three graph regimes, ONE ``graph_id``, EXPLICIT (no silent fallback — see
+[[no-fallbacks-no-aliases]]); select via ``PUX_UPSTREAM_GRAPH``:
 
-* ``PUX_UPSTREAM_DEV=1`` -> a deterministic scripted-model graph (the contract
-  keystone: proves langgraph-api serves a pux-style compiled graph with the full
-  SDK surface, keyless + Dockerless — the live-server analog of the test
-  harness). Driven by ``scripts/upstream_keystone.py``.
-* absent               -> the real ``build_graph(org)`` runtime factory (Docker
-  specialists + real model + the declarative stack). langgraph-api OWNS the
-  checkpointer (``build_graph`` is called with ``checkpointer=None`` here) per
+* ``keystone`` (legacy ``PUX_UPSTREAM_DEV``) — minimal scripted ``create_agent``.
+  Portable contract keystone: proves langgraph-api serves a pux-style graph with
+  the full SDK surface, keyless + Dockerless. Driven by ``scripts/upstream_keystone.py``.
+* ``org`` — the REAL org graph via ``compile_org`` (genuine roster + prompt +
+  deepagents middleware), scripted supervisor, no specialist tools. Keyless proof
+  that the real org graph SHAPE serves upstream.
+* unset (production/k3s) — ``build_graph(org)``: Docker specialists + real model
+  + the declarative stack. Needs the provider key + Docker. langgraph-api OWNS the
+  checkpointer (``build_graph`` called with ``checkpointer=None``) per
   [[unified-thread-store]] — the owner shifts from pux's ``open_thread_store`` to
   langgraph-api's runtime checkpointer.
 
-P2 declares every discovered org as its own ``graph_id``; this module ships the
-keystone (``general``) now.
+This ships the ``general`` graph_id; multi-org discovery is a follow-up.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
@@ -40,13 +44,16 @@ from langgraph.graph.state import CompiledStateGraph
 
 
 class _ScriptedModel(BaseChatModel):
-    """Deterministic supervisor for the ``PUX_UPSTREAM_DEV`` keystone graph.
+    """Deterministic supervisor for the keyless contract graphs.
 
-    Mirrors the test-harness scripted models: a real ``BaseChatModel`` so the
-    compiled graph + its JSON Schemas are genuine, with the LLM itself scripted
-    (no API key, no Docker).
+    A real ``BaseChatModel`` so the compiled graph + its JSON Schemas are genuine,
+    with the LLM itself scripted (no API key, no Docker). ``_llm_type`` is a
+    PROPERTY returning a string — matching ``ChatOpenAI``'s contract — because
+    deepagents' ``SummarizationMiddleware`` reads ``model._llm_type`` as a string
+    ATTRIBUTE (``model._llm_type.startswith``), not a callable.
     """
 
+    @property
     def _llm_type(self) -> str:
         return "upstream-keystone"
 
@@ -59,20 +66,57 @@ class _ScriptedModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content="upstream ok"))])
 
 
-def make_graph(org: str) -> CompiledStateGraph:
-    """Build the ``graph_id`` graph for ``org``.
+def _project_root() -> Path | None:
+    """Where the ``orgs/`` tree lives. The parent repo owns it (pux-harness is its
+    submodule); ``PUX_PROJECT_ROOT`` overrides for standalone kit use."""
+    env = os.environ.get("PUX_PROJECT_ROOT")
+    if env:
+        return Path(env)
+    candidate = Path(__file__).resolve().parents[3]  # .../auto-developer-orchestrator
+    return candidate if (candidate / "orgs").is_dir() else None
 
-    ``PUX_UPSTREAM_DEV`` selects the deterministic keystone graph; otherwise the
-    real runtime factory. langgraph-api injects its OWN checkpointer at runtime,
-    so the production path passes ``checkpointer=None`` (the graph must not carry
-    a competing checkpointer — see [[unified-thread-store]]).
+
+def make_graph(org: str) -> CompiledStateGraph:
+    """Build the ``graph_id`` graph for ``org`` (Agent Protocol / k3s lane).
+
+    Graph selection is EXPLICIT — no silent fallback (see [[no-fallbacks-no-aliases]]):
+
+    * ``PUX_UPSTREAM_GRAPH=keystone`` (or legacy ``PUX_UPSTREAM_DEV``) — a minimal
+      scripted ``create_agent`` graph. Portable contract keystone: proves
+      langgraph-api serves a pux-style compiled graph with the full SDK surface,
+      keyless + Dockerless. Driven by ``scripts/upstream_keystone.py``.
+    * ``PUX_UPSTREAM_GRAPH=org`` — the REAL org graph via ``compile_org`` (genuine
+      roster + prompt + deepagents middleware) with a scripted supervisor + no
+      specialist tools. Keyless/Dockerless contract proof that the real org graph
+      SHAPE serves upstream (stronger than the keystone).
+    * unset (production / k3s) — ``build_graph(org)``: Docker specialists + real
+      model + the declarative stack. Needs the provider key + Docker. langgraph-api
+      OWNS the checkpointer (``build_graph`` called with ``checkpointer=None``) per
+      [[unified-thread-store]] — the owner shifts from pux's ``open_thread_store``
+      to langgraph-api's runtime checkpointer.
+
+    This is the k3s lane. LOCAL is ACP (``deepagents-acp``, stdio JSON-RPC) — a
+    separate surface, not served here (see [[protocol-surface-map]]).
     """
-    if os.environ.get("PUX_UPSTREAM_DEV"):
+    mode = os.environ.get("PUX_UPSTREAM_GRAPH")
+    if mode is None:
+        mode = "keystone" if os.environ.get("PUX_UPSTREAM_DEV") else "runtime"
+
+    if mode == "keystone":
         return create_agent(_ScriptedModel(), [])
 
-    # Production: pux's runtime factory. langgraph-api owns the checkpointer +
-    # store; passing None lets the runtime inject its own (the whole point of
-    # binding the checkpoint+memory surface upstream too).
+    if mode == "org":
+        from pux_harness.kit.compile import compile_org
+
+        root = _project_root()
+        if root is None:
+            raise RuntimeError(
+                "PUX_UPSTREAM_GRAPH=org needs the orgs/ tree — set PUX_PROJECT_ROOT"
+            )
+        return compile_org(org, model=_ScriptedModel(), tools=[], project_root=root)
+
+    # runtime (production / k3s): pux's runtime factory. langgraph-api owns the
+    # checkpointer + store; passing None lets the runtime inject its own.
     from pux_harness.agent.graph import build_graph
 
     return build_graph(org, checkpointer=None, store=None)

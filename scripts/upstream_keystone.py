@@ -112,10 +112,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=2024)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument(
+        "--graph", choices=("keystone", "org"), default="keystone",
+        help="keystone=minimal scripted create_agent; org=real org graph via "
+             "compile_org (scripted supervisor, no specialist tools)",
+    )
     args = ap.parse_args()
     base = f"http://{args.host}:{args.port}"
 
-    env = {**os.environ, "PUX_UPSTREAM_DEV": "1"}
+    env = {**os.environ, "PUX_UPSTREAM_GRAPH": args.graph}
     cmd = [
         "uv", "run", "langgraph", "dev",
         "--config", str(CONFIG),
@@ -124,7 +129,7 @@ def main() -> int:
         "--no-browser",
         "--no-reload",
     ]
-    print(f"[keystone] launching upstream runtime: {' '.join(cmd)}", flush=True)
+    print(f"[keystone] launching upstream runtime (graph={args.graph}): {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
