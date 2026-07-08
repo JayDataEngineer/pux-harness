@@ -66,6 +66,16 @@ from pux_harness.sandbox import host_setup, policy
 
 log = logging.getLogger("pux.container")
 
+# Container-side VNC-web port per ``sandbox.display.backend``. The standard
+# image runs x11vnc (-nopw) + websockify/noVNC on 6080; the kasm target runs
+# KasmVNC (H.264/WebRTC) on 8444. See ``sandbox/supervisord{,-kasm}.conf``.
+_DISPLAY_PORT: dict[str, int] = {"standard": 6080, "kasm": 8444}
+
+
+def display_port(backend: str) -> int:
+    """Container-side VNC-web port for a ``sandbox.display.backend`` value."""
+    return _DISPLAY_PORT.get(backend, 6080)
+
 # --- defaults (mirror backend/internal/sandbox/{manager,defaults,cache}.go) ----
 
 # The host project root (for the Docker bind-mount + the ``openshell.project-
@@ -223,6 +233,7 @@ class SandboxContainer:
         self.org = org if org is not None else os.environ.get("PUX_ORG", "")
         self._client = client
         self._name: str | None = None
+        self._watch_url: str | None = None  # cached during create(); see watch_url
 
     @property
     def client(self) -> docker.DockerClient:
@@ -406,6 +417,14 @@ class SandboxContainer:
         if cap_add:
             create_kwargs["cap_add"] = cap_add
 
+        # Display: when ``sandbox.display.watch`` is on, publish the VNC-web port
+        # so the live desktop is browser-reachable. Isolated tier gets an explicit
+        # port binding (host net already exposes the port directly). Bound to
+        # 127.0.0.1 ONLY with an ephemeral host port — x11vnc runs -nopw, so it is
+        # never LAN-exposed; the explicit opt-in carries that security property.
+        watch_on = pol is not None and pol.sandbox.display.watch
+        disp = pol.sandbox.display if watch_on else None
+
         # Network: shared-infra for isolated; host net for bridged (skips ACLs).
         if effective_tier == "bridged":
             host_display = os.environ.get("DISPLAY", "")
@@ -416,6 +435,11 @@ class SandboxContainer:
             create_kwargs["network_mode"] = "host"
         else:
             create_kwargs["network"] = _env_str("OPENSHELL_NETWORK", DEFAULT_NETWORK)
+            if disp is not None:
+                # Ephemeral host port (None) on localhost; read back after start.
+                create_kwargs["ports"] = {
+                    f"{display_port(disp.backend)}/tcp": ("127.0.0.1", None)
+                }
 
         self._remove_stale()
         log.info("creating container %s (image=%s tier=%s runtime=%s)",
@@ -441,6 +465,13 @@ class SandboxContainer:
             container.remove(force=True)
             raise ContainerError(f"start {self.name}: {exc}") from exc
 
+        # Resolve the watch URL now that the container is up (isolated: read the
+        # ephemeral host port docker assigned; bridged: host port == container
+        # port). Cached so the reuse path doesn't need to re-inspect.
+        self._watch_url = self._resolve_watch_url(container, disp, effective_tier)
+        if self._watch_url:
+            log.info("watchable desktop for %s: %s", self.name, self._watch_url)
+
         # Restore persisted state (Chrome profile, dotfiles, packages). Fire-and-
         # forget — failures don't block the sandbox (Go treats them the same way).
         self._restore_persisted(container)
@@ -458,6 +489,56 @@ class SandboxContainer:
         log.info("sandbox ready: %s (container %s)", self.name, container.id[:12])
         self._name = self.name
         return self.name
+
+    def _resolve_watch_url(
+        self,
+        container: docker.models.containers.Container,
+        disp: policy.DisplaySpec | None,
+        effective_tier: str,
+    ) -> str | None:
+        """Browser URL for the live desktop, given a running container.
+
+        ``disp`` is the resolved ``sandbox.display`` (None when watch is off).
+        Bridged (host net): the container's port IS the host's own. Isolated:
+        read the ephemeral host port docker assigned to the published binding.
+        KasmVNC serves its own TLS web client on the port; noVNC (standard) is
+        websockify's plain-HTTP client at ``/vnc.html``."""
+        if disp is None:
+            return None
+        dport = display_port(disp.backend)
+        if effective_tier == "bridged":
+            host_port = dport
+        else:
+            container.reload()
+            binds = (container.ports or {}).get(f"{dport}/tcp")
+            if not binds:
+                return None
+            host_port = int(binds[0]["HostPort"])
+        if disp.backend == "kasm":
+            return f"https://127.0.0.1:{host_port}/"
+        return f"http://127.0.0.1:{host_port}/vnc.html"
+
+    @property
+    def watch_url(self) -> str | None:
+        """Browser URL for the live desktop when ``sandbox.display.watch`` is on.
+
+        Works on both the create path (cached in ``self._watch_url``) and the
+        reuse path (inspects the running container's port bindings). Returns
+        None when watch is off or no container is up — so callers can print it
+        unconditionally and stay quiet when the org hasn't opted in."""
+        if self._watch_url:
+            return self._watch_url
+        pol, tier = self._resolve_policy()
+        if pol is None or not pol.sandbox.display.watch:
+            return None
+        name = self._name or self._running_for_project()
+        if not name:
+            return None
+        try:
+            c = self.client.containers.get(name)
+        except NotFound:
+            return None
+        return self._resolve_watch_url(c, pol.sandbox.display, tier)
 
     def _ensure_image(
         self, image: str, build: policy.BuildSpec | None = None

@@ -149,11 +149,29 @@ class DepsSpec:
 
 
 @dataclass
+class DisplaySpec:
+    """``sandbox.display`` — publish the watchable desktop so a human can open
+    the sandbox's live screen in a browser. The image already runs the full
+    noVNC/KasmVNC stack under supervisord (Xvfb :99 → x11vnc → websockify);
+    this just maps its VNC-web port to a host port so it's reachable.
+
+    ``watch: true`` publishes the port bound to ``127.0.0.1`` ONLY with an
+    ephemeral host port — x11vnc runs passwordless (``-nopw``), so it is NEVER
+    exposed to the LAN. Default off: an explicit opt-in carries the security
+    property. ``backend`` selects the image variant's VNC-web port:
+    ``standard`` (noVNC, 6080) or ``kasm`` (KasmVNC H.264/WebRTC, 8444)."""
+
+    watch: bool = False
+    backend: str = "standard"
+
+
+@dataclass
 class SandboxSpec:
     image: str = ""
     tier: str = ""  # "isolated" or "bridged"
     build: BuildSpec = field(default_factory=BuildSpec)
     deps: DepsSpec = field(default_factory=DepsSpec)
+    display: DisplaySpec = field(default_factory=DisplaySpec)
 
 
 @dataclass
@@ -294,11 +312,27 @@ def _policy_from_dict(d: Mapping) -> Policy:
         )
     else:
         deps = DepsSpec()
+    display_map = sb.get("display")
+    if display_map is not None:
+        if not isinstance(display_map, Mapping):
+            raise PolicyError("policy: section 'sandbox.display' must be a mapping")
+        backend = str(display_map.get("backend", "standard") or "standard")
+        if backend not in ("standard", "kasm"):
+            raise PolicyError(
+                f"policy: sandbox.display.backend {backend!r} must be 'standard' or 'kasm'"
+            )
+        display = DisplaySpec(
+            watch=bool(display_map.get("watch", False)),
+            backend=backend,
+        )
+    else:
+        display = DisplaySpec()
     pol.sandbox = SandboxSpec(
         image=str(sb.get("image", "") or ""),
         tier=str(sb.get("tier", "") or ""),
         build=build,
         deps=deps,
+        display=display,
     )
     br = _section("browser")
     pol.browser = BrowserSpec(

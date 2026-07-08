@@ -407,6 +407,10 @@ async def _run_task(run_id: str, org: str, thread_id: str, raw_input: Any, rl: i
     try:
         from pux_harness.sandbox.container import prepare  # noqa: PLC0415
         job_results = prepare(org)
+        from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
+        _watch_url = SandboxContainer(org=org).watch_url
+        if _watch_url:
+            app.state.run_meta[run_id]["watch_url"] = _watch_url
         if job_results:
             failed = [r for r in job_results if r["status"] != "ok"]
             if failed:

@@ -146,6 +146,11 @@ async def _run(
                       + (f"  {r['error'][:80]}" if r.get("error") else ""))
             if failed:
                 print(f"\n  {len(failed)} prep job(s) failed (continuing to agent)")
+        # Surface the watchable-desktop URL when sandbox.display.watch is on.
+        from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
+        _watch = SandboxContainer(org=org).watch_url
+        if _watch:
+            print(f"  [watch] live desktop → {_watch}")
         print(f"[org] {org}   [task] {task}\n")
         # Arm the org's RubricMiddleware gate. An explicit ``rubric``
         # (the ``--rubric`` override) wins; otherwise fall back to the org's shipped
@@ -348,11 +353,11 @@ def _sandbox(cmd: str) -> int:
 
     if cmd == "start":
         name = sb.ensure()
-        _print_status(name, project, org)
+        _print_status(sb, name, project, org)
         return 0
     if cmd == "ensure":
         name = sb.ensure()
-        _print_status(name, project, org)
+        _print_status(sb, name, project, org)
         return 0
     if cmd == "stop":
         sb.destroy()
@@ -366,14 +371,14 @@ def _sandbox(cmd: str) -> int:
         if name is None:
             print(f"not running (no container for {project})")
             return 1
-        _print_status(name, project, org)
+        _print_status(sb, name, project, org)
         return 0
     raise SystemExit(
         f"unknown sandbox subcommand {cmd!r}; use: start | stop | status | ensure"
     )
 
 
-def _print_status(name: str, project: str, org: str) -> None:
+def _print_status(sb, name: str, project: str, org: str) -> None:
     import docker  # noqa: PLC0415
 
     c = docker.from_env(timeout=10).containers.get(name)
@@ -385,6 +390,9 @@ def _print_status(name: str, project: str, org: str) -> None:
     print(f"  Org policy  {org}")
     print(f"  Network     {','.join(c.attrs['NetworkSettings']['Networks'].keys())}")
     print(f"  Runtime     {c.attrs['HostConfig']['Runtime'] or 'default'}")
+    watch = sb.watch_url
+    if watch:
+        print(f"  Watch       {watch}")
 
 
 def _check_contract() -> int:
