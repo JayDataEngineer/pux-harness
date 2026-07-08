@@ -172,6 +172,12 @@ class SandboxSpec:
     build: BuildSpec = field(default_factory=BuildSpec)
     deps: DepsSpec = field(default_factory=DepsSpec)
     display: DisplaySpec = field(default_factory=DisplaySpec)
+    # ``sandbox.dynamic_tools`` — opt the org INTO level (c): agent-authored
+    # Python functions under ``orgs/<org>/lib/functions/`` that persist between
+    # runs and are callable in-container (the tool rung that *compounds* — see
+    # ``docs/dynamic-tools-and-packaging.md`` Part 1). Default off: an explicit
+    # opt-in, mirroring ``display.watch`` / ``deps``.
+    dynamic_tools: bool = False
 
 
 @dataclass
@@ -327,12 +333,23 @@ def _policy_from_dict(d: Mapping) -> Policy:
         )
     else:
         display = DisplaySpec()
+    dynamic_tools_raw = sb.get("dynamic_tools")
+    if dynamic_tools_raw is None:
+        dynamic_tools = False
+    elif not isinstance(dynamic_tools_raw, bool):
+        raise PolicyError(
+            f"policy: sandbox.dynamic_tools must be a bool, "
+            f"got {type(dynamic_tools_raw).__name__}"
+        )
+    else:
+        dynamic_tools = dynamic_tools_raw
     pol.sandbox = SandboxSpec(
         image=str(sb.get("image", "") or ""),
         tier=str(sb.get("tier", "") or ""),
         build=build,
         deps=deps,
         display=display,
+        dynamic_tools=dynamic_tools,
     )
     br = _section("browser")
     pol.browser = BrowserSpec(

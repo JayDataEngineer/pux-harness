@@ -82,6 +82,7 @@ from pux_harness.agent import model as model_mod
 from pux_harness.agent import stack as stack_mod
 from pux_harness.agent import tool_servers as tool_servers_mod
 from pux_harness.sandbox.tools import declared as declared_mod
+from pux_harness.sandbox.tools import dynamic as dynamic_mod
 from pux_harness.sandbox.tools import (
     NATIVE_FS_TOOLS,
     SPECIALIST_TOOL_NAMES,
@@ -445,16 +446,33 @@ def check_org(name: str) -> list[Violation]:
     # (the old paths diverged on native slugs). No server probe — pure Python,
     # runs identically in pytest and ``--check-contract``.
     declared_names = declared_mod.declared_tool_names(org_dir / "sandbox")
+    # Dynamic (level c) tool vocabulary — admitted ONLY when the org opts in
+    # (``sandbox.dynamic_tools: true``), matching runtime (``build_stack``
+    # builds the ``pux_dyn_*`` tools iff enabled). Accepts bare
+    # (``call_function``) OR prefixed (``pux_dyn_call_function``) forms in an
+    # agent ``tools:`` allowlist.
+    dyn_names = (
+        dynamic_mod.DYNAMIC_TOOL_NAMES
+        if profile_mod.load_dynamic_tools_enabled(name)
+        else frozenset()
+    )
     for slug, sub in agent_subagents.items():
         for raw in _parse_list(sub.get("tools", [])):
             tool = raw.rsplit("/", 1)[-1]
-            if classify_slug(tool) is None and tool not in declared_names:
+            bare = (
+                tool[len(dynamic_mod.PUX_DYN_PREFIX):]
+                if tool.startswith(dynamic_mod.PUX_DYN_PREFIX)
+                else tool
+            )
+            if (classify_slug(tool) is None
+                    and tool not in declared_names
+                    and bare not in dyn_names):
                 v.append(Violation("error", "tool-resolves",
                                    f"{name}/{slug}: tool {raw!r} -> "
                                    f"{prefixed(tool, Category.SPECIALIST)!r} "
                                    f"not a native fs tool, a "
-                                   f"pux_sandbox_* specialist, or a declared "
-                                   f"sandbox tool"))
+                                   f"pux_sandbox_* specialist, a declared "
+                                   f"sandbox tool, or a pux_dyn_* dynamic tool"))
 
     # Declared sandbox tools are their own channel (policy-independent): validate
     # every org unconditionally, even those with no ``policy.yaml``. No-op when

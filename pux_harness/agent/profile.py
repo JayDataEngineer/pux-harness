@@ -46,6 +46,7 @@ from langchain_core.tools import BaseTool
 
 from pux_harness.agent import orgs as _orgs_mod
 from pux_harness.agent.model import ROLE_KEYS
+from pux_harness.sandbox import policy as _policy_mod
 
 __all__ = [
     "RubricGate",
@@ -664,6 +665,31 @@ def load_ask_user_enabled(org: str) -> bool:
             f"got {type(val).__name__}: {val!r}"
         )
     return val
+
+
+def load_dynamic_tools_enabled(org: str) -> bool:
+    """Read ``sandbox.dynamic_tools`` from ``orgs/<org>/policy.yaml``.
+
+    ``True`` opts the org INTO level (c): the four ``pux_dyn_*`` tools
+    (``make_function`` / ``edit_function`` / ``list_functions`` /
+    ``call_function``) that let the agent author + call persistent Python under
+    ``orgs/<org>/lib/functions/`` (built in
+    ``sandbox.tools.dynamic.build_dynamic_tools``, wired by
+    ``stack.build_stack``). ``False`` — no ``policy.yaml``, or no
+    ``sandbox.dynamic_tools`` key — is the byte-identical default: no dynamic
+    tools anywhere in the stack.
+
+    Reads POLICY.yaml (NOT profile.yaml): the flag lives beside ``deps`` /
+    ``display`` because dynamic-tools config is sandbox-shaped, exactly like
+    them, and is read via the same ``policy.load`` the container uses.
+    ``NoPolicy`` (no policy.yaml) → ``False``; a non-bool value already raised
+    ``PolicyError`` at parse time, so the field is typed here.
+    """
+    try:
+        pol = _policy_mod.load(org, _orgs_mod.project_root())
+    except _policy_mod.NoPolicy:
+        return False
+    return pol.sandbox.dynamic_tools
 
 
 def load_profile(org: str) -> HarnessProfileConfig | None:

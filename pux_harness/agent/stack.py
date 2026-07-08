@@ -78,6 +78,7 @@ from pux_harness.agent.profile import (
     MiddlewareOverrides,
     apply_profile_to_tools,
     load_ask_user_enabled,
+    load_dynamic_tools_enabled,
     load_middleware_overrides,
     load_model_retry,
     load_tool_retry,
@@ -96,6 +97,7 @@ from pux_harness.sandbox.tools.declared import (
     build_script_redirects,
     load_declared_specs,
 )
+from pux_harness.sandbox.tools.dynamic import build_dynamic_tools
 
 __all__ = [
     "Scope",
@@ -629,11 +631,23 @@ def build_stack(
     # specialists (``_resolve_tools`` admits anything present in the map).
     declared = build_declared_tools(_org_path(org) / "sandbox", exec_client)
 
+    # Dynamic (level c) tools — opt-in via ``sandbox.dynamic_tools: true``. The
+    # four ``pux_dyn_*`` tools let the agent author + call persistent Python
+    # under ``orgs/<org>/lib/`` (see ``docs/dynamic-tools-and-packaging.md``
+    # Part 1). Byte-identical stack ([]) for orgs that do not opt in. Rides the
+    # SAME surface as specialists/declared so a subagent can be granted one via
+    # its ``tools:`` allowlist.
+    dynamic = (
+        build_dynamic_tools(_org_path(org) / "lib", exec_client)
+        if load_dynamic_tools_enabled(org)
+        else []
+    )
+
     # Tools: MCP tools first (so profile overrides can shape them), then every
-    # specialist + declared + the retrieval surface. Declared tools ride the
-    # SAME surface as specialists so the supervisor can call them AND a subagent
-    # can be granted one via its ``tools:`` allowlist.
-    tools_surface: list[BaseTool] = [*specialists, *declared]
+    # specialist + declared + dynamic + the retrieval surface. Declared + dynamic
+    # tools ride the SAME surface as specialists so the supervisor can call them
+    # AND a subagent can be granted one via its ``tools:`` allowlist.
+    tools_surface: list[BaseTool] = [*specialists, *declared, *dynamic]
     supervisor_tools: list[BaseTool] = [*mcp_tools, *tools_surface, *ctx_tools]
     if profile is not None:
         supervisor_tools = apply_profile_to_tools(supervisor_tools, profile)
