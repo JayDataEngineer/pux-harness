@@ -104,22 +104,29 @@ def _browser_navigate_tool(exec_client: DockerExecClient) -> StructuredTool:
 _BROWSER_CLICK_DESC = (
     "Click an element on the current page. Pass either a SoM label (integer "
     "from the labeled screenshot) or a CSS selector string. Returns the "
-    "post-click page state (URL, title, screenshot)."
+    "post-click page state (URL, title, screenshot). For anti-bot sites "
+    "(Cloudflare Turnstile, behavioral fingerprinting) that ignore normal "
+    "clicks, set trusted=true to drive the real OS cursor via CDP "
+    "(isTrusted=true) — only when a normal click silently no-ops."
 )
 
 
 class _BrowserClickArgs(BaseModel):
     index: int | None = Field(None, description="SoM label (numbered box on interactive elements from the last screenshot)")
     selector: str | None = Field(None, description="CSS selector (e.g. 'button#submit'). Used when index is omitted.")
+    trusted: bool = Field(False, description="Trusted input: drive the real cursor via CDP Input (isTrusted=true) so anti-bot defenses register a genuine click. Default false (Selenium click). Use only when a normal click silently no-ops on a protected site.")
 
 
 def _browser_click_tool(exec_client: DockerExecClient) -> StructuredTool:
-    def _run(index: int | None = None, selector: str | None = None) -> str:
+    def _run(index: int | None = None, selector: str | None = None,
+             trusted: bool = False) -> str:
         body: dict = {}
         if index is not None:
             body["index"] = index
         if selector is not None:
             body["selector"] = selector
+        if trusted:
+            body["trusted"] = True
         return _sb_post(exec_client, "/click", body)
 
     return StructuredTool(
@@ -133,7 +140,9 @@ def _browser_click_tool(exec_client: DockerExecClient) -> StructuredTool:
 _BROWSER_TYPE_DESC = (
     "Type text into a form field on the current page. Uses CDP character-by-"
     "character input (React-safe — fires real DOM events). Pass either a SoM "
-    "label or CSS selector to identify the target input."
+    "label or CSS selector to identify the target input. For anti-bot sites "
+    "with keystroke-fingerprinting, set trusted=true to type via CDP "
+    "Input.insertText (isTrusted input events)."
 )
 
 
@@ -141,10 +150,12 @@ class _BrowserTypeArgs(BaseModel):
     text: str = Field(..., description="Text to type into the field")
     index: int | None = Field(None, description="SoM label of the target input")
     selector: str | None = Field(None, description="CSS selector of the target input")
+    trusted: bool = Field(False, description="Trusted input: type via CDP Input.insertText (isTrusted input events) instead of the native value-setter. Default false. Use for keystroke-fingerprinting anti-bot defenses.")
 
 
 def _browser_type_tool(exec_client: DockerExecClient) -> StructuredTool:
-    def _run(text: str, index: int | None = None, selector: str | None = None) -> str:
+    def _run(text: str, index: int | None = None, selector: str | None = None,
+             trusted: bool = False) -> str:
         if not text:
             return _result({"success": False, "error": "text is required"})
         if index is None and not selector:
@@ -154,6 +165,8 @@ def _browser_type_tool(exec_client: DockerExecClient) -> StructuredTool:
             body["index"] = index
         if selector is not None:
             body["selector"] = selector
+        if trusted:
+            body["trusted"] = True
         return _sb_post(exec_client, "/type", body)
 
     return StructuredTool(
@@ -826,12 +839,14 @@ class _BrowserClickAtArgs(BaseModel):
     button: int = Field(0, description="mouse button: 0=left (default), 1=middle, 2=right")
     double: bool = Field(False, description="true → double-click")
     right: bool = Field(False, description="true → right-click (dispatches contextmenu)")
+    trusted: bool = Field(False, description="Trusted input: drive the real cursor via CDP Input (isTrusted=true). Default false. Use for anti-bot sites that ignore synthetic clicks.")
 
 
 def _browser_click_at_tool(exec_client: DockerExecClient) -> StructuredTool:
     def _run(x: float | None = None, y: float | None = None,
              index: int | None = None, selector: str | None = None,
-             button: int = 0, double: bool = False, right: bool = False) -> str:
+             button: int = 0, double: bool = False, right: bool = False,
+             trusted: bool = False) -> str:
         has_target = x is not None or y is not None or index is not None or selector
         if not has_target:
             return _result({"success": False, "error": "click_at needs x,y OR index/selector"})
@@ -840,6 +855,8 @@ def _browser_click_at_tool(exec_client: DockerExecClient) -> StructuredTool:
         if y is not None: body["y"] = y
         if index is not None: body["index"] = index
         if selector: body["selector"] = selector
+        if trusted:
+            body["trusted"] = True
         return _sb_post(exec_client, "/click_at", body)
 
     return StructuredTool(
