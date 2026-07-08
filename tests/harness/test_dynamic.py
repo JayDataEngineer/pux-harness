@@ -312,3 +312,36 @@ def test_index_round_trip_sorted(org_lib):
 def test_load_index_absent_returns_empty(org_lib):
     # no lib dir at all yet
     assert D.load_dynamic_index(org_lib / "nested") == {}
+
+
+# --- runner template against REAL python3 (prove, don't assert) -------------
+
+def test_runner_executes_against_real_python3(org_lib):
+    """The riskiest piece is the in-container runner template (``python3 -c``
+    doing ``from functions.<name> import run``). Prove it end-to-end against
+    REAL python3 — not a ``_FakeExec`` — in the exact shape ``call_function``
+    builds: cwd = lib dir, kwargs via env var, ``PYTHONDONTWRITEBYTECODE=1``.
+    Host python3 shares the container's cwd/``sys.path[0]`` semantics, so this
+    covers import + run + marker + JSON + the bytecache guard; only container
+    egress ACLs (not exercised by a pure compute fn) wait on a live container."""
+    import os
+    import subprocess
+
+    D._ensure_lib_skeleton(org_lib)
+    (org_lib / "functions" / "add.py").write_text(
+        "def run(**kwargs):\n    return sum(kwargs['nums'])\n"
+    )
+    runner = D._RUNNER_TEMPLATE.replace("__NAME__", "add")
+    env = {
+        **os.environ,
+        "_PUX_DYN_KWARGS": json.dumps({"nums": [10, 20, 30]}),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    proc = subprocess.run(
+        ["python3", "-c", runner], cwd=str(org_lib), env=env,
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"runner failed: {proc.stderr}"
+    assert D._extract_result(proc.stdout) == {"ok": True, "value": 60}
+    # the bytecache guard keeps a root-owned __pycache__ off the host-visible lib
+    assert not (org_lib / "functions" / "__pycache__").exists()
