@@ -113,6 +113,32 @@ class ThreadStore:
             return None
         return {"thread_id": r[0], "org": r[1], "metadata": r[2], "created_at": r[3]}
 
+    async def merge_metadata(
+        self, thread_id: str, metadata: dict[str, Any],
+    ) -> bool:
+        """Shallow-merge ``metadata`` into the thread's stored metadata (the
+        ``PATCH /threads/{id}`` path — the SDK ``threads.update``).
+
+        Returns ``False`` when the thread isn't registered (caller raises 404);
+        ``True`` on a successful merge. The merge is shallow (top-level keys
+        overwritten/added), matching langgraph-api's behavior.
+        """
+        cur = await self.db.execute(
+            "SELECT metadata FROM pux_threads WHERE thread_id = ?", (thread_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return False
+        existing = json.loads(row[0] or "{}")
+        existing.update(metadata)
+        await self.db.execute(
+            "UPDATE pux_threads SET metadata = ? WHERE thread_id = ?",
+            (json.dumps(existing), thread_id),
+        )
+        await self.db.commit()
+        return True
+
 
 @asynccontextmanager
 async def open_thread_store(

@@ -48,6 +48,7 @@ vs adopting an opinionated runtime), and the REST contract is identical either
 way — swapping the server impl behind these endpoints is invisible to clients,
 so the choice is reversible.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -59,7 +60,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
@@ -82,6 +83,7 @@ DEFAULT_RECURSION_LIMIT = 60
 
 # --- request / response models (kept loose: the spec's input/output is free-form) -
 
+
 class ThreadCreate(BaseModel):
     agent_id: str
     metadata: dict[str, Any] = {}
@@ -93,7 +95,7 @@ class ThreadSearch(BaseModel):
 
 
 class RunCreate(BaseModel):
-    input: Any = None            # str | {"messages": [...]} | dict
+    input: Any = None  # str | {"messages": [...]} | dict
     metadata: dict[str, Any] = {}
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     # Resume an interrupted run: ``{"resume": <value>}`` drives
@@ -107,7 +109,7 @@ class EphemeralRun(BaseModel):
     input: Any = None
     metadata: dict[str, Any] = {}
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
-    command: dict[str, Any] | None = None   # resume — see RunCreate.command
+    command: dict[str, Any] | None = None  # resume — see RunCreate.command
 
 
 def _now() -> str:
@@ -172,10 +174,12 @@ async def lifespan(app: FastAPI):
         # (matches the localhost single-user model); swap to AsyncSqliteStore for
         # persistence in a follow-up.
         from langgraph.store.memory import InMemoryStore  # noqa: PLC0415
+
         app.state.base_store = InMemoryStore()
 
         # Load foreign MCP tool servers for every org that declares them.
         from pux_harness.agent.mcp_client import McpSessionManager  # noqa: PLC0415
+
         _mcp_managers: dict[str, McpSessionManager] = {}
         for org_name in discover_orgs():
             try:
@@ -196,6 +200,7 @@ async def lifespan(app: FastAPI):
         if _HAS_AG_UI:
             from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
             from pux_harness.kit._paths import project_root  # noqa: PLC0415
+
             # The module-level ``app`` is reused across lifespans (in tests every
             # TestClient context re-enters lifespan; production runs one). Mounting
             # APPENDS a route per call, so without dropping the prior mount a later
@@ -205,8 +210,7 @@ async def lifespan(app: FastAPI):
             # fresh each lifespan so the active graph's connection is live.
             # No-op on a fresh app; correct for any in-process re-mount.
             app.router.routes[:] = [
-                r for r in app.router.routes
-                if not getattr(r, "path", "").startswith("/agui/")
+                r for r in app.router.routes if not getattr(r, "path", "").startswith("/agui/")
             ]
             for org_name in discover_orgs():
                 if "agui" not in policy_mod.protocols_for_org(org_name, project_root()):
@@ -242,6 +246,7 @@ try:
     # the venv). The interrupt handling the ask_user web proof depends on lives in
     # ag_ui_langgraph/agent.py, so LangGraphAgent covers it natively.
     from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint  # noqa: F401
+
     _HAS_AG_UI = True
 except ImportError:
     pass
@@ -262,9 +267,10 @@ def _get_graph(org: str) -> CompiledStateGraph:
         # lifespan) — so a ``/store/items`` put is visible to the graph's memory
         # tools, and the REST + graph memory surfaces are one backend.
         app.state.graphs[org] = build_graph(
-            org, checkpointer=app.state.saver, store=app.state.base_store,
-            facts=RuntimeFacts(transport="serve",
-                               autonomous=autonomous_from_env()),
+            org,
+            checkpointer=app.state.saver,
+            store=app.state.base_store,
+            facts=RuntimeFacts(transport="serve", autonomous=autonomous_from_env()),
             mcp_tools=app.state.mcp.get(org, ()),
         )
     return app.state.graphs[org]
@@ -292,6 +298,7 @@ class RunOutcome:
     ``status="interrupted"`` (never a silent ``success``); the client resumes by
     POSTing a new run carrying ``command={"resume": ...}`` on the same thread.
     """
+
     output: str
     interrupted: bool
     interrupts: list[dict[str, Any]]
@@ -315,15 +322,11 @@ def _graph_input(org: str, body: Any) -> Any:
     return state
 
 
-async def _invoke_once(
-    org: str, thread_id: str, body: Any, recursion_limit: int
-) -> RunOutcome:
+async def _invoke_once(org: str, thread_id: str, body: Any, recursion_limit: int) -> RunOutcome:
     """Run one org graph invocation on a thread; return the outcome with
     interrupt status. Handles both fresh input and resume ``Command`` payloads."""
     graph = _get_graph(org)
-    config = build_invoke_config(
-        thread_id, recursion_limit, org, transport="serve"
-    )
+    config = build_invoke_config(thread_id, recursion_limit, org, transport="serve")
     result = await graph.ainvoke(_graph_input(org, body), config=config)
     snap = await graph.aget_state(config)
     # ainvoke returns on interrupt with state.next non-empty (the pending node).
@@ -338,12 +341,14 @@ async def _invoke_once(
 
 # --- health -------------------------------------------------------------------
 
+
 @app.get("/ok")
 async def health() -> dict[str, Any]:
     return {"ok": True, "orgs": discover_orgs()}
 
 
 # --- agents (introspection) ---------------------------------------------------
+
 
 @app.post("/agents/search")
 async def agents_search() -> list[dict[str, Any]]:
@@ -358,6 +363,7 @@ async def agent_get(agent_id: str) -> dict[str, Any]:
 
 
 # --- threads ------------------------------------------------------------------
+
 
 @app.post("/threads")
 async def thread_create(body: ThreadCreate) -> dict[str, Any]:
@@ -399,14 +405,22 @@ async def threads_search(body: ThreadSearch = ThreadSearch()) -> list[dict[str, 
 @app.get("/threads/{thread_id}")
 async def thread_get(thread_id: str) -> dict[str, Any]:
     org = await _require_thread(thread_id)
+    return await _thread_descriptor(thread_id, org)
+
+
+async def _thread_descriptor(thread_id: str, org: str) -> dict[str, Any]:
+    """The canonical thread shape GET/PATCH/copy return: id + org + status +
+    merged metadata + current graph values. Shared so the descriptor can't drift
+    between the read + write endpoints."""
     graph = _get_graph(org)
     snap = await graph.aget_state({"configurable": {"thread_id": thread_id}})
-    values = snap.values or {}
+    row = await app.state.store.get_thread(thread_id) or {}
     return {
         "thread_id": thread_id,
         "agent_id": org,
         "status": _status_from_snapshot(snap),
-        "values": _jsonable(values),
+        "metadata": json.loads(row.get("metadata") or "{}"),
+        "values": _jsonable(snap.values or {}),
         "next": snap.next,
     }
 
@@ -440,7 +454,62 @@ async def thread_history(thread_id: str) -> list[dict[str, Any]]:
     return out
 
 
+class ThreadUpdate(BaseModel):
+    """``PATCH /threads/{id}`` body (the SDK ``threads.update``). ``metadata`` is
+    shallow-merged into the stored metadata; ``ttl`` is accepted for wire
+    compatibility but ignored (the sqlite index has no TTL — a follow-up)."""
+
+    metadata: dict[str, Any] = {}
+    ttl: int | dict[str, Any] | None = None
+
+
+@app.patch("/threads/{thread_id}")
+async def thread_update(
+    thread_id: str,
+    body: ThreadUpdate,
+    prefer: str | None = Header(default=None, alias="Prefer"),
+) -> Any:
+    """Merge metadata into a thread (the SDK ``threads.update`` path). Honors
+    ``Prefer: return=minimal`` → 204 no body; otherwise returns the updated
+    thread descriptor."""
+    org = await _require_thread(thread_id)
+    await app.state.store.merge_metadata(thread_id, body.metadata)
+    if prefer and "return=minimal" in prefer:
+        return Response(status_code=204)
+    return await _thread_descriptor(thread_id, org)
+
+
+@app.post("/threads/{thread_id}/copy")
+async def thread_copy(thread_id: str) -> dict[str, Any]:
+    """Fork a thread: register a new thread_id under the same org + copied
+    metadata, then copy the current checkpoint state across (the SDK
+    ``threads.copy`` path; returns the new descriptor — the SDK itself discards
+    it, but raw clients use it).
+
+    Current-state copy (not full history): ``AsyncSqliteSaver`` exposes no
+    history-duplicate op, so the new thread carries the source's latest
+    checkpoint — enough to continue the conversation from the fork point.
+    """
+    org = await _require_thread(thread_id)
+    src = await app.state.store.get_thread(thread_id) or {}
+    new_id = str(uuid.uuid4())
+    await app.state.store.register_thread(
+        new_id,
+        org,
+        json.loads(src.get("metadata") or "{}"),
+    )
+    graph = _get_graph(org)
+    snap = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    if snap.values:
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": new_id}},
+            snap.values,
+        )
+    return await _thread_descriptor(new_id, org)
+
+
 # --- runs ---------------------------------------------------------------------
+
 
 @app.post("/runs/wait")
 async def run_ephemeral(body: EphemeralRun) -> dict[str, Any]:
@@ -467,8 +536,7 @@ async def run_ephemeral(body: EphemeralRun) -> dict[str, Any]:
         }
     base = {"thread_id": thread_id, "agent_id": body.agent_id}
     if outcome.interrupted:
-        return {**base, "status": "interrupted", "output": "",
-                "interrupts": outcome.interrupts}
+        return {**base, "status": "interrupted", "output": "", "interrupts": outcome.interrupts}
     return {**base, "status": "success", "output": outcome.output}
 
 
@@ -477,8 +545,10 @@ async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -
     # Run prep jobs after container is up, before the agent loop.
     try:
         from pux_harness.sandbox.container import prepare  # noqa: PLC0415
+
         job_results = prepare(org)
         from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
+
         _watch_url = SandboxContainer(org=org).watch_url
         if _watch_url:
             app.state.run_meta[run_id]["watch_url"] = _watch_url
@@ -496,13 +566,13 @@ async def _run_task(run_id: str, org: str, thread_id: str, body: Any, rl: int) -
         outcome = await _invoke_once(org, thread_id, body, rl)
         if outcome.interrupted:
             app.state.run_meta[run_id].update(
-                status="interrupted", output="", error=None,
+                status="interrupted",
+                output="",
+                error=None,
                 interrupts=outcome.interrupts,
             )
         else:
-            app.state.run_meta[run_id].update(
-                status="success", output=outcome.output, error=None
-            )
+            app.state.run_meta[run_id].update(status="success", output=outcome.output, error=None)
     except Exception as exc:  # noqa: BLE001
         app.state.run_meta[run_id].update(
             status="error", output="", error=f"{type(exc).__name__}: {exc}"
@@ -538,6 +608,47 @@ async def thread_runs_list(thread_id: str) -> list[dict[str, Any]]:
     ]
 
 
+@app.get("/threads/{thread_id}/runs/{run_id}")
+async def thread_run_get(thread_id: str, run_id: str) -> dict[str, Any]:
+    """Get one run's metadata (the SDK ``runs.get`` path). 404 if the run isn't
+    on this thread."""
+    await _require_thread(thread_id)
+    meta = app.state.run_meta.get(run_id)
+    if meta is None or meta.get("thread_id") != thread_id:
+        raise HTTPException(status_code=404, detail=f"unknown run {run_id!r}")
+    return {**meta, "alive": (run_id in app.state.runs and not app.state.runs[run_id].done())}
+
+
+@app.delete("/threads/{thread_id}/runs/{run_id}")
+async def thread_run_delete(thread_id: str, run_id: str) -> Response:
+    """Delete a run: cancel the task if still in flight, then drop its metadata
+    (the SDK ``runs.delete`` path). 204 no body — the SDK discards."""
+    await _require_thread(thread_id)
+    meta = app.state.run_meta.get(run_id)
+    if meta is None or meta.get("thread_id") != thread_id:
+        raise HTTPException(status_code=404, detail=f"unknown run {run_id!r}")
+    task = app.state.runs.pop(run_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+    app.state.run_meta.pop(run_id, None)
+    return Response(status_code=204)
+
+
+@app.get("/threads/{thread_id}/runs/{run_id}/join")
+async def thread_run_join(thread_id: str, run_id: str) -> dict[str, Any]:
+    """Block until the run completes, then return the thread's final state (the
+    SDK ``runs.join`` path — a long-poll GET for a background run's result). 404
+    if the run isn't on this thread."""
+    org = await _require_thread(thread_id)
+    meta = app.state.run_meta.get(run_id)
+    if meta is None or meta.get("thread_id") != thread_id:
+        raise HTTPException(status_code=404, detail=f"unknown run {run_id!r}")
+    task = app.state.runs.get(run_id)
+    if task is not None:
+        await task  # the _run_task coroutine; resolves to None on completion
+    return await _thread_descriptor(thread_id, org)
+
+
 @app.get("/runs/{run_id}/wait")
 async def run_wait(run_id: str) -> dict[str, Any]:
     meta = app.state.run_meta.get(run_id)
@@ -570,6 +681,7 @@ async def run_cancel(run_id: str) -> dict[str, Any]:
 # ``StoreClient`` sends verbatim (the contract Studio + the SDK + any
 # langgraph-api client hits): PUT/GET/DELETE ``/store/items``,
 # POST ``/store/items/search``, POST ``/store/namespaces``.
+
 
 class StorePutItem(BaseModel):
     namespace: list[str]
@@ -624,14 +736,20 @@ async def store_put_item(body: StorePutItem) -> dict[str, Any]:
                 detail=f"namespace label {label!r} may not contain '.'",
             )
     await app.state.base_store.aput(
-        tuple(body.namespace), body.key, body.value, body.index, ttl=body.ttl,
+        tuple(body.namespace),
+        body.key,
+        body.value,
+        body.index,
+        ttl=body.ttl,
     )
     return {}  # the SDK discards the PUT response
 
 
 @app.get("/store/items")
 async def store_get_item(
-    namespace: str, key: str, refresh_ttl: bool | None = None,
+    namespace: str,
+    key: str,
+    refresh_ttl: bool | None = None,
 ) -> dict[str, Any]:
     """Read one item by dotted namespace + key (the SDK ``get_item`` path). 404
     when absent — the SDK raises for it."""
@@ -655,8 +773,11 @@ async def store_search_items(body: StoreSearchItems) -> dict[str, Any]:
     ``{"items": [...]}`` — the SDK unwraps the list itself."""
     items = await app.state.base_store.asearch(
         tuple(body.namespace_prefix),
-        query=body.query, filter=body.filter,
-        limit=body.limit, offset=body.offset, refresh_ttl=body.refresh_ttl,
+        query=body.query,
+        filter=body.filter,
+        limit=body.limit,
+        offset=body.offset,
+        refresh_ttl=body.refresh_ttl,
     )
     return {"items": [_store_item(i) for i in items]}
 
@@ -666,13 +787,17 @@ async def store_list_namespaces(body: StoreListNamespaces) -> list[list[str]]:
     """List namespaces under a prefix/suffix/depth (the SDK ``list_namespaces``
     path). Returns the raw list of namespace paths."""
     ns = await app.state.base_store.alist_namespaces(
-        prefix=body.prefix, suffix=body.suffix, max_depth=body.max_depth,
-        limit=body.limit, offset=body.offset,
+        prefix=body.prefix,
+        suffix=body.suffix,
+        max_depth=body.max_depth,
+        limit=body.limit,
+        offset=body.offset,
     )
     return [list(n) for n in ns]
 
 
 # --- streaming (SSE) ---------------------------------------------------------
+
 
 def _sse(event: str, data: Any) -> str:
     """One SSE v1 frame — ``event: <e>\\ndata: <json>\\n\\n`` — the exact wire
@@ -685,7 +810,11 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
 async def _stream_run(
-    org: str, thread_id: str, body: Any, recursion_limit: int, run_id: str,
+    org: str,
+    thread_id: str,
+    body: Any,
+    recursion_limit: int,
+    run_id: str,
 ) -> Any:
     """Yield v1 SSE frames for one run: a leading ``metadata`` event, then the
     langgraph stream modes (``messages``/``updates``/``values``), then an
@@ -693,13 +822,12 @@ async def _stream_run(
     key in the final ``values``/``updates`` events — the client reads it +
     resumes with ``command={"resume": ...}`` on the same thread."""
     graph = _get_graph(org)
-    config = build_invoke_config(
-        thread_id, recursion_limit, org, transport="serve"
-    )
+    config = build_invoke_config(thread_id, recursion_limit, org, transport="serve")
     yield _sse("metadata", {"run_id": run_id})
     try:
         async for mode, chunk in graph.astream(
-            _graph_input(org, body), config=config,
+            _graph_input(org, body),
+            config=config,
             stream_mode=["messages", "updates", "values"],
         ):
             if mode == "messages":
@@ -743,6 +871,7 @@ async def thread_run_stream(thread_id: str, body: RunCreate) -> StreamingRespons
 
 
 # --- jobs (post-create prep steps) -------------------------------------------
+
 
 class JobsRunRequest(BaseModel):
     job: str | None = None  # run a specific job by name, or all if None
@@ -791,8 +920,7 @@ async def jobs_run(org: str, body: JobsRunRequest = JobsRunRequest()) -> dict[st
     return {
         "org": org,
         "jobs": [
-            {"name": r.name, "status": r.status, "error": r.error,
-             "duration": round(r.duration, 1)}
+            {"name": r.name, "status": r.status, "error": r.error, "duration": round(r.duration, 1)}
             for r in results
         ],
     }
@@ -817,14 +945,20 @@ async def jobs_status(org: str) -> dict[str, Any]:
     return {
         "org": org,
         "jobs": [
-            {"name": s.name, "script": s.script, "args": s.args,
-             "timeout": s.timeout, "description": s.description}
+            {
+                "name": s.name,
+                "script": s.script,
+                "args": s.args,
+                "timeout": s.timeout,
+                "description": s.description,
+            }
             for s in specs
         ],
     }
 
 
 # --- helpers ------------------------------------------------------------------
+
 
 def _status_from_snapshot(snap: Any) -> str:
     if snap.next:  # more nodes to run -> interrupted mid-graph
