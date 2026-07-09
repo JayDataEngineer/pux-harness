@@ -254,8 +254,8 @@ def _deep_merge_profile(base: Any, delta: Any) -> Any:
     * lists UNION (dedup, base order preserved) — so ``excluded_tools``,
       ``excluded_middleware``, and ``middleware.{scope}.{add,remove}`` accumulate
       down the chain;
-    * scalars: ``delta`` wins — so ``base_system_prompt`` / ``system_prompt_suffix``
-      (child replaces) and every leaf in ``rubric`` / ``models`` (child wins).
+    * scalars: ``delta`` wins — so ``system_prompt_suffix`` (child replaces)
+      and every leaf in ``rubric`` / ``models`` (child wins).
 
     Type-mismatch (dict vs list vs scalar) falls back to ``delta`` wins — the
     child explicitly restated it, which is the honest resolution. Pure +
@@ -783,6 +783,18 @@ def validate_profile(org: str) -> HarnessProfileConfig | None:
     """
     cfg = load_profile(org)              # raises on a malformed schema (incl. a
                                         # legacy ``subagents:`` block — from_dict now rejects that key)
+    if cfg is not None and cfg.base_system_prompt is not None:
+        # no-legacy-left-behind: ``base_system_prompt`` was a global-REPLACE that
+        # silently wiped root AGENTS.md + the org overlay + the harness addendum +
+        # the orchestrator pattern — a nuclear escape hatch used by ZERO orgs. The
+        # constructed-from-parts prompt assembler (``prompt_parts``) has no
+        # global-replace step at all; ``system_prompt_suffix`` (append) is the safe
+        # lever. The key stays on the upstream dataclass, so pux rejects it HERE.
+        raise ValueError(
+            f"{org}: profile.yaml: `base_system_prompt` is removed — it was a "
+            f"global-REPLACE that wiped the assembled prompt. Use "
+            f"`system_prompt_suffix` (append) instead."
+        )
     load_rubric_gate(org)                # raises on a malformed rubric: block
     load_middleware_overrides(org)       # raises on a malformed middleware: block
     load_model_retry(org)                # raises on a malformed model_retry: block

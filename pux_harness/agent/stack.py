@@ -15,7 +15,7 @@ an override system." Everything that varies per-org flows through HERE:
   ``DEFAULT_SUBAGENT`` + the tool/prompt defaults). Change a default here, every
   org changes.
 * **Org overrides** live in ``orgs/<org>/profile.yaml`` and are resolved here:
-  the deepagents fields (``system_prompt_suffix`` / ``base_system_prompt`` /
+  the deepagents fields (``system_prompt_suffix`` /
   ``tool_description_overrides`` / ``excluded_tools`` / ``excluded_middleware``)
   PLUS a harness-local ``middleware:`` block (``supervisor``/``subagent`` ×
   ``add``/``remove``) that finally makes the middleware stack data-driven.
@@ -60,9 +60,15 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.hitl import (
-    ASK_USER_PROMPT_SUFFIX,
     ask_user_turn_based,
     make_ask_user_tool,
+)
+from pux_harness.agent.prompt_parts import (
+    PromptCtx,
+    PromptScope,
+    SUPERVISOR_PROMPT_PARTS,
+    _interpreter_mounted,
+    assemble_prompt,
 )
 from pux_harness.agent.model import (
     _TRANSIENT_EXCEPTIONS,
@@ -479,79 +485,6 @@ def _build_interpreter(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     )
 
 
-def _interpreter_mounted(middleware: Sequence[AgentMiddleware]) -> bool:
-    """True iff the dynamic-subagent ``CodeInterpreterMiddleware`` is actually in
-    ``middleware`` — the post-resolution signal that this orchestrator was given the
-    ``eval`` tool (a strength-``pro`` base, or an explicit ``add: [interpreter]``
-    override). Honors ``add``/``remove`` (a strong base with ``remove:[interpreter]``
-    reports False), so the dynamic-prompt block tracks the REAL mount decision.
-
-    Detected by QUALIFIED class name — NOT an ``isinstance`` import — so the many
-    weak-model builds that never mount the interpreter never load quickjs/wasmtime
-    here either. That keeps the strength gate a real PERF gate (not just a mount
-    gate): a flash orchestrator pays zero native-load cost, end to end. The class
-    name + module root are a stable upstream contract (langchain-quickjs surfaces
-    exactly ``CodeInterpreterMiddleware``); a rename surfaces first in
-    ``test_build_interpreter_returns_eval_exposing_middleware``."""
-    for m in middleware:
-        t = type(m)
-        if (
-            getattr(t, "__name__", "") == "CodeInterpreterMiddleware"
-            and t.__module__.split(".", 1)[0] == "langchain_quickjs"
-        ):
-            return True
-    return False
-
-
-def _append_dynamic_suffix(
-    prompt: str, middleware: Sequence[AgentMiddleware],
-) -> str:
-    """Append the dynamic-dispatch upgrade notice iff the interpreter is mounted.
-    Extracted from ``build_stack`` so the prompt-assembly contract — DIFFERENT
-    assembled prompt for an interpreter-enabled orchestrator vs a static-only one
-    (the user's hard requirement: "when we DON'T GIVE the interpreter, the
-    AGENTS.md should be DIFFERENT") — is unit-testable without a full stack build."""
-    if not _interpreter_mounted(middleware):
-        return prompt
-    return f"{prompt}\n\n{_DYNAMIC_DISPATCH_SUFFIX}"
-
-
-# The dynamic-dispatch upgrade notice — appended to the assembled CTO prompt ONLY
-# when the interpreter is mounted (``_interpreter_mounted``). The ``AGENTS.md``
-# orchestrator section above it is the UNIVERSAL static-``task`` baseline every
-# orchestrator sees; this block is the upgrade a strong orchestrator gets on top.
-# A weak orchestrator gets neither the ``eval`` tool NOR this guidance — the same
-# no-token-waste principle as not mounting the tool (the user's hard requirement:
-# "when we DON'T GIVE the interpreter, the AGENTS.md should be DIFFERENT"). So the
-# two assembled prompts genuinely differ: static-only vs static + dynamic. The
-# middleware itself injects the JS ``task()`` / PTC API guide, so this block states
-# the STRATEGY (prefer one dispatch script, inline recon, keep the thread lean) and
-# defers the API shape to the ``eval`` tool's own description — no duplication.
-_DYNAMIC_DISPATCH_SUFFIX = """\
-## Dynamic dispatch (you are interpreter-enabled)
-
-You have the ``eval`` tool — a sandboxed JS REPL — so you can drive the
-**dynamic** happy path. For ANY multi-unit task, PREFER it over the
-static ``task``-one-call-at-a-time flow above:
-
-- ``eval`` runs ONE short dispatch script. ``task({subagentType, description})``
-  dispatches a subagent and returns its response; ``Promise.all([...])`` fans
-  workers out in parallel; ``tools.glob`` / ``tools.grep`` / ``tools.ls`` /
-  ``tools.read_file`` do read-only discovery without a round-trip per call.
-- The happy path becomes: recon via an explorer ``task``, INLINE its report into
-  each worker ``description``, fan the workers out with ``Promise.all``, return
-  the synthesis as the script's value.
-- KEEP YOUR THREAD LEAN — that is the whole point. You hold only the dispatch
-  logic + the final result; the explorers / workers absorb the file contents and
-  the context blow. Do NOT read the explored files into your own thread — inline
-  the explorer's report into the worker calls instead. Hoarding context on the
-  dynamic path duplicates the explorer's work in your thread, which is the very
-  token cost dynamic dispatch exists to avoid.
-
-The ``eval`` tool's own description + the injected ``task()`` / PTC guide carry
-the exact JS API — follow them; do not invent a different shape. (Note:
-``task()`` dispatches inside the already-approved ``eval`` and bypasses parent
-HITL approval per dispatch — by design.)"""
 
 
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
@@ -813,14 +746,6 @@ def build_stack(
     if profile is not None:
         supervisor_tools = apply_profile_to_tools(supervisor_tools, profile)
 
-    # Prompt: root + org + addendum, then profile overrides.
-    prompt = build_system_prompt(org)
-    if profile is not None:
-        if profile.base_system_prompt:
-            prompt = profile.base_system_prompt
-        if profile.system_prompt_suffix:
-            prompt = f"{prompt}\n\n{profile.system_prompt_suffix}"
-
     # ``ask_user`` HITL tool — opt-in (``profile.yaml`` ``ask_user: true``) AND
     # a runtime that can actually field a human reply. DROPPED over MCP (the
     # caller can't answer) + autonomous/headless (no human): absent from the
@@ -836,21 +761,36 @@ def build_stack(
             *supervisor_tools,
             make_ask_user_tool(facts.transport),
         ]
-        # The "end your turn" suffix is for the EDITOR (turn-based) path only:
-        # over the web the interrupt pause already gates the reply, so an
-        # end-turn instruction would be stale by the time the tool returns.
-        if ask_user_turn_based(facts.transport):
-            prompt = f"{prompt}\n\n{ASK_USER_PROMPT_SUFFIX}"
 
-    # Dynamic-dispatch upgrade notice — appended to the CTO prompt ONLY when the
-    # interpreter is actually mounted (strong base OR an explicit add-override).
-    # The AGENTS.md orchestrator section (in ``build_system_prompt``) is the
-    # universal static-``task`` baseline EVERY orchestrator sees; this block is
-    # the dynamic upgrade a strong orchestrator gets on top. A weak orchestrator
-    # gets neither the ``eval`` tool NOR this guidance — the assembled prompt
-    # genuinely differs (static-only vs static + dynamic), so a model that can't
-    # drive the dynamic path never wastes tokens reading about it.
-    prompt = _append_dynamic_suffix(prompt, supervisor_middleware)
+    # Prompt: constructed from an ORDERED registry of parts (``prompt_parts``).
+    # ``base_system_prompt`` (the old global-REPLACE that wiped root + overlay +
+    # addendum + the orchestrator pattern) is GONE — a permanent contract failure
+    # in ``validate_profile``; this runtime guard is defense in depth (the
+    # long-lived server path bypasses the offline check). ``system_prompt_suffix``
+    # (append) is the only org-level prompt override. Each part's ``build`` returns
+    # None when its condition is OFF (skipped, never an error) — no gap.
+    if profile is not None and profile.base_system_prompt:
+        raise ValueError(
+            f"{org}: profile.yaml: `base_system_prompt` is removed — it was a "
+            f"global-REPLACE that wiped the assembled prompt. Use "
+            f"`system_prompt_suffix` (append) instead."
+        )
+    # The "end your turn" suffix is for the EDITOR (turn-based) path only:
+    # over the web the interrupt pause already gates the reply, so an end-turn
+    # instruction would be stale by the time the tool returns.
+    ask_user_suffix_active = ask_user_active and ask_user_turn_based(facts.transport)
+    prompt = assemble_prompt(
+        SUPERVISOR_PROMPT_PARTS,
+        PromptCtx(
+            agents_md_base=build_system_prompt(org),
+            system_prompt_suffix=(
+                profile.system_prompt_suffix if profile is not None else None
+            ),
+            ask_user_active=ask_user_suffix_active,
+            interpreter_mounted=_interpreter_mounted(supervisor_middleware),
+        ),
+        PromptScope.SUPERVISOR,
+    )
 
     subagents = load_subagents(
         org, tools_surface,

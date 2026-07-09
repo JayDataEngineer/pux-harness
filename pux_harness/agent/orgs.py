@@ -23,13 +23,19 @@ no ``importlib``. Tool + skills resolution stays CENTRAL (here, via
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Container, Sequence, TYPE_CHECKING
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 from deepagents import HarnessProfileConfig
 
 from pux_harness.agent.model import get_model
+from pux_harness.agent.prompt_parts import (
+    SUBAGENT_PROMPT_PARTS,
+    PromptCtx,
+    PromptScope,
+    assemble_prompt,
+)
 from pux_harness.sandbox.tools import Category, classify_slug, prefixed
 
 if TYPE_CHECKING:
@@ -52,7 +58,9 @@ if TYPE_CHECKING:
 # / ``_specialists_dir()`` seams; ``load_root_prompt`` (the root AGENTS.md is
 # pinned to ``PROJECT_ROOT``, NOT the ``_orgs_dir()`` seam — a tempdir test
 # patches ``_orgs_dir`` but the base prompt stays the real one); ``_read``
-# (the PROJECT_ROOT-bound reader); ``build_system_prompt`` (owns ``_ADDENDUM``);
+# (the PROJECT_ROOT-bound reader); ``build_system_prompt`` (the static base of
+# the supervisor prompt — root + org overlay only; the addendum + every suffix is
+# folded on top by ``prompt_parts.assemble_prompt``);
 # ``_resolve_tools`` (strict registry); ``_build_sub`` + ``load_subagents``
 # (profile/middleware/retrieval enrichment).
 from pux_harness.kit import loaders as _aloaders
@@ -140,35 +148,6 @@ def org_agent_slugs(name: str) -> list[str]:
     return _aloaders.org_agent_slugs(name, _orgs_dir().parent)
 
 
-_ADDENDUM = """\
-
-## Harness addendum (deepagents) — authoritative
-
-You are running under the Python deepagents harness. Where this addendum
-conflicts with the org docs above, THIS ADDENDUM wins.
-
-- **Delegation:** delegate with the `task` tool:
-  `task(subagent_type="<name>", description="<what to do>")`. The subagents
-  available to you are listed in the `task` tool's own description. The
-  subagent sees only your `description`, not your conversation — give it
-  enough context (relevant paths, the question, the expected output shape).
-- **File/shell surface:** the file and shell tools are the NATIVE deepagents
-  tools — `execute` (run a shell command), `read_file`, `write_file`,
-  `edit_file`, `glob`, `grep`, `ls`. There is NO `pux_sandbox_bash` or
-  `pux_sandbox_file_*`. Anywhere the org docs say `pux_sandbox_bash`, use
-  `execute`; `pux_sandbox_file_read` -> `read_file`; `pux_sandbox_file_glob`
-  -> `glob`; `pux_sandbox_file_grep` -> `grep`; and so on. Specialist
-  capabilities remain under `pux_sandbox_*` (`pux_sandbox_python`,
-  `pux_sandbox_browser_*`, `pux_sandbox_desktop_*`, `pux_sandbox_describe_image`,
-  `pux_sandbox_list_skills`). Skill BODIES are peeked with the native
-  `read_file` (the ``SkillsMiddleware`` advertises each skill's name +
-  description in your prompt; `list_skills` is the host-side catalog) — there is
-  no `pux_sandbox_load_skill`. The workspace is at `/sandbox/workspace/` inside
-  the sandbox container — the project root, bind-mounted. You and every
-  subagent share this same surface.
-"""
-
-
 def load_root_prompt() -> str:
     """Body of the root AGENTS.md (the base 'Pux' system prompt).
 
@@ -190,14 +169,14 @@ def load_org_prompt(name: str) -> str:
 
 
 def build_system_prompt(org: str) -> str:
-    """root AGENTS.md + the chain-inherited org overlay + harness addendum
-    (mirrors pi-mono's append-org-to-root assembly, plus the deepagents
-    terminology bridge). The overlay is the parent's + own AGENTS.md
-    concatenated (own last) when the org ``extends:`` a parent — read via the
-    kit's cycle-aware ``_chain_overlay``. For a non-extending org, byte-identical
-    to ``root + own + addendum``."""
+    """root AGENTS.md + the chain-inherited org overlay — the STATIC base of the
+    supervisor prompt. The harness addendum + every conditional suffix is folded
+    on top by ``prompt_parts.assemble_prompt``; this returns ONLY the base, so the
+    no-gap registry owns the full assembly. The overlay is the parent's + own
+    AGENTS.md concatenated (own last) when the org ``extends:`` a parent — read
+    via the kit's cycle-aware ``_chain_overlay``."""
     overlay = _aloaders._chain_overlay(org, _orgs_dir().parent)
-    return f"{load_root_prompt()}\n\n{overlay}{_ADDENDUM}"
+    return f"{load_root_prompt()}\n\n{overlay}"
 
 
 def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:
@@ -346,7 +325,7 @@ def _build_sub(
 # no second surface. The ``no-legacy-subagents-block`` contract tripwire keeps
 # the old block from returning.
 _AGENT_PROFILE_KEYS: tuple[str, ...] = (
-    "base_system_prompt", "system_prompt_suffix",
+    "system_prompt_suffix",
     "tool_description_overrides", "excluded_tools",
 )
 
@@ -505,17 +484,17 @@ def load_subagents(
     avoid a module cycle (``profile.py`` imports ``orgs._orgs_dir``).
 
     PER-AGENT overrides (the universal pattern): the agent's OWN
-    frontmatter may carry the SAME four ``HarnessProfileConfig`` fields
-    (``base_system_prompt`` / ``system_prompt_suffix`` /
-    ``tool_description_overrides`` / ``excluded_tools``), honored per-agent via
-    ``_agent_profile_from_spec``. The spec is already ``extends:``-merged
-    (``kit.loaders._merge_extends``), so a child agent inherits + overrides these
-    exactly as it inherits tools/skills — no second surface. This REPLACED the
-    legacy ``profile.yaml`` ``subagents:`` block (now a contract failure).
+    frontmatter may carry the SAME three ``HarnessProfileConfig`` fields
+    (``system_prompt_suffix`` / ``tool_description_overrides`` /
+    ``excluded_tools``), honored per-agent via ``_agent_profile_from_spec``. The
+    spec is already ``extends:``-merged (``kit.loaders._merge_extends``), so a
+    child agent inherits + overrides these exactly as it inherits tools/skills —
+    no second surface. This REPLACED the legacy ``profile.yaml`` ``subagents:``
+    block (now a contract failure). A per-agent ``base_system_prompt`` is a
+    PERMANENT contract failure (it was a nuclear replace that wiped the body).
     Precedence (most-specific = last word):
 
         .md body (or extends-merged body)
-        → per-agent ``base_system_prompt`` (replace)
         → org-wide ``system_prompt_suffix``
         → per-agent ``system_prompt_suffix``
 
@@ -544,18 +523,32 @@ def load_subagents(
         )
         # Per-agent overrides from the spec's OWN frontmatter.
         agent_cfg = _agent_profile_from_spec(spec)
-        # Prompt precedence: body → per-agent base (replace) → org-wide suffix
-        # → per-agent suffix (most-specific = last word).
-        if agent_cfg is not None and agent_cfg.base_system_prompt:
-            sub["system_prompt"] = agent_cfg.base_system_prompt
-        if profile is not None and profile.system_prompt_suffix:
-            sub["system_prompt"] = (
-                f"{sub['system_prompt']}\n\n{profile.system_prompt_suffix}"
+        # Subagent prompt = its OWN body + the org-wide suffix + its own
+        # per-agent suffix — NO supervisor content (the user's hard rule:
+        # subagents are SPECIALIZED for independent tasks). Assembled by the
+        # no-gap registry (``prompt_parts``). A per-agent ``base_system_prompt``
+        # (a nuclear replace that would wipe the body) is GONE — a stray one in
+        # frontmatter must FAIL, not silently drop (else it's a gap).
+        if "base_system_prompt" in spec:
+            raise ValueError(
+                f"{org}/{slug}: `base_system_prompt` is removed — it was a "
+                f"per-agent global-REPLACE that wiped the agent's own body. "
+                f"Use `system_prompt_suffix` (append) instead."
             )
-        if agent_cfg is not None and agent_cfg.system_prompt_suffix:
-            sub["system_prompt"] = (
-                f"{sub['system_prompt']}\n\n{agent_cfg.system_prompt_suffix}"
-            )
+        sub["system_prompt"] = assemble_prompt(
+            SUBAGENT_PROMPT_PARTS,
+            PromptCtx(
+                agent_body=spec["system_prompt"],
+                system_prompt_suffix=(
+                    profile.system_prompt_suffix if profile is not None else None
+                ),
+                agent_system_prompt_suffix=(
+                    agent_cfg.system_prompt_suffix
+                    if agent_cfg is not None else None
+                ),
+            ),
+            PromptScope.SUBAGENT,
+        )
         # Tools: .md → org-wide prune/rewrite → per-agent prune/rewrite.
         if sub.get("tools"):
             if profile is not None:

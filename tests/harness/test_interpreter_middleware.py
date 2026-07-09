@@ -34,9 +34,6 @@ from pux_harness.agent.stack import (
     RuntimeFacts,
     Scope,
     StackCtx,
-    _append_dynamic_suffix,
-    _DYNAMIC_DISPATCH_SUFFIX,
-    _interpreter_mounted,
     _resolve_toggles,
     _specs_by_name,
     middleware_names,
@@ -153,53 +150,7 @@ def test_add_wins_over_remove(monkeypatch):
     )
     assert _interpreter_built(out)
 
-
-# ------------------------------------------------------------------------------------
-# 4. dynamic-prompt assembly — the orchestrator AGENTS.md is DYNAMIC
-# ------------------------------------------------------------------------------------
-# The user's hard requirement: "when we DON'T GIVE the interpreter, the AGENTS.md
-# should be DIFFERENT." So the assembled CTO prompt must contain the dynamic-
-# dispatch guidance ONLY when the interpreter is mounted. A weak orchestrator gets
-# neither the eval tool NOR the dynamic-path guidance — the same no-token-waste
-# principle as not mounting the tool.
-
-def test_interpreter_mounted_detects_built_middleware():
-    """``_interpreter_mounted`` sees a real built interpreter; misses a non-
-    interpreter object and an empty list. Detected by QUALIFIED class name so the
-    check needs NO langchain_quickjs import at call sites that mount nothing (a
-    perf gate, not just a mount gate). The non-interpreter sentinel is a plain
-    ``object()`` (any non-quickjs type) — the detector is purely type-name based."""
-    interp = _specs_by_name()["interpreter"].build(_ctx(), Scope.SUPERVISOR)
-    other = object()
-    assert _interpreter_mounted([interp]) is True
-    assert _interpreter_mounted([other]) is False
-    assert _interpreter_mounted([]) is False
-    assert _interpreter_mounted([other, interp]) is True
-
-
-def test_dynamic_dispatch_suffix_carries_the_strategy():
-    """The upgrade notice tells the strong orchestrator to PREFER one dispatch
-    script over the static task flow, keep its thread lean, and defers the JS API
-    to the eval tool's own description (no duplication with the middleware's guide)."""
-    assert _DYNAMIC_DISPATCH_SUFFIX.strip(), "suffix must be non-empty"
-    assert "eval" in _DYNAMIC_DISPATCH_SUFFIX
-    assert "task({subagentType" in _DYNAMIC_DISPATCH_SUFFIX
-    assert "Promise.all" in _DYNAMIC_DISPATCH_SUFFIX
-    assert "PREFER" in _DYNAMIC_DISPATCH_SUFFIX
-
-
-def test_dynamic_suffix_appended_only_when_interpreter_mounted():
-    """THE contract: an interpreter-enabled orchestrator gets the dynamic block
-    appended to its prompt; a static-only orchestrator gets byte-identical input
-    back. Two genuinely different assembled prompts."""
-    interp = _specs_by_name()["interpreter"].build(_ctx(), Scope.SUPERVISOR)
-    other = object()
-    BASE = "BASE PROMPT"
-
-    mounted = _append_dynamic_suffix(BASE, [interp])
-    assert mounted.startswith(BASE)
-    assert _DYNAMIC_DISPATCH_SUFFIX in mounted
-
-    # static-only paths: no suffix leaks in.
-    assert _append_dynamic_suffix(BASE, []) == BASE
-    assert _append_dynamic_suffix(BASE, [other]) == BASE
+# Section 4 (dynamic-prompt assembly — ``_interpreter_mounted`` /
+# ``_DYNAMIC_DISPATCH_SUFFIX`` / ``_append_dynamic_suffix``) RELOCATED to
+# ``tests/harness/test_prompt_parts.py``: those symbols moved from ``stack.py``
+# into ``prompt_parts`` (prompt content), so their tests live with the assembler.

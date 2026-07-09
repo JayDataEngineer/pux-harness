@@ -616,7 +616,7 @@ def check_org(name: str) -> list[Violation]:
                 f"removed — folded into per-agent `extends:` + delta frontmatter "
                 f"fields (tools_add / tools_remove / skills_add / "
                 f"description_append / tool_description_overrides / "
-                f"base_system_prompt / system_prompt_suffix / excluded_tools). "
+                f"system_prompt_suffix / excluded_tools). "
                 f"Move each subagent's override into its own "
                 f"`orgs/{name}/agents/<slug>.md` (or a shared base + `extends:`)."
             ))
@@ -1065,7 +1065,7 @@ def _no_legacy_subagents_block() -> list[Violation]:
     The per-subagent override surface was folded INTO agent frontmatter —
     ``extends:`` + the delta fields (``tools_add`` / ``tools_remove`` /
     ``skills_add`` / ``description_append``) and the native HarnessProfileConfig
-    fields (``base_system_prompt`` / ``system_prompt_suffix`` /
+    fields (``system_prompt_suffix`` /
     ``tool_description_overrides`` / ``excluded_tools``), honored per-agent via
     ``orgs._agent_profile_from_spec``. The old ``profile.yaml`` ``subagents:``
     block was a SECOND partial-override surface with its own resolver — exactly
