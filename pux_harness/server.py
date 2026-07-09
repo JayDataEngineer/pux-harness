@@ -122,6 +122,12 @@ class RunCreate(BaseModel):
     # Falls back to ``PUX_RUN_WEBHOOK_URL`` when unset. Best-effort — see
     # ``_dispatch_run_webhook``.
     webhook_url: str | None = None
+    # LangGraph stream-mode selector: a single name (``"values"``), a
+    # comma-separated string (``"messages,updates"``), or a list. A
+    # ``?stream_mode=`` QUERY param (how ``langgraph_sdk`` ships it) takes
+    # precedence over this body field; absent => the default triple — see
+    # ``_resolve_stream_modes``.
+    stream_mode: str | list[str] | None = None
 
 
 class EphemeralRun(BaseModel):
@@ -130,6 +136,7 @@ class EphemeralRun(BaseModel):
     metadata: dict[str, Any] = {}
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     command: dict[str, Any] | None = None  # resume — see RunCreate.command
+    stream_mode: str | list[str] | None = None  # see RunCreate.stream_mode
 
 
 def _now() -> str:
@@ -1038,18 +1045,47 @@ def _sse(event: str, data: Any) -> str:
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
+_DEFAULT_STREAM_MODES: list[str] = ["messages", "updates", "values"]
+
+
+def _resolve_stream_modes(raw: str | list[str] | None) -> list[str]:
+    """Normalize a client-requested ``stream_mode`` into a list of langgraph
+    mode names. Accepts a single name, a comma-separated string (the form
+    ``langgraph_sdk`` ships as a query param), or a list. Empty/absent falls
+    back to the default triple so clients that don't ask get the legacy surface.
+    Mode names are passed through unchanged — langgraph validates them."""
+    if raw is None:
+        return _DEFAULT_STREAM_MODES
+    if isinstance(raw, str):
+        raw = [m.strip() for m in raw.split(",") if m.strip()]
+    return list(raw) or _DEFAULT_STREAM_MODES
+
+
 async def _stream_run(
     org: str,
     thread_id: str,
     body: Any,
     recursion_limit: int,
     run_id: str,
+    modes: list[str] | None = None,
 ) -> Any:
-    """Yield v1 SSE frames for one run: a leading ``metadata`` event, then the
-    langgraph stream modes (``messages``/``updates``/``values``), then an
-    ``error`` frame on exception. The interrupt surfaces as a ``__interrupt__``
-    key in the final ``values``/``updates`` events — the client reads it +
-    resumes with ``command={"resume": ...}`` on the same thread."""
+    """Yield v1 SSE frames for one run: a leading ``metadata`` event, then one
+    event per requested langgraph stream mode (the event name IS the mode name —
+    ``messages`` carries a ``[msg, meta]`` pair, every other mode passes its
+    chunk through verbatim), then an ``error`` frame on exception, then a
+    terminal ``end`` sentinel (``data: null``) on BOTH success and error paths.
+
+    ``end`` is the exact terminal frame upstream ``langgraph-api`` emits;
+    ``langgraph_sdk._shared.utilities._sse_to_v2_dict`` recognizes it and
+    returns None (the SDK's end-of-stream sentinel — iteration ends there). It
+    is a trailing yield (not ``finally``) so it fires on normal completion +
+    caught exceptions but correctly skips on client disconnect /
+    ``CancelledError`` (the request was aborted — nothing to terminate).
+
+    The interrupt surfaces as a ``__interrupt__`` key in the final ``values``/
+    ``updates`` events — the client reads it + resumes with
+    ``command={"resume": ...}`` on the same thread."""
+    modes = modes or _DEFAULT_STREAM_MODES
     graph = _get_graph(org)
     config = build_invoke_config(thread_id, recursion_limit, org, transport="serve")
     yield _sse("metadata", {"run_id": run_id})
@@ -1057,43 +1093,50 @@ async def _stream_run(
         async for mode, chunk in graph.astream(
             _graph_input(org, body),
             config=config,
-            stream_mode=["messages", "updates", "values"],
+            stream_mode=modes,
         ):
             if mode == "messages":
                 msg, meta = chunk
                 yield _sse("messages", [_jsonable(msg), _jsonable(meta)])
-            elif mode == "updates":
-                yield _sse("updates", chunk)
-            else:  # values — carries __interrupt__ on the interrupted step
-                yield _sse("values", chunk)
+            else:
+                yield _sse(mode, chunk)
     except Exception as exc:  # noqa: BLE001 - emit an error frame, don't crash mid-stream
         yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+    yield _sse("end", None)
 
 
 @app.post("/runs/stream")
-async def run_stream(body: EphemeralRun) -> StreamingResponse:
+async def run_stream(body: EphemeralRun, stream_mode: str | None = None) -> StreamingResponse:
     """Ephemeral run streamed as SSE (create thread + stream + the thread is
-    kept for resume). The wire format is what ``langgraph_sdk`` consumes."""
+    kept for resume). The wire format is what ``langgraph_sdk`` consumes.
+    ``stream_mode`` selects the langgraph modes — a ``?stream_mode=`` query
+    param (how the SDK ships it) takes precedence over the body field; absent
+    => the default triple (messages/updates/values)."""
     if body.agent_id not in discover_orgs():
         raise HTTPException(status_code=404, detail=f"unknown agent {body.agent_id!r}")
     thread_id = str(uuid.uuid4())
     await app.state.store.register_thread(thread_id, body.agent_id, body.metadata)
     run_id = str(uuid.uuid4())
+    modes = _resolve_stream_modes(stream_mode or body.stream_mode)
     return StreamingResponse(
-        _stream_run(body.agent_id, thread_id, body, body.recursion_limit, run_id),
+        _stream_run(body.agent_id, thread_id, body, body.recursion_limit, run_id, modes),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
 
 
 @app.post("/threads/{thread_id}/runs/stream")
-async def thread_run_stream(thread_id: str, body: RunCreate) -> StreamingResponse:
+async def thread_run_stream(
+    thread_id: str, body: RunCreate, stream_mode: str | None = None
+) -> StreamingResponse:
     """Stream a run on an existing thread (SSE). POST ``command={"resume": ...}``
-    to resume an interrupted run on the thread."""
+    to resume an interrupted run on the thread. ``stream_mode`` (query OR body)
+    selects the langgraph modes; absent => the default triple."""
     org = await _require_thread(thread_id)
     run_id = str(uuid.uuid4())
+    modes = _resolve_stream_modes(stream_mode or body.stream_mode)
     return StreamingResponse(
-        _stream_run(org, thread_id, body, body.recursion_limit, run_id),
+        _stream_run(org, thread_id, body, body.recursion_limit, run_id, modes),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
