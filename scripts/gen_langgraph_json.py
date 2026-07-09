@@ -63,6 +63,11 @@ def render() -> str:
             # Bind pux's custom surfaces (EventBus + jobs) under upstream's AP
             # CRUD via langgraph-api's ``user_router`` seam (``http.app``).
             "http": {"app": HTTP_APP},
+            # pux-harness requires Python >=3.12,<3.14; langgraph-cli's DEFAULT
+            # build tag is 3.11 (langgraph_api/config.py DEFAULT_PYTHON_VERSION),
+            # which is incompatible. Pin the build image's Python explicitly.
+            # (langgraph dev ignores this — it uses the host venv.)
+            "python_version": "3.13",
         },
         indent=2,
         sort_keys=True,

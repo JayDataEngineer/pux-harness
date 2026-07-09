@@ -16,5 +16,6 @@
   },
   "http": {
     "app": "pux_harness.runtime.custom_app:app"
-  }
+  },
+  "python_version": "3.13"
 }
