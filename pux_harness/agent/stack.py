@@ -64,7 +64,12 @@ from pux_harness.agent.hitl import (
     ask_user_turn_based,
     make_ask_user_tool,
 )
-from pux_harness.agent.model import _TRANSIENT_EXCEPTIONS, driver_multimodal, get_model
+from pux_harness.agent.model import (
+    _TRANSIENT_EXCEPTIONS,
+    driver_multimodal,
+    driver_strong_orchestrator,
+    get_model,
+)
 from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
     _build_general_purpose_sub,
@@ -88,6 +93,7 @@ from pux_harness.context.browser_vision import (
 )
 from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
+from pux_harness.context.prepare_warmup import PrepareWarmupMiddleware
 from pux_harness.context.session_guide import SessionGuideMiddleware
 from pux_harness.agent.capabilities import CapabilityResolver
 from pux_harness.sandbox.tools import build_grader_tools
@@ -148,6 +154,17 @@ class RuntimeFacts:
     tool_servers_active: bool = False
     provider: str | None = None
     tier: str | None = None
+    # Run the prepare/warmup seam (declared policy jobs + universal
+    # warmup_webhook) ONCE at agent start via PrepareWarmupMiddleware's
+    # ``before_agent`` hook. Default False: ``pux direct`` (main.py) and the
+    # ``server.py`` fallback run ``prepare()`` themselves at their entry point,
+    # and tests build the graph without a real sandbox, so the middleware must
+    # no-op there (else Docker would be touched on every test invoke). The one
+    # runtime WITHOUT an entry-point prepare hook is Aegra (langgraph-api owns
+    # the run loop) — its factory (``runtime/upstream.py``) sets this True so
+    # warmup_browser / warmup_webhook fire under Aegra too. The middleware is
+    # the single owner of the serve-lane prepare seam.
+    prepare_warmup: bool = False
 
 
 def autonomous_from_env() -> bool:
@@ -243,6 +260,26 @@ def _build_routing(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
 
 def _build_session_guide(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     return SessionGuideMiddleware()
+
+
+def _build_prepare(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
+    """PrepareWarmupMiddleware — the serve-lane owner of the ``prepare()`` seam.
+
+    Runs the org's declared policy ``jobs:`` (e.g. ``warmup_browser``) + the
+    universal ``warmup_webhook`` probe ONCE at agent start, so Aegra (which has
+    no entry-point prepare hook of its own) gets warmup too. Returns ``None``
+    (skip) unless ``facts.prepare_warmup`` — the ``direct`` and ``server.py``
+    lanes run ``prepare()`` themselves and tests must not touch Docker, so the
+    default-False fact leaves the middleware inert for them (no double-fire,
+    no test regression). ``universal_warmup`` mirrors the historical lane split:
+    serve-class transports probe the run-completion endpoint; ``direct`` does
+    not. See ``context/prepare_warmup.py``."""
+    if not ctx.facts.prepare_warmup:
+        return None
+    return PrepareWarmupMiddleware(
+        org=ctx.org,
+        universal_warmup=ctx.facts.transport != "direct",
+    )
 
 
 def _build_audit(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
@@ -402,6 +439,121 @@ def _build_tool_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     )
 
 
+def _build_interpreter(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
+    """``CodeInterpreterMiddleware`` (langchain-quickjs) — the dynamic-subagent
+    happy path. Injects an ``eval`` tool (a sandboxed QuickJS JS REPL) plus a
+    ``task(...)`` global, so a strong orchestrator writes one short JS dispatch
+    script (explorer recon → ``Promise.all`` workers → synthesize) instead of
+    grinding through items one model-chosen tool call at a time. The
+    orchestrator thread stays LEAN — explorers/workers absorb the context blow,
+    a major token saver for a smart base model (the whole point).
+
+    Strength-gated (NOT in ``DEFAULT_SUPERVISOR``): armed in
+    ``_resolve_toggles`` iff ``driver_strong_orchestrator(role='base', org=)``
+    — i.e. the resolved base model is ``strength: pro`` (shipped glm-5.2 /
+    glm-5.1). A weak/unknown driver (the ``fast`` tier, mimo, anything not
+    flagged pro) NEVER gets the interpreter — it would waste tokens on a tool
+    the model can't drive reliably (the user's hard requirement).
+    ``middleware.supervisor.add: [interpreter]`` forces it ON per-org; ``remove``
+    forces it OFF.
+
+    PTC (programmatic tool calling) is armed with a READ-ONLY discovery
+    allowlist (``glob`` / ``grep`` / ``ls`` / ``read_file``): the JS surveys the
+    workspace directly (no round-trip per call) but cannot mutate — workers do
+    mutations via ``task(...)``. ``subagents=True`` exposes ``task(...)`` ONLY
+    when the agent already has the Deep Agents ``task`` tool (an org that
+    rostered no subagents is unaffected). NOTE (upstream caveat): ``task(...)``
+    dispatches inside the already-approved ``eval`` and bypasses parent
+    ``interrupt_on`` / HITL approval per dispatch — gate ``eval`` itself if an
+    org needs pre-dispatch approval.
+
+    The langchain-quickjs import is LAZY (inside the build) so the many
+    weak-model builds that never mount the interpreter skip the
+    quickjs/wasmtime native load entirely. It is a CORE dep, so the import
+    cannot fail in a real install — this is a perf gate, not a guarded
+    fallback. See ``AGENTS.md`` (Orchestrator pattern) for the dispatch contract."""
+    from langchain_quickjs import CodeInterpreterMiddleware
+    return CodeInterpreterMiddleware(
+        subagents=True,
+        ptc=["glob", "grep", "ls", "read_file"],
+    )
+
+
+def _interpreter_mounted(middleware: Sequence[AgentMiddleware]) -> bool:
+    """True iff the dynamic-subagent ``CodeInterpreterMiddleware`` is actually in
+    ``middleware`` — the post-resolution signal that this orchestrator was given the
+    ``eval`` tool (a strength-``pro`` base, or an explicit ``add: [interpreter]``
+    override). Honors ``add``/``remove`` (a strong base with ``remove:[interpreter]``
+    reports False), so the dynamic-prompt block tracks the REAL mount decision.
+
+    Detected by QUALIFIED class name — NOT an ``isinstance`` import — so the many
+    weak-model builds that never mount the interpreter never load quickjs/wasmtime
+    here either. That keeps the strength gate a real PERF gate (not just a mount
+    gate): a flash orchestrator pays zero native-load cost, end to end. The class
+    name + module root are a stable upstream contract (langchain-quickjs surfaces
+    exactly ``CodeInterpreterMiddleware``); a rename surfaces first in
+    ``test_build_interpreter_returns_eval_exposing_middleware``."""
+    for m in middleware:
+        t = type(m)
+        if (
+            getattr(t, "__name__", "") == "CodeInterpreterMiddleware"
+            and t.__module__.split(".", 1)[0] == "langchain_quickjs"
+        ):
+            return True
+    return False
+
+
+def _append_dynamic_suffix(
+    prompt: str, middleware: Sequence[AgentMiddleware],
+) -> str:
+    """Append the dynamic-dispatch upgrade notice iff the interpreter is mounted.
+    Extracted from ``build_stack`` so the prompt-assembly contract — DIFFERENT
+    assembled prompt for an interpreter-enabled orchestrator vs a static-only one
+    (the user's hard requirement: "when we DON'T GIVE the interpreter, the
+    AGENTS.md should be DIFFERENT") — is unit-testable without a full stack build."""
+    if not _interpreter_mounted(middleware):
+        return prompt
+    return f"{prompt}\n\n{_DYNAMIC_DISPATCH_SUFFIX}"
+
+
+# The dynamic-dispatch upgrade notice — appended to the assembled CTO prompt ONLY
+# when the interpreter is mounted (``_interpreter_mounted``). The ``AGENTS.md``
+# orchestrator section above it is the UNIVERSAL static-``task`` baseline every
+# orchestrator sees; this block is the upgrade a strong orchestrator gets on top.
+# A weak orchestrator gets neither the ``eval`` tool NOR this guidance — the same
+# no-token-waste principle as not mounting the tool (the user's hard requirement:
+# "when we DON'T GIVE the interpreter, the AGENTS.md should be DIFFERENT"). So the
+# two assembled prompts genuinely differ: static-only vs static + dynamic. The
+# middleware itself injects the JS ``task()`` / PTC API guide, so this block states
+# the STRATEGY (prefer one dispatch script, inline recon, keep the thread lean) and
+# defers the API shape to the ``eval`` tool's own description — no duplication.
+_DYNAMIC_DISPATCH_SUFFIX = """\
+## Dynamic dispatch (you are interpreter-enabled)
+
+You have the ``eval`` tool — a sandboxed JS REPL — so you can drive the
+**dynamic** happy path. For ANY multi-unit task, PREFER it over the
+static ``task``-one-call-at-a-time flow above:
+
+- ``eval`` runs ONE short dispatch script. ``task({subagentType, description})``
+  dispatches a subagent and returns its response; ``Promise.all([...])`` fans
+  workers out in parallel; ``tools.glob`` / ``tools.grep`` / ``tools.ls`` /
+  ``tools.read_file`` do read-only discovery without a round-trip per call.
+- The happy path becomes: recon via an explorer ``task``, INLINE its report into
+  each worker ``description``, fan the workers out with ``Promise.all``, return
+  the synthesis as the script's value.
+- KEEP YOUR THREAD LEAN — that is the whole point. You hold only the dispatch
+  logic + the final result; the explorers / workers absorb the file contents and
+  the context blow. Do NOT read the explored files into your own thread — inline
+  the explorer's report into the worker calls instead. Hoarding context on the
+  dynamic path duplicates the explorer's work in your thread, which is the very
+  token cost dynamic dispatch exists to avoid.
+
+The ``eval`` tool's own description + the injected ``task()`` / PTC guide carry
+the exact JS API — follow them; do not invent a different shape. (Note:
+``task()`` dispatches inside the already-approved ``eval`` and bypasses parent
+HITL approval per dispatch — by design.)"""
+
+
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # Canonical mount ORDER — ``_resolve_toggles`` emits in this order, so a
     # spec's registry position IS its mount position. ``audit`` (opt-in) is FIRST
@@ -417,6 +569,18 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     MiddlewareSpec("model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry),
     MiddlewareSpec("tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry),
     MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
+    # ``prepare`` is a ``before_agent``-only hook (no model/tool wrapping), so
+    # its registry position does not affect the wrap pipeline — appended LAST to
+    # avoid shifting any existing mount positions. Runs ``prepare()`` once at
+    # agent start; skipped (returns None) unless ``facts.prepare_warmup``.
+    MiddlewareSpec("prepare", frozenset({Scope.SUPERVISOR}), _build_prepare),
+    # ``interpreter`` (CodeInterpreterMiddleware) is a tool-injector (adds the
+    # ``eval`` JS-REPL tool + the ``task(...)`` global), not a model/tool-call
+    # wrapper — so its registry position does not affect the wrap pipeline.
+    # Appended LAST to avoid shifting any existing mount positions. NOT in
+    # ``DEFAULT_SUPERVISOR``: strength-gated (armed in ``_resolve_toggles`` iff
+    # the base model is ``strength: pro``); ``add/remove`` overrides per-org.
+    MiddlewareSpec("interpreter", frozenset({Scope.SUPERVISOR}), _build_interpreter),
 ]
 
 
@@ -432,7 +596,7 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
 # (default-on, removable via ``middleware.supervisor.remove``) — the user's
 # "selectively remove/add middleware" request, applied uniformly to the
 # formerly-non-toggleable layers too.
-DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "model_retry", "browser_vision"]
+DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "model_retry", "browser_vision", "prepare"]
 
 # Subagents get the context layer + browser_vision by default; routing /
 # session_guide / rubric are supervisor concerns. An org MAY add a subagent
@@ -497,12 +661,17 @@ def _resolve_toggles(
     no gate, ``browser_vision`` with a text-only driver)."""
     by_name = _specs_by_name()
 
-    # defaults + gate-driven rubric/tool_retry → rules → removes → adds (add wins over remove).
+    # defaults + gate-driven rubric/tool_retry/interpreter → rules → removes → adds (add wins over remove).
     on: set[str] = set(default_names)
     if scope is Scope.SUPERVISOR and ctx.rubric_gate is not None and ctx.rubric_gate.enabled:
         on.add("rubric")
     if scope is Scope.SUPERVISOR and ctx.tool_retry_cfg is not None:
         on.add("tool_retry")
+    # Dynamic-subagent happy path: auto-mount iff the resolved base model is a
+    # strong orchestrator (strength: pro). Weak/unknown → off (no token waste);
+    # middleware.supervisor.add/remove override either way (add wins, below).
+    if scope is Scope.SUPERVISOR and driver_strong_orchestrator(role="base", org=ctx.org):
+        on.add("interpreter")
     on = set(_apply_rules(ctx.facts, scope, list(on)))
     on -= set(removes)
     on |= set(adds)
@@ -672,6 +841,16 @@ def build_stack(
         # end-turn instruction would be stale by the time the tool returns.
         if ask_user_turn_based(facts.transport):
             prompt = f"{prompt}\n\n{ASK_USER_PROMPT_SUFFIX}"
+
+    # Dynamic-dispatch upgrade notice — appended to the CTO prompt ONLY when the
+    # interpreter is actually mounted (strong base OR an explicit add-override).
+    # The AGENTS.md orchestrator section (in ``build_system_prompt``) is the
+    # universal static-``task`` baseline EVERY orchestrator sees; this block is
+    # the dynamic upgrade a strong orchestrator gets on top. A weak orchestrator
+    # gets neither the ``eval`` tool NOR this guidance — the assembled prompt
+    # genuinely differs (static-only vs static + dynamic), so a model that can't
+    # drive the dynamic path never wastes tokens reading about it.
+    prompt = _append_dynamic_suffix(prompt, supervisor_middleware)
 
     subagents = load_subagents(
         org, tools_surface,

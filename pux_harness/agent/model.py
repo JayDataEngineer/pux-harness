@@ -652,6 +652,30 @@ def driver_multimodal(*, role: str = "base", org: str | None = None) -> bool:
     return is_multimodal(resolve_model_id(role=role, org=org))
 
 
+def is_strong_orchestrator(model_id: str) -> bool:
+    """True iff ``model_id`` is flagged ``strength: pro`` in the ``models:``
+    registry. Unknown ids (and any non-``pro`` value) default to False — the
+    fail-safe path: a model of unknown strength gets NO dynamic-subagent
+    interpreter, so a weak orchestrator never wastes tokens on a tool it can't
+    drive reliably (the user's hard requirement)."""
+    caps = _models_registry().get(model_id)
+    if not isinstance(caps, dict):
+        return False
+    return caps.get("strength") == "pro"
+
+
+def driver_strong_orchestrator(*, role: str = "base", org: str | None = None) -> bool:
+    """True iff the model resolved for ``role`` (against ``org`` + the active
+    tier) is a strong orchestrator (``strength: pro``). The seam the dynamic-
+    subagent ``interpreter`` middleware keys on to decide whether the happy
+    path auto-mounts: a ``pro`` base (shipped glm-5.2/glm-5.1) gets the JS
+    dispatch surface; a ``flash``/unknown base (the ``fast`` tier, mimo) does
+    not. No key, no network — pure id resolution + lookup, mirroring
+    ``driver_multimodal``. Override per-org via
+    ``middleware.supervisor.add/remove: [interpreter]``."""
+    return is_strong_orchestrator(resolve_model_id(role=role, org=org))
+
+
 def dcode_provider() -> str | None:
     """dcode's provider name for our endpoint (``models.yaml`` ``dcode.provider``),
     or None when unset. ``pux tui`` forwards ``<provider>:<id>`` to dcode so it

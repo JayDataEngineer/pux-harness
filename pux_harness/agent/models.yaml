@@ -62,6 +62,16 @@
 #   fail-safe path). `provider:` names a profile in `providers:` (or the
 #   `default_provider` when absent). The DEFAULT tier's multimodal_model must be
 #   flagged true here.
+#   `strength:` is the orchestration-strength class — `pro` (a strong
+#   orchestrator, smart enough to drive the dynamic-subagent happy path via
+#   `CodeInterpreterMiddleware`) or `flash` (a cheap/worker model that should
+#   NOT auto-mount that happy path). `is_strong_orchestrator(id)` /
+#   `driver_strong_orchestrator(role=, org=)` read it; UNKNOWN ids default to
+#   `flash` (fail-safe: a model of unknown strength gets NO interpreter, so a
+#   weak orchestrator never wastes tokens on a tool it can't drive reliably).
+#   The dynamic happy path auto-mounts iff the `base` role resolves to a `pro`
+#   id (shipped: glm-5.2/glm-5.1); `middleware.supervisor.add: [interpreter]`
+#   overrides it ON per-org, `remove` OFF. Set once here — the single source.
 #
 # THE `dcode:` BLOCK
 #   The TUI (dcode) names our opencode endpoint `opencode-go-openai` and uses the
@@ -96,14 +106,14 @@ default_provider: opencode-go
 
 # Per-id registry: capability flag + which profile serves it.
 models:
-  glm-5.2:           {provider: zai-anthropic, multimodal: false}
-  glm-5.1:           {provider: zai-anthropic, multimodal: false}
-  mimo-v2.5:         {provider: opencode-go, multimodal: true}
-  mimo-v2.5-pro:     {provider: opencode-go, multimodal: true}
-  kimi-k2.7-code:    {provider: opencode-go, multimodal: false}
-  kimi-k2.6:         {provider: opencode-go, multimodal: false}
-  deepseek-v4-pro:   {provider: opencode-go, multimodal: false}
-  deepseek-v4-flash: {provider: opencode-go, multimodal: false}
+  glm-5.2:           {provider: zai-anthropic, multimodal: false, strength: pro}
+  glm-5.1:           {provider: zai-anthropic, multimodal: false, strength: pro}
+  mimo-v2.5:         {provider: opencode-go, multimodal: true, strength: flash}
+  mimo-v2.5-pro:     {provider: opencode-go, multimodal: true, strength: flash}
+  kimi-k2.7-code:    {provider: opencode-go, multimodal: false, strength: flash}
+  kimi-k2.6:         {provider: opencode-go, multimodal: false, strength: flash}
+  deepseek-v4-pro:   {provider: opencode-go, multimodal: false, strength: flash}
+  deepseek-v4-flash: {provider: opencode-go, multimodal: false, strength: flash}
 
 # Named tiers — a coherent role map per "mode". `default_tier` is the shipped
 # default; --tier <name> (or --fast) selects another at run time.

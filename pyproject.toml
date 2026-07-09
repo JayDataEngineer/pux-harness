@@ -20,14 +20,31 @@ dependencies = [
     "deepagents-code",
     "ag-ui-langgraph",
     "fastmcp>=3.4.2",
+    "langchain-quickjs>=0.2.0",
 ]
 
-# Optional extras — the base install stays lean. Each extra is a guarded import
-# (see agent/observability.py): the harness runs identically with or without.
+# Optional extras — the base install stays lean. The Python-import extras
+# (observability, upstream) are guarded imports (see agent/observability.py):
+# the harness runs identically with or without. The ``prod`` extra is different —
+# a separate runtime binary (aegra) the prod launcher opts into (see below).
 [project.optional-dependencies]
 observability = ["langfuse>=3.0"]
 upstream = [
     "langgraph-cli[inmem]>=0.4.30",
+]
+# Aegra — the OSS langgraph-api/LangGraph-Platform drop-in that serves the
+# Agent Protocol HTTP surface in production (see docs/AEGRA_PROD.md). A separate
+# binary, not a guarded import: the PyPI distribution is ``aegra-cli`` (which
+# ships the ``aegra`` console command — do NOT confuse with the unrelated PyPI
+# ``aegra`` package, capped at 0.2.0). Kept out of the base install so consumers
+# of the slim kit don't pull postgres/redis/sqlalchemy/structlog. The prod
+# launcher (scripts/start_pux_aegra.sh) opts in with ``uv run --extra prod`` —
+# which installs on first start AND self-heals after any bare ``uv sync`` (a bare
+# sync prunes undeclared packages; ``--extra prod`` re-declares aegra-cli into the
+# sync set so every prod start re-installs it). Mirror of how ``upstream`` scopes
+# the langgraph-cli keystone lane.
+prod = [
+    "aegra-cli>=0.9.24",
 ]
 
 [build-system]
@@ -41,7 +58,7 @@ pux = "pux_harness.cli:main"
 packages = ["pux_harness"]
 
 [dependency-groups]
-dev = ["pytest", "ruff", "mypy"]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
 
 [tool.pytest.ini_options]
 # The harness repo's own suite: the slim-kit compiler + the org-agnostic
@@ -50,6 +67,7 @@ dev = ["pytest", "ruff", "mypy"]
 # which installs pux-harness and exercises it against real orgs.
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

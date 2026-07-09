@@ -115,6 +115,44 @@ def test_driver_multimodal_worker_is_multimodal_in_default_tier(monkeypatch):
     assert model.driver_multimodal(role="worker") is True
 
 
+# --- per-id orchestration strength (the dynamic-subagent happy-path gate) -----
+
+def test_is_strong_orchestrator_reads_registry():
+    """``strength`` is a property of the MODEL ID, read from the registry — the
+    single source the interpreter happy path keys on (set once in models.yaml)."""
+    assert model.is_strong_orchestrator("glm-5.2") is True
+    assert model.is_strong_orchestrator("glm-5.1") is True
+    assert model.is_strong_orchestrator("mimo-v2.5") is False
+    assert model.is_strong_orchestrator("deepseek-v4-pro") is False   # name says pro, registry says flash
+    assert model.is_strong_orchestrator("kimi-k2.7-code") is False
+
+
+def test_is_strong_orchestrator_unknown_defaults_false():
+    """An UNKNOWN id (and any non-``pro`` value) defaults to NOT strong (fail-
+    safe: a model of unknown strength gets NO interpreter, so a weak orchestrator
+    never wastes tokens on a tool it can't drive reliably)."""
+    assert model.is_strong_orchestrator("brand-new-model-id") is False
+    assert model.is_strong_orchestrator("") is False
+
+
+def test_driver_strong_orchestrator_flips_with_tier(monkeypatch):
+    """``driver_strong_orchestrator`` resolves the base role's id (per the active
+    tier) then its strength — the seam the interpreter gate uses. Default tier's
+    supervisor is glm-5.2 (pro -> interpreter auto-mounts); fast tier flips it to
+    mimo (flash -> no interpreter, no token waste)."""
+    monkeypatch.delenv("PUX_TIER", raising=False)
+    assert model.driver_strong_orchestrator(role="base") is True    # glm-5.2
+    monkeypatch.setenv("PUX_TIER", "fast")
+    assert model.driver_strong_orchestrator(role="base") is False   # mimo-v2.5
+
+
+def test_driver_strong_orchestrator_worker_never_strong(monkeypatch):
+    """The DEFAULT tier's WORKER (mimo) is flash even though the supervisor is
+    pro — workers never drive the dynamic dispatch; the supervisor does."""
+    monkeypatch.delenv("PUX_TIER", raising=False)
+    assert model.driver_strong_orchestrator(role="worker") is False
+
+
 # --- a tier missing a role key fails loud (the modern form of the old roles: check) ---
 
 def test_validate_rejects_tier_missing_role_key(tmp_path, monkeypatch, _spec_cleared):
