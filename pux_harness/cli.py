@@ -433,6 +433,32 @@ def main() -> None:
         help="tree containing orgs/ to lock against (default: "
              "$PUX_PROJECT_ROOT or CWD)")
 
+    # Verify a packed OCI layout (P5 close-the-loop: ``emit`` records the tamper
+    # anchor, ``verify`` checks it). Stdlib-only — reads index.json + blobs directly,
+    # no ``oras`` needed at verify time (a trust op minimizes its toolchain). Checks
+    # manifest + blob integrity, optional trust anchors, and optional source
+    # attestation (does the packed library match ``orgs/<org>/lib/`` right now?).
+    p_verify = sub.add_parser(
+        "verify",
+        help="verify a packed OCI layout's integrity (manifest + layer digests)")
+    p_verify.add_argument(
+        "--oci", required=True,
+        help="oci-layout dir to verify (the <org>.oci from `pux pack --oci`)")
+    p_verify.add_argument(
+        "--org", default=None,
+        help="enable source attestation: re-derive the library layer from "
+             "orgs/<org>/lib/ and confirm it matches the packed layer")
+    p_verify.add_argument(
+        "--source-root", default=None,
+        help="tree containing orgs/ for --org attestation (default: "
+             "$PUX_PROJECT_ROOT or CWD)")
+    p_verify.add_argument(
+        "--expected", default=None,
+        help="trusted manifest digest (sha256:...) to assert against")
+    p_verify.add_argument(
+        "--expected-library", default=None,
+        help="trusted agent-library layer digest (sha256:...) to assert against")
+
     args = ap.parse_args()
     _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (serve/acp/direct/tui)
 
@@ -600,6 +626,28 @@ def main() -> None:
                 if lib:
                     print(f"  library layer (integrity): {lib.get('digest')}  "
                           f"[{lib.get('size')} B]")
+
+    # --- Verify a packed OCI layout (P5: emit records the anchor, verify checks it) ---
+    elif args.cmd == "verify":
+        from pathlib import Path as _Path
+        from pux_harness.kit._paths import project_root as _project_root
+        from pux_harness.oci import OciError, verify_oci_layout
+
+        layout = _Path(args.oci)
+        # Source attestation needs a tree to re-derive lib/ from: an explicit
+        # --source-root wins; else the live project root when --org is given.
+        source_root = (_Path(args.source_root) if args.source_root
+                       else (_project_root() if args.org else None))
+        try:
+            result = verify_oci_layout(
+                layout, org=args.org, source_root=source_root,
+                expected=args.expected, expected_library=args.expected_library)
+        except OciError as exc:
+            import sys as _sys
+            _sys.stderr.write(f"verify failed for {layout}: {exc}\n")
+            raise SystemExit(1)
+        print(result.summary())
+        raise SystemExit(0 if result.ok else 1)
 
     # --- `export` is DEPRECATED → HARD ERROR (Decision 5: no silent alias) ---
     # The verb is retained as a parser so `pux export ...` yields this clear

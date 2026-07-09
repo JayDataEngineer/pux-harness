@@ -23,8 +23,10 @@ from pux_harness.oci import (
     OciError,
     _build_layer_tar,
     _is_library,
+    _normalized_bytes,
     _split_layers,
     emit_oci_artifact,
+    verify_oci_layout,
 )
 
 
@@ -143,16 +145,27 @@ def _inputs(tmp: Path, lib_body: str = "def learned():\n    return 1\n",
 # --- layer grouping + tar -----------------------------------------------------
 
 def test_is_library_targets_org_lib():
-    assert _is_library("orgs/acme/lib/functions/learned.py")
-    assert _is_library("orgs/acme/lib/index.yaml")
-    assert not _is_library("orgs/acme/sandbox/helper.py")
-    assert not _is_library("orgs/acme/agents/worker.md")
-    assert not _is_library("run.py")
+    assert _is_library("orgs/acme/lib/functions/learned.py", "acme")
+    assert _is_library("orgs/acme/lib/index.yaml", "acme")
+    assert not _is_library("orgs/acme/sandbox/helper.py", "acme")
+    assert not _is_library("orgs/acme/agents/worker.md", "acme")
+    assert not _is_library("run.py", "acme")
+
+
+def test_is_library_does_not_misroute_a_sandbox_lib_subdir():
+    """Regression: a bare ``/lib/`` substring routed ``orgs/<org>/sandbox/lib/util.py``
+    into the agent-library integrity layer. Anchoring on ``/<org>/lib/`` fixes it,
+    and still matches the specialists layout (``orgs/specialists/<org>/lib/``)."""
+    assert not _is_library("orgs/acme/sandbox/lib/util.py", "acme")
+    assert not _is_library("orgs/acme/somelib/foo.py", "acme")
+    # the org segment disambiguates the specialists parent dir
+    assert _is_library("orgs/specialists/invest/lib/functions/x.py", "invest")
+    assert not _is_library("orgs/specialists/invest/lib/functions/x.py", "acme")
 
 
 def test_split_layers_puts_lib_apart_from_source_and_scaffold(tmp_path):
     files, scaffold, _ = _inputs(tmp_path)
-    source, library = _split_layers(files, scaffold)
+    source, library = _split_layers(files, scaffold, "acme")
     src_paths = [p for p, _ in source]
     lib_paths = [p for p, _ in library]
     assert "orgs/acme/lib/functions/learned.py" in lib_paths
@@ -257,3 +270,114 @@ def test_media_types_are_the_pux_vocabulary(tmp_path):
     assert by_type["config"] == PUX_CONFIG_MEDIATYPE
     assert by_type["source-code"] == PUX_SOURCE_LAYER_MEDIATYPE
     assert by_type["agent-library"] == PUX_LIBRARY_LAYER_MEDIATYPE
+
+
+# --- verify (close-the-loop: emit records the anchor, verify checks it) ----------
+# verify reads the oci-layout DIRECTLY (stdlib-only — no oras at verify time), so the
+# unit tests hand-build a REAL layout (index.json + blobs/sha256/...) on disk.
+
+def _build_layout(
+    tmp: Path, *, config: bytes = b"{}", source: bytes = b"src",
+    library: bytes = b"lib", corrupt_library: bytes | None = None,
+) -> tuple[Path, str, str]:
+    """Hand-build a real oci-layout so verify can read it without oras. Returns
+    (layout, manifest_digest, library_digest). ``corrupt_library`` writes bytes that
+    do NOT hash to the recorded library digest (an in-place tamper)."""
+    layout = tmp / "acme.oci"
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+
+    def _write(blob_bytes: bytes) -> str:
+        digest = _digest(blob_bytes)
+        (blobs / digest.split(":", 1)[1]).write_bytes(blob_bytes)
+        return digest
+
+    config_d = _write(config)
+    source_d = _write(source)
+    library_d = _digest(library)
+    (blobs / library_d.split(":", 1)[1]).write_bytes(
+        library if corrupt_library is None else corrupt_library)
+
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": PUX_CONFIG_MEDIATYPE, "digest": config_d, "size": len(config)},
+        "layers": [
+            {"mediaType": PUX_SOURCE_LAYER_MEDIATYPE, "digest": source_d, "size": len(source)},
+            {"mediaType": PUX_LIBRARY_LAYER_MEDIATYPE, "digest": library_d, "size": len(library)},
+        ],
+        "annotations": {"org.pux.org": "acme"},
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+    manifest_d = _write(manifest_bytes)
+    (layout / "index.json").write_text(json.dumps({
+        "schemaVersion": 2, "manifests": [
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+             "digest": manifest_d, "size": len(manifest_bytes)}]}))
+    return layout, manifest_d, library_d
+
+
+def _lib_layer_tar(tmp: Path, org: str = "acme") -> bytes:
+    """The agent-library layer tar built from the staged source ``orgs/<org>/lib/``
+    — the SAME construction pack uses, so verify's source-attestation matches it."""
+    lib_root = tmp / "orgs" / org / "lib"
+    entries = []
+    for path in sorted(lib_root.rglob("*")):
+        if path.is_file():
+            arc = path.relative_to(tmp).as_posix()
+            entries.append((arc, _normalized_bytes(arc, path.read_bytes())))
+    return _build_layer_tar(entries, org)
+
+
+def test_verify_passes_on_a_clean_layout(tmp_path):
+    layout, manifest_d, library_d = _build_layout(tmp_path)
+    result = verify_oci_layout(layout)
+    assert result.ok, result.summary()
+    assert result.manifest_digest == manifest_d
+    assert result.library_digest == library_d  # the tamper anchor is surfaced
+    assert {c.name for c in result.checks if not c.ok} == set()
+
+
+def test_verify_detects_a_corrupted_library_blob(tmp_path):
+    """An in-place tamper of the agent-library blob (content != recorded digest) is
+    caught by the blob self-consistency check — the integrity contract, on verify."""
+    layout, _, _ = _build_layout(tmp_path, corrupt_library=b"TAMPERED-CONTENT")
+    result = verify_oci_layout(layout)
+    assert not result.ok
+    failed = [c.name for c in result.checks if not c.ok]
+    assert any("agent-library" in n and "self-consistency" in n for n in failed), failed
+
+
+def test_verify_manifest_and_library_trust_anchors(tmp_path):
+    layout, manifest_d, library_d = _build_layout(tmp_path)
+    # correct anchors → pass
+    assert verify_oci_layout(layout, expected=manifest_d,
+                             expected_library=library_d).ok
+    # wrong manifest anchor → fail on that check only
+    bad_manifest = verify_oci_layout(layout, expected="sha256:" + "0" * 64)
+    assert not bad_manifest.ok
+    assert any("manifest == expected" in c.name for c in bad_manifest.checks if not c.ok)
+    # wrong library anchor → fail
+    bad_library = verify_oci_layout(layout, expected_library="sha256:" + "f" * 64)
+    assert not bad_library.ok
+    assert any("library == expected" in c.name for c in bad_library.checks if not c.ok)
+
+
+def test_verify_source_attestation_matches_then_detects_drift(tmp_path, monkeypatch):
+    """Re-deriving the agent-library layer from ``orgs/<org>/lib/`` matches the packed
+    layer; mutating the learned function → the source-attestation check FAILS (the
+    drift the design promises is detectable on verify)."""
+    files, scaffold, inventory = _inputs(tmp_path)  # stages orgs/acme/lib/...
+    library_tar = _lib_layer_tar(tmp_path)          # pack-faithful library bytes
+    layout, _, _ = _build_layout(tmp_path, library=library_tar)
+
+    matched = verify_oci_layout(layout, org="acme", source_root=tmp_path)
+    assert matched.ok, matched.summary()
+    assert any("matches source" in c.name for c in matched.checks)
+
+    # the agent "learned" something new after the pack → drift
+    (tmp_path / "orgs" / "acme" / "lib" / "functions" / "learned.py").write_text(
+        "def learned():\n    return 999  # drifted\n")
+    drifted = verify_oci_layout(layout, org="acme", source_root=tmp_path)
+    assert not drifted.ok
+    assert any("matches source" in c.name for c in drifted.checks if not c.ok)

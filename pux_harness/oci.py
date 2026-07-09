@@ -32,6 +32,7 @@ REFUSES the emit (clear install message) — there is no silent skip.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tarfile
@@ -97,9 +98,15 @@ class OciArtifact:
 # Layer grouping + tar construction
 # ---------------------------------------------------------------------------
 
-def _is_library(path: str) -> bool:
-    """``orgs/<org>/lib/**`` — the agent-authored learned functions + index.yaml."""
-    return "/lib/" in path
+def _is_library(path: str, org: str) -> bool:
+    """``orgs/<org>/lib/**`` — the agent-authored learned functions + index.yaml.
+
+    Anchored on ``/<org>/lib/`` (not a bare ``/lib/`` substring) so a sandbox
+    ``lib/`` subdir (``orgs/<org>/sandbox/lib/util.py``) is NOT misrouted into the
+    agent-library integrity layer. Handles both the flat and the specialists
+    (``orgs/specialists/<org>/lib/``) layouts — the org segment disambiguates
+    regardless of the ``specialists/`` prefix."""
+    return f"/{org}/lib/" in path
 
 
 def _normalized_bytes(archive_path: str, raw: bytes) -> bytes:
@@ -110,7 +117,7 @@ def _normalized_bytes(archive_path: str, raw: bytes) -> bytes:
 
 
 def _split_layers(
-    files: dict[str, Path], scaffold: dict[str, bytes]
+    files: dict[str, Path], scaffold: dict[str, bytes], org: str,
 ) -> tuple[list[tuple[str, bytes]], list[tuple[str, bytes]]]:
     """Group the collected content into (source-code entries, agent-library entries).
 
@@ -125,7 +132,7 @@ def _split_layers(
         except (PermissionError, OSError):
             continue  # mirror pack_org: unreadable files are skipped, not fatal
         data = _normalized_bytes(archive_path, raw)
-        (library if _is_library(archive_path) else source).append((archive_path, data))
+        (library if _is_library(archive_path, org) else source).append((archive_path, data))
     # The generated scaffold joins the source layer (trusted kit, not learned lib).
     for archive_path, raw in sorted(scaffold.items()):
         source.append((archive_path, _normalized_bytes(archive_path, raw)))
@@ -236,7 +243,7 @@ def emit_oci_artifact(
     layout.parent.mkdir(parents=True, exist_ok=True)
     artifact_tag = tag or "v1"
 
-    source_entries, library_entries = _split_layers(files, scaffold)
+    source_entries, library_entries = _split_layers(files, scaffold, org)
 
     # Compact config descriptor (content-deterministic — no timestamp inside it; the
     # manifest digest carries oras's auto org.opencontainers.image.created, so it is
@@ -346,3 +353,161 @@ def _write_provenance(
     }
     path.write_text(json.dumps(record, indent=2, sort_keys=True))
     return path
+
+
+# ---------------------------------------------------------------------------
+# Verify (P5 close-the-loop: ``emit`` records the tamper anchor, ``verify`` checks it)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VerifyCheck:
+    """One named pass/fail of a verify run."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+@dataclass
+class VerifyResult:
+    """Outcome of :func:`verify_oci_layout`. ``library_digest`` is the surfaced
+    tamper anchor; ``ok`` is the AND of every check."""
+
+    ok: bool
+    layout: Path
+    manifest_digest: str
+    library_digest: str | None
+    checks: list[VerifyCheck]
+
+    def summary(self) -> str:
+        lines = [f"oci layout: {self.layout}",
+                 f"manifest:    {self.manifest_digest}"]
+        if self.library_digest:
+            lines.append(f"library:     {self.library_digest}  (tamper anchor)")
+        for chk in self.checks:
+            mark = "OK  " if chk.ok else "FAIL"
+            suffix = f" — {chk.detail}" if chk.detail else ""
+            lines.append(f"  [{mark}] {chk.name}{suffix}")
+        verdict = "PASS — artifact verified" if self.ok else "FAIL — see checks above"
+        lines.append(f"VERDICT: {verdict}")
+        return "\n".join(lines)
+
+
+def _blob_path(layout: Path, digest: str) -> Path:
+    """``sha256:<hex>`` → ``<layout>/blobs/sha256/<hex>``."""
+    algo, _, hexv = digest.partition(":")
+    return layout / "blobs" / algo / hexv
+
+
+def _read_layout_manifest(layout: Path) -> tuple[dict[str, Any], str]:
+    """``index.json`` → the manifest blob it points at. Returns (manifest, digest)."""
+    index = json.loads((layout / "index.json").read_text())
+    manifest_digest = (index.get("manifests") or [{}])[0].get("digest", "")
+    if not manifest_digest:
+        raise OciError(f"{layout} index.json has no manifest digest — not a pux oci-layout")
+    manifest = json.loads(_blob_path(layout, manifest_digest).read_text())
+    return manifest, manifest_digest
+
+
+def _library_layer_digest_from_source(
+    org: str, source_root: Path | None,
+) -> str | None:
+    """Re-derive the agent-library layer digest from ``orgs/<org>/lib/**`` on disk,
+    using the SAME construction pack uses (``_build_layer_tar`` + text normalization +
+    ``_is_library`` filtering) so the comparison is byte-faithful. Returns ``None`` if
+    the org has no ``lib/`` (nothing to attest). Handles both the flat
+    (``orgs/<org>/lib``) and specialists (``orgs/specialists/<org>/lib``) layouts."""
+    if source_root is None:
+        return None
+    root = Path(source_root)
+    candidates = [root / "orgs" / org / "lib",
+                  root / "orgs" / "specialists" / org / "lib"]
+    lib_dir = next((c for c in candidates if c.is_dir()), None)
+    if lib_dir is None:
+        return None
+    entries: list[tuple[str, bytes]] = []
+    for path in sorted(lib_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        arc = path.relative_to(root).as_posix()
+        if not _is_library(arc, org):  # defensive — everything under lib/ already matches
+            continue
+        entries.append((arc, _normalized_bytes(arc, path.read_bytes())))
+    return "sha256:" + hashlib.sha256(_build_layer_tar(entries, org)).hexdigest()
+
+
+def verify_oci_layout(
+    layout: Path, *, org: str | None = None, source_root: Path | None = None,
+    expected: str | None = None, expected_library: str | None = None,
+) -> VerifyResult:
+    """Verify a pux OCI layout — **stdlib-only** (no ``oras`` needed at verify time).
+
+    A trust operation minimizes its toolchain: the layout is read directly
+    (``index.json`` → manifest blob → layer blobs), so a consumer verifies an artifact
+    WITHOUT the pack tool installed. Checks:
+
+    1. **manifest integrity** — the manifest blob recomputes to the digest
+       ``index.json`` references (catches a swapped manifest).
+    2. **blob self-consistency** — every config/layer blob recomputes to its
+       manifest-recorded digest (catches in-place corruption / bit-rot).
+    3. **manifest trust anchor** (``expected``) — the manifest digest equals a
+       known-good value recorded at pack time / from a signature (P6).
+    4. **library trust anchor** (``expected_library``) — the agent-library layer
+       digest equals a known-good value (the integrity target).
+    5. **source attestation** (``org`` + ``source_root``) — re-derive the
+       agent-library layer from ``orgs/<org>/lib/**`` and confirm it matches the
+       packed layer (catches a learned function that drifted after the pack).
+
+    The agent-library layer digest is surfaced as the tamper anchor — P5's headline
+    property is now consumable: ``emit`` records it, ``verify`` checks it."""
+    layout = Path(layout)
+    checks: list[VerifyCheck] = []
+    manifest, manifest_digest = _read_layout_manifest(layout)
+
+    # 1. manifest integrity
+    actual_manifest = "sha256:" + hashlib.sha256(
+        _blob_path(layout, manifest_digest).read_bytes()).hexdigest()
+    checks.append(VerifyCheck(
+        "manifest integrity", actual_manifest == manifest_digest,
+        "" if actual_manifest == manifest_digest else f"got {actual_manifest}"))
+
+    # 2. blob self-consistency (config + each layer)
+    for desc in [manifest.get("config") or {}] + (manifest.get("layers") or []):
+        digest = desc.get("digest", "")
+        media = desc.get("mediaType", "?")
+        if not digest:
+            continue
+        blob = _blob_path(layout, digest)
+        if not blob.is_file():
+            checks.append(VerifyCheck(f"blob present: {media}", False, "missing on disk"))
+            continue
+        got = "sha256:" + hashlib.sha256(blob.read_bytes()).hexdigest()
+        checks.append(VerifyCheck(
+            f"blob self-consistency: {media}", got == digest,
+            "" if got == digest else f"got {got}"))
+
+    library_digest = next(
+        (layer.get("digest") for layer in (manifest.get("layers") or [])
+         if layer.get("mediaType") == PUX_LIBRARY_LAYER_MEDIATYPE), None)
+
+    # 3. manifest trust anchor
+    if expected:
+        checks.append(VerifyCheck(
+            "manifest == expected trust anchor", manifest_digest == expected,
+            "" if manifest_digest == expected else f"expected {expected}"))
+    # 4. library trust anchor
+    if expected_library and library_digest:
+        checks.append(VerifyCheck(
+            "library == expected trust anchor", library_digest == expected_library,
+            "" if library_digest == expected_library else f"expected {expected_library}"))
+    # 5. source attestation
+    if org:
+        derived = _library_layer_digest_from_source(org, source_root)
+        if derived is not None and library_digest:
+            checks.append(VerifyCheck(
+                f"library matches source orgs/{org}/lib/", derived == library_digest,
+                "" if derived == library_digest else f"source-derived {derived}"))
+
+    return VerifyResult(
+        ok=all(chk.ok for chk in checks), layout=layout, manifest_digest=manifest_digest,
+        library_digest=library_digest, checks=checks)
