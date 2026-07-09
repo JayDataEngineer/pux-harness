@@ -126,8 +126,22 @@ def make_graph(org: str) -> CompiledStateGraph:
     # runtime (production / k3s): pux's runtime factory. langgraph-api owns the
     # checkpointer + store; passing None lets the runtime inject its own.
     from pux_harness.agent.graph import build_graph
+    from pux_harness.agent.stack import RuntimeFacts
 
-    return build_graph(org, checkpointer=None, store=None)
+    # ``prepare_warmup=True`` arms the PrepareWarmupMiddleware (the
+    # ``before_agent`` hook), the serve-lane owner of the ``prepare()`` seam.
+    # Aegra owns the run loop itself — unlike ``pux direct``/``server.py`` it
+    # has no pux entry point to call ``prepare()`` from, so the warmup
+    # (declared ``jobs:`` like ``warmup_browser`` + universal
+    # ``warmup_webhook``) would silently NOT fire without this. ``transport``
+    # defaults to ``serve`` ⇒ ``universal_warmup=True`` (matches the
+    # ``server.py`` lane). See ``context/prepare_warmup.py``.
+    return build_graph(
+        org,
+        checkpointer=None,
+        store=None,
+        facts=RuntimeFacts(prepare_warmup=True),
+    )
 
 
 # --- multi-org factory registration --------------------------------------
