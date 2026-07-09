@@ -13,5 +13,8 @@
     "telegram-agent": "pux_harness.runtime.upstream:graph__telegram_agent",
     "twitter-agent": "pux_harness.runtime.upstream:graph__twitter_agent",
     "video-production": "pux_harness.runtime.upstream:graph__video_production"
+  },
+  "http": {
+    "app": "pux_harness.runtime.custom_app:app"
   }
 }

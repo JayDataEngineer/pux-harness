@@ -27,6 +27,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]  # pux-harness/
 MANIFEST = ROOT / "langgraph.json"
 MODULE = "pux_harness.runtime.upstream"
+# The langgraph-api ``user_router`` custom app — pux's unique surfaces
+# (/events* EventBus + /jobs/{org}/* prep) composed UNDER upstream's AP CRUD.
+# See pux_harness/runtime/custom_app.py + plan-p3-server-rest-retirement.
+HTTP_APP = "pux_harness.runtime.custom_app:app"
 
 
 def _project_root() -> Path | None:
@@ -53,7 +57,15 @@ def graph_specs() -> dict[str, str]:
 
 def render() -> str:
     return json.dumps(
-        {"dependencies": ["."], "graphs": graph_specs()}, indent=2, sort_keys=True
+        {
+            "dependencies": ["."],
+            "graphs": graph_specs(),
+            # Bind pux's custom surfaces (EventBus + jobs) under upstream's AP
+            # CRUD via langgraph-api's ``user_router`` seam (``http.app``).
+            "http": {"app": HTTP_APP},
+        },
+        indent=2,
+        sort_keys=True,
     ) + "\n"
 
 
