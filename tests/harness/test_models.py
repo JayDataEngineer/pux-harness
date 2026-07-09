@@ -299,7 +299,7 @@ def test_get_model_attaches_fallback_chain(monkeypatch):
     m = model.get_model(role="base")
     # MUST be a BaseChatModel — deepagents' resolve_model fast-path requires it.
     assert isinstance(m, BaseChatModel)
-    # And NOT a RunnableWithFallbacks (the pre-fix shape that crashed pux serve).
+    # And NOT a RunnableWithFallbacks (the pre-fix shape that crashed serve startup).
     assert not isinstance(m, RunnableWithFallbacks)
     assert _model_id(m) == "glm-5.2"
     assert [_model_id(fb) for fb in m._fallback_models] == ["glm-5.1"]
@@ -311,7 +311,7 @@ def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
     and returned UNCHANGED. A bare ``RunnableWithFallbacks`` (the pre-fix shape)
     missed the fast-path → ``apply_provider_profile(model)`` →
     ``get_provider_profile(model)`` → ``spec.count(':")`` → ``AttributeError``
-    ('ReasoningChatOpenAI' object has no attribute 'count') → ``pux serve``
+    ('ReasoningChatOpenAI' object has no attribute 'count') → Aegra
     startup crash. This is the EXACT gap that let the regression ship: bind_tools
     was proven but the model was never driven through the real deepagents seam."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
@@ -325,9 +325,9 @@ def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
 def test_fallback_model_builds_in_real_deepagent_factory(monkeypatch):
     """REGRESSION (verify-or-die): the fallback-bearing base model is accepted by
     the REAL ``deepagents.create_deep_agent`` factory — the full seam that crashed
-    ``pux serve`` startup (build_graph → create_deep_agent → resolve_model →
+    Aegra startup (build_graph → create_deep_agent → resolve_model →
     AttributeError). Building binds tools internally; proving the factory accepts
-    the model is the strongest guarantee that ``pux serve`` boots. No network —
+    the model is the strongest guarantee that Aegra boots. No network —
     the model is never invoked, only assembled."""
     monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")

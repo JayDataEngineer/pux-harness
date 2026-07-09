@@ -3,7 +3,7 @@
 This is the SEAM that makes pux seamless in a foreign codebase: a consumer
 drops ``./.env`` next to its code, runs pux, and its keys land in
 ``os.environ`` without an ``export``. It is vendored with the slim kit into
-every export, so the SAME function serves ``pux serve``/``pux direct``/
+every export, so the SAME function serves the Aegra runtime / ``pux direct`` /
 ``pux acp`` AND an exported runner. These tests pin its two contracts:
 
 1. **``.env`` load** — launch-CWD-anchored (``find_dotenv(usecwd=True)``); an

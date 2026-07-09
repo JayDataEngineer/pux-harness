@@ -11,8 +11,8 @@ created_at)`` index that maps a thread_id → the org whose graph owns it.
 ``langgraph/checkpoint/sqlite/aio.py``):** ``AsyncSqliteSaver.from_conn_string``
 opens its OWN aiosqlite connection. A ``PRAGMA busy_timeout`` set on a SEPARATE
 ``pux_threads`` connection would NOT apply to the saver's writes — so two
-processes (``pux direct`` + ``pux serve``) hitting the same DB would intermittently
-raise ``database is locked``. :func:`open_thread_store` opens ONE connection,
+processes (``pux direct`` + the Aegra runtime) hitting the same DB would
+intermittently raise ``database is locked``. :func:`open_thread_store` opens ONE connection,
 sets WAL + ``busy_timeout=5000`` on it, then constructs ``AsyncSqliteSaver(conn)``
 (the documented raw form) so the saver and the index share the same hardened
 connection. ``tests/test_threads.py`` proves the multi-process case.

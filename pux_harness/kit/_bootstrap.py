@@ -5,8 +5,8 @@ app (or an exported org runner) drops a ``.env`` next to its code, runs pux, and
 its keys are picked up WITHOUT the user having to ``export`` them into the shell
 that launched the process. It lives in the slim kit (not the heavy runtime) so
 it is vendored into every export — the runner emitted for an exported org calls
-this at its top, and ``pux serve``/``pux direct``/``pux acp`` call it from their
-own entrypoints. One function, every consumer.
+this at its top, and the Aegra runtime / ``pux direct`` / ``pux acp`` call it from
+their own entrypoints. One function, every consumer.
 
 Two contracts:
 
@@ -23,7 +23,7 @@ Two contracts:
 2. **Pin logging to stderr** (only when ``pin_stderr=True`` — the ACP stdio path,
    where stdout IS the JSON-RPC wire and a stray log line corrupts the stream).
    ``force=True`` re-binds the root logger before deepagents/langchain/acp can
-   auto-configure a stdout handler. HTTP entrypoints (serve/agui) pass
+   auto-configure a stdout handler. The HTTP entrypoint (Aegra) passes
    ``pin_stderr=False`` so uvicorn keeps its own log config.
 
 Idempotent: ``load_dotenv`` never overrides an already-set var and

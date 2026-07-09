@@ -13,8 +13,9 @@ Historically the two HTTP/CLI entry points called it themselves:
 
 * ``main.py`` (``pux direct``) — ``prepare(org, exec_client=shared_exec())``
   before ``agent.ainvoke()``.
-* ``server.py`` (``pux serve`` fallback) — ``prepare(org, universal_warmup=True)``
-  offloaded to a worker thread inside ``POST /runs``.
+* the now-retired ``server.py`` (formerly ``pux serve``) used to call
+  ``prepare(org, universal_warmup=True)`` offloaded to a worker thread inside
+  ``POST /runs`` — its role moved to this middleware (Aegra owns the run loop).
 
 Aegra (pux's prod Agent Protocol runtime — a langgraph-api/LangGraph-Platform
 drop-in) owns the run loop itself: there is NO pux entry point between
@@ -29,9 +30,9 @@ Single owner, no double-fire
 ----------------------------
 The middleware is GATED on ``RuntimeFacts.prepare_warmup`` (default False).
 Only the Aegra runtime factory (``runtime/upstream.py``) sets it True. The
-``direct`` and ``server.py`` lanes leave it False and keep their OWN explicit
-``prepare()`` call — so each runtime has exactly ONE prepare source and no run
-double-fires. Tests build the graph with the default ``RuntimeFacts()`` → the
+``direct`` lane leaves it False and keeps its OWN explicit ``prepare()`` call —
+so each runtime has exactly ONE prepare source and no run double-fires. Tests
+build the graph with the default ``RuntimeFacts()`` → the
 middleware no-ops (``_build_prepare`` returns ``None``) → Docker is never
 touched from a test invoke.
 
@@ -46,9 +47,9 @@ Why ``abefore_agent`` + ``asyncio.to_thread``
 warmup scripts). The prod path (Aegra / langgraph-api) streams runs
 asynchronously, so the hook runs as ``abefore_agent``. Calling ``prepare()``
 inline would stall the SINGLE event loop — during which a webhook-less client's
-``GET /events`` poll could time out and mistake the runtime for dead (the
-exact reason ``server.py`` offloaded with ``asyncio.to_thread``). Offloading
-keeps the loop serving ``/events``, ``/ok``, and new runs while prep runs in
+``GET /events`` poll could time out and mistake the runtime for dead (the same
+reason the now-retired ``server.py`` offloaded with ``asyncio.to_thread``).
+Offloading keeps the loop serving ``/events`` and new runs while prep runs in
 parallel.
 """
 from __future__ import annotations
@@ -123,7 +124,7 @@ class PrepareWarmupMiddleware(AgentMiddleware):
     async def abefore_agent(
         self, state: Any, runtime: Any
     ) -> dict[str, Any] | None:
-        """Async path (the prod one: Aegra / server.py stream).
+        """Async path (the prod one: Aegra streams runs asynchronously).
 
         Offload the blocking Docker I/O to a worker thread so the event loop
         keeps serving /events polls + new runs while prep runs in parallel.

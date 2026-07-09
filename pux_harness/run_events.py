@@ -8,9 +8,12 @@ subscribes ONCE to ``GET /events/stream`` and receives every ``run.completed``
 as it happens — across all orgs/threads/runs — or catches up via
 ``GET /events?since=<ts>``.
 
-``server.py`` publishes here at the SAME call site as the outbound webhook
-(``_dispatch_run_webhook``), so the SSE stream and the outbound POST carry
-IDENTICAL payloads (``run_id``/``status``/``output``/``event="run.completed"``).
+Run completions publish here at the SAME call site the legacy outbound webhook
+used (``_dispatch_run_webhook``, in the now-retired ``server.py``), so the SSE
+stream carries the IDENTICAL payload (``run_id``/``status``/``output``/
+``event="run.completed"``). Under Aegra the bus lives in ``runtime/custom_app.py``
+(mounted via ``http.app``) — Aegra has no outbound webhook, so this SSE feed IS
+the push channel.
 The bus is the receiver-of-last-resort that lives on the pux side, so the caller
 never has to expose an endpoint.
 

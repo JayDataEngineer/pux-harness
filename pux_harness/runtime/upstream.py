@@ -8,7 +8,7 @@ TWO PROTOCOLS, TWO SURFACES (per the pi-pivot scoping):
   * k3s    -> Agent Protocol (AP): ``langgraph-api`` HTTP REST (threads/runs/
               store/assistants/SSE). THIS module + ``langgraph.json``.
 This is the k3s/AP lane. langgraph-api OWNS the REST surface — pux's hand-rolled
-``server.py`` REST lane is retire-eligible (see [[protocol-surface-map]],
+``server.py`` REST lane was RETIRED (Aegra phase D; see [[protocol-surface-map]],
 [[rely-on-upstream]], [[no-legacy-left-behind]]). Each org = one ``graph_id`` =
 one assistant; the wire format is ``langgraph_sdk``'s, so consumers keep working.
 
@@ -130,12 +130,12 @@ def make_graph(org: str) -> CompiledStateGraph:
 
     # ``prepare_warmup=True`` arms the PrepareWarmupMiddleware (the
     # ``before_agent`` hook), the serve-lane owner of the ``prepare()`` seam.
-    # Aegra owns the run loop itself — unlike ``pux direct``/``server.py`` it
-    # has no pux entry point to call ``prepare()`` from, so the warmup
-    # (declared ``jobs:`` like ``warmup_browser`` + universal
-    # ``warmup_webhook``) would silently NOT fire without this. ``transport``
-    # defaults to ``serve`` ⇒ ``universal_warmup=True`` (matches the
-    # ``server.py`` lane). See ``context/prepare_warmup.py``.
+    # Aegra owns the run loop itself — unlike ``pux direct`` it has no pux
+    # entry point to call ``prepare()`` from, so the warmup (declared
+    # ``jobs:`` like ``warmup_browser`` + universal ``warmup_webhook``) would
+    # silently NOT fire without this. ``transport`` defaults to ``serve`` ⇒
+    # ``universal_warmup=True`` (matches the historical serve lane — formerly
+    # the retired ``server.py``). See ``context/prepare_warmup.py``.
     return build_graph(
         org,
         checkpointer=None,

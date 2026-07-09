@@ -1,7 +1,7 @@
 """Langfuse observability — the no-op-unless-configured contract.
 
 Owns ``agent/observability.py``: the single graph-invoke-config builder wired
-into both ``main.py`` (``pux direct``) and ``server.py`` (``pux serve``). Two
+into both ``main.py`` (``pux direct``) and the Aegra runtime (prod serve). Two
 guarantees pinned here:
 
 1. **No-op unless configured** — when langfuse is NOT importable OR the

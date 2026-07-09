@@ -1,7 +1,6 @@
 """Unified ``pux`` CLI — replaces ``bin/pux``, ``main.py``, ``cli.py``, ``acp.py``.
 
 Usage:
-  pux serve                    start the Agent Protocol server (uvicorn)
   pux direct                   in-process deepagents runner (no server)
   pux acp [--org X]            ACP stdio server for editor integration
   pux tui [--org X]            launch dcode TUI with org branding + agents
@@ -46,7 +45,9 @@ def _post(path: str, **json_body: Any) -> Any:
         r = httpx.post(f"{PUX_API_URL}{path}", json=json_body, timeout=TIMEOUT)
     except httpx.ConnectError as exc:
         _die(f"can't reach the Agent Protocol server at {PUX_API_URL} "
-             f"({exc}). Start it with: pux serve")
+             f"({exc}). Start the Agent Protocol server (prod: `aegra serve` "
+             f"via scripts/start_pux_aegra.sh; dev: `langgraph dev` or "
+             f"`aegra dev`)")
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail", r.text)
@@ -61,7 +62,9 @@ def _get(path: str) -> Any:
         r = httpx.get(f"{PUX_API_URL}{path}", timeout=TIMEOUT)
     except httpx.ConnectError as exc:
         _die(f"can't reach the Agent Protocol server at {PUX_API_URL} "
-             f"({exc}). Start it with: pux serve")
+             f"({exc}). Start the Agent Protocol server (prod: `aegra serve` "
+             f"via scripts/start_pux_aegra.sh; dev: `langgraph dev` or "
+             f"`aegra dev`)")
     if r.status_code >= 400:
         _die(f"server returned {r.status_code}: {r.text}")
     return r.json()
@@ -79,11 +82,11 @@ def _print_block(label: str, body: str) -> None:
 
 def _add_tier_flags(p: Any) -> None:
     """Add ``--tier <name>`` + ``--fast`` (mutually exclusive) to an in-process
-    subparser. ``serve``/``acp``/``direct``/``tui`` build orgs (and so resolve
-    models) in THIS process, so a tier flag here is authoritative. Client
-    commands (``dispatch``/``run``) talk to an already-running server that
-    resolved its tier at startup — a client flag would be misleading, so they
-    don't get one. ``--fast`` is sugar for ``--tier fast``."""
+    subparser. ``acp``/``direct``/``tui`` build orgs (and so resolve models) in
+    THIS process, so a tier flag here is authoritative. Client commands
+    (``dispatch``/``run``) talk to an already-running server that resolved its
+    tier at startup — a client flag would be misleading, so they don't get one.
+    ``--fast`` is sugar for ``--tier fast``."""
     g = p.add_mutually_exclusive_group()
     g.add_argument(
         "--tier", default=None, metavar="NAME",
@@ -257,9 +260,9 @@ def main() -> None:
     # at parser-build time (e.g. ``--org`` default = $PUX_ORG), so ``./.env`` must
     # be loaded NOW for those defaults to see it. This is the shared kit seam
     # (``pux_harness.kit.bootstrap_env_and_logging``) — the SAME function
-    # serve/direct/acp and exported runners use, so pux is seamless when run
+    # direct/acp and exported runners use, so pux is seamless when run
     # from a FOREIGN codebase: the consumer's ``.env`` is picked up without an
-    # ``export``. ``pin_stderr=False`` here (serve/direct log to stdout fine);
+    # ``export``. ``pin_stderr=False`` here (direct logs to stdout fine);
     # ``pux acp`` re-invokes with ``pin_stderr=True`` to defend its stdio wire.
     from pux_harness.kit import bootstrap_env_and_logging  # noqa: PLC0415
 
@@ -270,16 +273,16 @@ def main() -> None:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # Server-mode commands
-    p_serve = sub.add_parser("serve", help="start the Agent Protocol server (uvicorn)")
-    _add_tier_flags(p_serve)
-
+    # Server-mode commands. (The Agent Protocol HTTP server is no longer a `pux`
+    # subcommand — prod is Aegra via scripts/start_pux_aegra.sh, dev is
+    # `langgraph dev` / `aegra dev`. `pux` builds orgs in-process for ACP/TUI/direct.)
     p_acp = sub.add_parser("acp", help="ACP stdio server for editor integration")
     p_acp.add_argument("--org", default=os.environ.get("PUX_ORG", "general"))
     _add_tier_flags(p_acp)
 
     # MCP server (FastMCP SSE wrapper over the Agent Protocol). Port via
-    # PUX_MCP_PORT (default 9987); requires `pux serve` running.
+    # PUX_MCP_PORT (default 9987); requires the Agent Protocol server running
+    # (prod: `aegra serve`; dev: `langgraph dev` / `aegra dev`).
     sub.add_parser("mcp", help="FastMCP server (SSE) wrapping the Agent Protocol")
 
     # TUI launcher (dcode wrapper)
@@ -460,16 +463,10 @@ def main() -> None:
         help="trusted agent-library layer digest (sha256:...) to assert against")
 
     args = ap.parse_args()
-    _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (serve/acp/direct/tui)
-
-    # --- Server mode ---
-    if args.cmd == "serve":
-        from pux_harness.server import main as _serve
-
-        _serve()
+    _apply_tier_flag(args)  # PUX_TIER for in-process model resolution (acp/direct/tui)
 
     # --- ACP stdio ---
-    elif args.cmd == "acp":
+    if args.cmd == "acp":
         from pux_harness.acp import run_acp
 
         run_acp(args.org)

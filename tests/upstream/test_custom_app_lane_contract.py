@@ -11,8 +11,9 @@ Pins the contract that ONE ``langgraph dev`` process serves BOTH:
 This is the C1 proof of the rely-on-upstream cutover vehicle
 ([[rely-on-upstream]], [[plan-p3-server-rest-retirement]]): pux contributes ONLY
 its unique routes as a custom app and lets ``langgraph serve`` own the rest — the
-two surfaces coexist on one process, which is what makes retiring ``server.py``'s
-29 duplicate CRUD routes safe ([[no-legacy-left-behind]]).
+two surfaces coexist on one process, which is what made it safe to retire
+``server.py``'s 29 duplicate CRUD routes (done — Aegra phase D; see
+``[[server-py-retired]]``) ([[no-legacy-left-behind]]).
 
 LIVE: skipped unless ``langgraph-cli`` is importable. Run with::
 

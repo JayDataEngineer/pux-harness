@@ -24,7 +24,7 @@ The stdout contract is ENFORCED, not just stated: ``run_acp`` calls
 user's key export) and pins the root logger to ``stderr`` (``force=True``) so
 no library can auto-configure a stdout handler that would corrupt the
 JSON-RPC stream. The same helper (``pin_stderr=False``) is the seam that makes
-``pux serve``/``pux direct``/exported runners load their consumer ``.env``
+the Aegra runtime / ``pux direct`` / exported runners load their consumer ``.env``
 seamlessly. See ``tests/harness/test_bootstrap.py``.
 """
 from __future__ import annotations

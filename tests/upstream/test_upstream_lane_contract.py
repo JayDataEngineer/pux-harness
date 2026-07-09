@@ -1,9 +1,10 @@
 """Contract test for the UPSTREAM Agent Protocol lane.
 
 Pins the contract that ``pux_harness.runtime.upstream`` + ``langgraph.json``
-serve the FULL Agent Protocol surface that pux's hand-rolled ``server.py`` REST
-lane currently reimplements — so ``server.py``'s REST CRUD is retire-eligible
-(see [[rely-on-upstream]], [[no-legacy-left-behind]], [[upstream-protocol-pivot]]).
+serve the FULL Agent Protocol surface — the LIVE proof that retired pux's
+hand-rolled ``server.py`` REST lane (Aegra phase D; see ``[[server-py-retired]]``):
+its REST CRUD was proven redundant here, then deleted. Governing context:
+[[rely-on-upstream]], [[no-legacy-left-behind]], [[upstream-protocol-pivot]].
 
 This is the LIVE proof the pivot leans on (verify-or-die, not "should work"):
 it launches the OFFICIAL ``langgraph-api`` runtime (``langgraph dev``) against
@@ -85,6 +86,46 @@ def _wait_ok(base: str, timeout: float = 120.0) -> None:
     raise RuntimeError(f"upstream server never became healthy at {base}/ok: {last}")
 
 
+def _declared_graphs() -> set[str]:
+    return set(json.loads(CONFIG.read_text())["graphs"])
+
+
+def _served_graphs(base: str) -> set[str]:
+    """graph_ids the upstream runtime is currently serving (assistants.search)."""
+    req = urllib.request.Request(
+        f"{base}/assistants/search", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return {a["graph_id"] for a in json.loads(r.read())}
+
+
+def _wait_graphs_served(base: str, timeout: float = 30.0) -> None:
+    """Best-effort: poll until langgraph dev serves EVERY declared graph_id.
+
+    ``/ok`` flips healthy BEFORE all graphs finish building/registering (they
+    build lazily at startup), so probing ``assistants.search`` right after
+    ``/ok`` races — graphs that build slowly (large rosters, deep capability
+    resolution) are momentarily absent and the contract test false-fails. This
+    absorbs that window by waiting until the declared set is fully served.
+
+    GRACEFUL by design: if a graph genuinely never registers within ``timeout``
+    (a real build failure, or a flaky registration), it RETURNS ANYWAY rather
+    than killing the whole module via a fixture error — the per-test assertions
+    still catch a truly-missing graph. So this only smooths slow-but-fine builds;
+    it can never mask a real failure.
+    """
+    declared = _declared_graphs()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if declared <= _served_graphs(base):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1.0)
+
+
 @pytest.fixture(scope="module")
 def upstream_base() -> str:
     """Launch ``langgraph dev`` against pux's graph declaration; yield its base URL.
@@ -115,6 +156,7 @@ def upstream_base() -> str:
     log_buf: list[str] = []
     try:
         _wait_ok(base)
+        _wait_graphs_served(base)  # /ok is server-up; wait until every graph registers
         yield base
     finally:
         proc.terminate()

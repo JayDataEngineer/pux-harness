@@ -4,8 +4,9 @@ Exposes the org graph as MCP tools so any MCP client (Hermes, OpenClaw, Claude
 Desktop, Zed) can drive Pux without knowing the Agent Protocol wire format.
 Transport: SSE on :9987 (``pux mcp``).
 
-Requires the Agent Protocol server to be running: ``pux serve`` (FastAPI on
-:9988). Call ``health`` first to confirm the backend is up.
+Requires the Agent Protocol server to be running — prod is Aegra
+(scripts/start_pux_aegra.sh on :9988); dev is ``langgraph dev`` / ``aegra dev``.
+Call ``health`` first to confirm the backend is up.
 
 Two execution models:
   - ``run_agent`` — blocking, one-shot (quick tasks).
@@ -27,7 +28,7 @@ from fastmcp import FastMCP
 
 PUX_API = os.environ.get("PUX_API_URL", "http://127.0.0.1:9988")
 TIMEOUT = float(os.environ.get("PUX_MCP_TIMEOUT", "300"))
-DEFAULT_RECURSION_LIMIT = 60  # matches server.py:60 + cli.py default
+DEFAULT_RECURSION_LIMIT = 60  # matches the cli.py default
 
 mcp = FastMCP(
     "pux",
@@ -67,7 +68,8 @@ async def _request(method: str, path: str, **kw: Any) -> Any:
         r = await client.request(method, path, **kw)
     except httpx.ConnectError as exc:
         raise ValueError(
-            f"cannot reach Pux API at {PUX_API} ({exc}); is `pux serve` running?"
+            f"cannot reach Pux API at {PUX_API} ({exc}); is the Agent Protocol "
+            f"server running? (prod: `aegra serve`; dev: `langgraph dev` / `aegra dev`)"
         ) from exc
     except httpx.HTTPError as exc:  # timeouts, etc.
         raise ValueError(f"Pux API transport error: {exc}") from exc
@@ -97,12 +99,25 @@ async def _call(method: str, path: str, **kw: Any) -> tuple[Any, str | None]:
 
 @mcp.tool()
 async def health() -> str:
-    """Check the Pux backend (Agent Protocol server) is reachable and list loaded
+    """Check the Pux backend (Agent Protocol server) is reachable and list served
     orgs. Call this first if any other tool returns an ERROR."""
-    data, err = await _call("GET", "/ok")
+    # /events/health (the custom_app EventBus surface, mounted under Aegra) is
+    # the reliable reachability probe — it proves the AP runtime + the pux
+    # surfaces are both live (it is what scripts/start_pux_aegra.sh waits on).
+    data, err = await _call("GET", "/events/health")
     if err:
         return err
-    orgs = data.get("orgs", []) if isinstance(data, dict) else []
+    # Served orgs = the langgraph-api assistants (graph_ids). POST over the SAME
+    # singleton client (testable via MockTransport; no per-call client churn) —
+    # mirrors list_orgs's /agents/search probe. An empty body returns every
+    # assistant (the upstream assistants.search wire call).
+    assistants, aerr = await _call("POST", "/assistants/search", json={})
+    if aerr:
+        return f"ok — backend up (org list unavailable: {aerr})"
+    orgs = sorted({
+        a["graph_id"] for a in (assistants or [])
+        if isinstance(a, dict) and a.get("graph_id")
+    })
     return f"ok — backend up; {len(orgs)} org(s): {', '.join(orgs)}"
 
 
@@ -392,8 +407,8 @@ def _format_message(m: Any) -> str:
 
 def _extract_run_output(data: Any) -> str:
     """Render a ``/runs/wait`` response as the bare answer text an MCP client
-    wants (not a status blob). The REAL shape is a run-meta dict
-    (server.py:356-361): ``status`` success/error with ``output``/``error``.
+    wants (not a status blob). The REAL shape is a run-meta dict —
+    ``status`` success/error with ``output``/``error``.
     On error it returns ``ERROR: <error>`` (consistent with the error-text
     convention); on success it returns ``output``. The legacy ``{messages:[…]}``
     LangGraph-agent shape is handled as a defensive fallback."""
@@ -463,7 +478,8 @@ def main() -> None:
     # Default 0.0.0.0 keeps the dev convenience of "reachable locally". For a
     # PROD deployment bound to a specific interface (e.g. the Tailscale IP only,
     # so the MCP surface is reachable from Tailscale peers but NOT the LAN/public),
-    # set PUX_MCP_HOST. Mirrors the PUX_API_HOST knob on `pux serve`.
+    # set PUX_MCP_HOST. Mirrors the PUX_API_HOST knob on the Agent Protocol
+    # server (`aegra serve` in prod; `langgraph dev` / `aegra dev` in dev).
     host = os.environ.get("PUX_MCP_HOST", "0.0.0.0")
     mcp.run(transport="sse", host=host, port=port)
 

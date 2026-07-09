@@ -13,17 +13,18 @@ has NO equivalent for:
   receiver-of-last-resort for webhook-less clients like Hermes; ``run_events.py``).
 * ``/jobs/{org}/*`` — prep/warmup jobs (warmup_browser etc.; ``sandbox/jobs.py``).
 
-Everything else (threads/runs/store/assistants/agents CRUD, ``/ok``) is served by
+Everything else (threads/runs/store/assistants/agents CRUD) is served by
 upstream langgraph-api and is intentionally NOT re-rolled here — this is the
-rely-on-upstream cutover vehicle ([[rely-on-upstream]]).
+rely-on-upstream cutover vehicle ([[rely-on-upstream]]). (Health is the custom
+``/events/health`` below — Aegra does not expose a ``/ok``.)
 
 Wired in ``langgraph.json`` via::
 
     "http": {"app": "pux_harness.runtime.custom_app:app"}
 
-Handlers are lifted verbatim from ``server.py``; only the state access changed
-(``app.state.events`` -> ``request.app.state.events``) so they are robust to
-being mounted as a sub-app.
+Handlers originated in the now-retired ``server.py`` (lifted verbatim; only the
+state access changed — ``app.state.events`` -> ``request.app.state.events`` — so
+they are robust to being mounted as a sub-app).
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Langfuse tracing for the deepagents graph — optional, no-op unless configured.
 
 The ONE langgraph invoke-config builder for both graph-invoke sites (``main.py``
-for ``pux direct`` and ``server.py`` for ``pux serve``). When Langfuse is
+for ``pux direct`` and the Aegra / ``langgraph-api`` runtime for prod serve). When Langfuse is
 installed AND the ``LANGFUSE_PUBLIC_KEY`` / ``LANGFUSE_SECRET_KEY`` env vars are
 set, every run is traced to a Langfuse session. When either is absent,
 ``build_invoke_config`` returns the plain config the graph already used — zero
@@ -83,8 +83,8 @@ def build_invoke_config(
 
     Identical to the prior inline dict (``configurable.thread_id`` +
     ``recursion_limit``) when Langfuse is off; adds ``callbacks`` + the langfuse
-    metadata keys when on. Use from ``main.py`` (transport ``"direct"``) and
-    ``server.py`` (transport ``"serve"``).
+    metadata keys when on. Use from ``main.py`` (transport ``"direct"``) and the
+    Aegra runtime (transport ``"serve"``).
     """
     cfg: dict[str, Any] = {
         "configurable": {"thread_id": thread_id},

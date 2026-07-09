@@ -310,10 +310,10 @@ class SandboxContainer:
             "FS_READWRITE=/sandbox/workspace,/sandbox/tmp",
             "DOCKER_HOST=unix:///var/run/docker.sock",
             "HOST_GATEWAY=host.docker.internal",
-            # Where pux serve (Agent Protocol) lives, so in-container prep jobs
-            # (e.g. warmup_webhook) + agent code can reach it. serve binds the
-            # Tailscale IP, so the container uses this host (host.docker.internal
-            # would NOT connect — serve isn't on the docker-gateway iface).
+            # Where the Agent Protocol server (Aegra) lives, so in-container prep
+            # jobs (e.g. warmup_webhook) + agent code can reach it. Aegra binds
+            # the Tailscale IP, so the container uses this host (host.docker.internal
+            # would NOT connect — Aegra isn't on the docker-gateway iface).
             f"PUX_API_HOST={_env_str('PUX_API_HOST', '127.0.0.1')}",
             f"PUX_API_PORT={_env_str('PUX_API_PORT', '9988')}",
         ]
@@ -740,8 +740,9 @@ def prepare(
 ) -> list[dict[str, Any]]:
     """Run post-create, pre-agent prep jobs inside the sandbox container.
 
-    Called by entry points (main.py, server.py) after ``ensure()``, before
-    ``graph.ainvoke()``. Returns a list of result dicts for logging/display.
+    Called by the prepare() entry points (``main.py`` for ``pux direct``; the
+    Aegra runtime via ``PrepareWarmupMiddleware`` for prod) after ``ensure()``,
+    before ``graph.ainvoke()``. Returns a list of result dicts for logging/display.
 
     Idempotency is delegated to the scripts themselves (file caches +
     SurrealDB UPSERTs make repeat runs cheap).
@@ -749,7 +750,7 @@ def prepare(
     ``universal_warmup``: when True (the serve path), additionally run
     ``warmup_webhook`` for EVERY org — not a policy job, so it covers orgs that
     declare no ``jobs:`` — verifying the run-completion event endpoint
-    (``pux serve`` ``/events/health``) is reachable from this sandbox, so a
+    (the Aegra runtime's ``/events/health``) is reachable from this sandbox, so a
     webhook-less client (Hermes) can observe completions. The ``direct`` path
     leaves it False (no serve in direct mode => the check would always fail).
 

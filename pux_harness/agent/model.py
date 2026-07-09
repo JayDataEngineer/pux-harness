@@ -400,7 +400,7 @@ class _FallbackReasoningChatOpenAI(ReasoningChatOpenAI):
       ``Runnable``, NOT a ``BaseChatModel`` → the fast-path misses → deepagents
       falls through to ``init_chat_model(model, ...)`` →
       ``apply_provider_profile(model)`` → ``get_provider_profile(model)`` →
-      ``spec.count(":")`` → ``AttributeError`` (caught live at ``pux serve``
+      ``spec.count(":")`` → ``AttributeError`` (caught live at Aegra
       startup: "'ReasoningChatOpenAI' object has no attribute 'count'"). LangChain
       ships NO ``ChatModelWithFallbacks`` adapter — only ``RunnableWithFallbacks``
       — so the fallback-bearing model MUST be a ``BaseChatModel`` subclass we own.

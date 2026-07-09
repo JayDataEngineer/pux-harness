@@ -235,9 +235,11 @@ class Policy:
 
 # Agent-facing protocol surfaces an org may declare in policy.yaml.
 # ``acp`` = stdio Agent Client Protocol (``pux acp --org <name>`` — always
-# available, per-spawn, nothing to mount); ``agui`` = CopilotKit AG-UI SSE
-# (``pux serve`` mounts ``/agui/{name}``). Absent/empty ``protocols:`` resolves
-# to DEFAULT_PROTOCOLS (both), so the declaration is opt-in NARROWING + explicit
+# available, per-spawn, nothing to mount); ``agui`` = CopilotKit AG-UI SSE.
+# (The retired ``server.py`` used to mount ``/agui/{name}`` off this value;
+# that mount went with server.py in Aegra phase D — the field stays as a
+# validated self-declaration.) Absent/empty ``protocols:`` resolves to
+# DEFAULT_PROTOCOLS (both), so the declaration is opt-in NARROWING + explicit
 # self-description — never a regression: an org without it behaves as before
 # (all surfaces). KNOWN_PROTOCOLS is the single source contract.py validates
 # against.
@@ -466,18 +468,6 @@ def resolve_protocols(pol: Policy) -> list[str]:
     NARROWED set, e.g. ``[acp]`` for a coding org that should not mount AG-UI);
     absent/empty -> :data:`DEFAULT_PROTOCOLS` (both surfaces)."""
     return list(pol.protocols) if pol.protocols else list(DEFAULT_PROTOCOLS)
-
-
-def protocols_for_org(org_name: str, project_root: str | Path) -> list[str]:
-    """Load-bearing seam for ``pux serve``'s AG-UI mount gate + tests. Resolves
-    the org's declared surfaces, defaulting to :data:`DEFAULT_PROTOCOLS` when
-    the org has no policy.yaml (NoPolicy) — so a policy-less org keeps today's
-    behavior (all surfaces mounted)."""
-    try:
-        pol = load(org_name, project_root)
-    except NoPolicy:
-        return list(DEFAULT_PROTOCOLS)
-    return resolve_protocols(pol)
 
 
 # --- credentials --------------------------------------------------------------

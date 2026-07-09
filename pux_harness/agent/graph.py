@@ -1,5 +1,6 @@
 """Per-org deepagents graph builder, shared by the in-process runner
-(``main.py``) and the Agent Protocol server (``server.py``).
+(``main.py``) and the Agent Protocol server (Aegra / ``langgraph-api`` in prod;
+``langgraph dev`` / ``aegra dev`` in dev).
 
 One ``DockerExecClient`` + one ``PuxSandboxBackend`` serve the whole process
 (the client is a thin Docker SDK wrapper; the backend is stateless apart from

@@ -17,8 +17,9 @@ Architecture:
     through the store.
 
 The runner (``main.py``) passes ``store=None`` and gets an ephemeral
-``InMemoryStore`` (created inside ``build_memory_backend``); the server
-(``server.py``) passes its own store for cross-restart survival. A ``None``
+``InMemoryStore`` (created inside ``build_memory_backend``); the Aegra runtime
+(langgraph-api, which owns the checkpointer) passes its own store for
+cross-restart survival. A ``None``
 store can NOT reach ``StoreBackend`` — it has no in-graph fallback and crashes
 on the first ``download_files``.
 """
