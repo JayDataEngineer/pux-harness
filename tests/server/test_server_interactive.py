@@ -42,6 +42,7 @@ from langgraph.types import interrupt
 
 from langgraph_sdk.sse import BytesLineDecoder, SSEDecoder  # the SDK's own parser
 
+from pux_harness.run_events import EventBus
 from pux_harness.server import app
 from pux_harness.threads import open_thread_store
 
@@ -146,6 +147,10 @@ async def _drive(db_path, fn):
         app.state.runs = {}
         app.state.run_meta = {}
         app.state.mcp = {}
+        # The lifespan mounts an EventBus on app.state.events; _run_task publishes
+        # run completions to it. Tests bypass the lifespan (no MCP/AG-UI), so
+        # mirror it here (in-memory) or _run_task raises AttributeError.
+        app.state.events = EventBus()
         transport = ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await fn(client)

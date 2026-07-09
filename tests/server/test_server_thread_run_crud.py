@@ -30,6 +30,7 @@ from langgraph.store.memory import InMemoryStore
 from langgraph_sdk.client import LangGraphClient
 from langgraph_sdk.errors import NotFoundError
 
+from pux_harness.run_events import EventBus
 from pux_harness.server import app
 from pux_harness.threads import open_thread_store
 
@@ -90,6 +91,10 @@ async def _drive(fn):
         app.state.runs = {}
         app.state.run_meta = {}
         app.state.mcp = {}
+        # The lifespan mounts an EventBus on app.state.events; _run_task publishes
+        # run completions to it. Tests bypass the lifespan, so mirror it here
+        # (in-memory — no jsonl persistence) or _run_task raises AttributeError.
+        app.state.events = EventBus()
         async with httpx.AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as httpx_client:
