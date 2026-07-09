@@ -550,6 +550,19 @@ def check_org(name: str) -> list[Violation]:
                                    f"{name}: policy.yaml unknown sections "
                                    f"{bad}; allowed: "
                                    f"{sorted(KNOWN_POLICY_SECTIONS)}"))
+            # CU-4 (no-legacy-left-behind): policy.yaml ``tool_servers:`` is the
+            # pre-unification MCP declaration site — replaced by org.yaml
+            # ``capabilities:`` (kind: mcp), the ONE canonical site. ``tool_servers``
+            # stays a KNOWN section above so the generic policy-sections rule stays
+            # silent; this dedicated rule owns the clear "use capabilities: instead"
+            # message (mirrors no-legacy-agent-capability-keys for the org axis).
+            if "tool_servers" in parsed:
+                v.append(Violation(
+                    "error", "no-legacy-tool-servers",
+                    f"{name}: policy.yaml: the `tool_servers:` block is the "
+                    f"forbidden legacy MCP declaration — move its entries to "
+                    f"org.yaml `capabilities:` (kind: mcp), the one canonical "
+                    f"site (CU-4)."))
             try:
                 pol = policy_mod.load(name, _orgs_dir().parent)
                 policy_mod.resolve_mounts(pol)
@@ -934,6 +947,41 @@ def _no_legacy_agent_py() -> list[Violation]:
                     v.append(Violation(
                         "error", "no-legacy-agent-py",
                         f"{path}: empty body — the agent has no system prompt"))
+    return v
+
+
+def _no_legacy_agent_capability_keys() -> list[Violation]:
+    """Permanent tripwire (no-legacy-left-behind, CU-4): every agent ``.md``
+    MUST declare its model add-ons via the unified ``capabilities:`` block.
+    Bare ``tools:`` and ``skills:`` frontmatter keys are the pre-unification
+    form and are a HARD contract failure, not a silent dual-read.
+
+    Before CU-4, three fragmented channels (``tools:``, ``skills:``, and the
+    org-level ``tool_servers:``) each had their own declaration surface + loader.
+    CU-4 collapsed them into ONE ``capabilities:`` block — ``kind: tool`` /
+    ``kind: skill`` in the agent .md, ``kind: mcp`` in org.yaml — behind the
+    single ``CapabilityResolver`` front-door. A re-introduced ``tools:``/
+    ``skills:`` key (someone adds one because it "used to work") bypasses that
+    front-door — the exact drift CU killed. Mirrors ``no-legacy-agent-py``: a
+    fleet scan over EVERY agent .md (roster agents, extended parents, orphans
+    alike), so a legacy key can't hide in a parent that no roster lists directly.
+    """
+    v: list[Violation] = []
+    for d in _agent_dirs():
+        for path in sorted(d.iterdir()):
+            if path.suffix != ".md":
+                continue
+            try:
+                fm, _ = _split_frontmatter(path.read_text())
+            except ValueError:
+                continue  # no-legacy-agent-py owns a bad parse
+            legacy = [k for k in ("tools", "skills") if k in fm]
+            if legacy:
+                v.append(Violation(
+                    "error", "no-legacy-agent-capability-keys",
+                    f"{path}: frontmatter uses legacy {legacy} key(s); collapse "
+                    f"them into one ``capabilities:`` block (kind: tool / "
+                    f"kind: skill) — the unified declaration (CU-4)."))
     return v
 
 
@@ -1520,6 +1568,7 @@ def check_harness() -> list[Violation]:
         v.append(Violation("error", "models-spec",
                            f"models.yaml invalid: {exc}"))
     v.extend(_no_legacy_agent_py())
+    v.extend(_no_legacy_agent_capability_keys())
     v.extend(_no_legacy_sandbox_artifacts())
     v.extend(_no_legacy_middleware_in_graph())
     v.extend(_no_legacy_memory_saver_in_runtimes())

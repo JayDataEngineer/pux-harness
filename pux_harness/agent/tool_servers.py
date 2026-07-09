@@ -1,9 +1,11 @@
 """Tool-server dependency resolver — foreign MCP servers declared per-org.
 
-Given an org's ``policy.yaml`` ``tool_servers:`` list (strings → catalog refs,
-or mappings → inline or catalog-ref-with-override), ``resolve_tool_servers``
-produces a list of resolved ``ToolServerSpec`` — the single shape the async
-bridge (``mcp_client.py``) consumes.
+Given an org's ``org.yaml`` ``capabilities:`` (``kind: mcp``) entries (bare
+strings → catalog refs, or mappings → inline or catalog-ref-with-override),
+``resolve_tool_servers`` produces a list of resolved ``ToolServerSpec`` — the
+single shape the async bridge (``mcp_client.py``) consumes. (CU-4: this is the
+ONE declaration site — the legacy ``policy.yaml`` ``tool_servers:`` block was
+removed and is now a permanent contract failure.)
 
 The catalog lives at ``orgs/_shared/tool_servers.yaml`` and mirrors the
 Claude-Code/dcode ``.mcp.json`` schema (``McpServerSpec``). Resolution is
@@ -335,8 +337,8 @@ def resolve_tool_servers(
     *,
     permissive: bool = False,
 ) -> list[ToolServerSpec]:
-    """Resolve the org's ``policy.yaml`` ``tool_servers:`` list into fully-
-    resolved ``ToolServerSpec`` objects.
+    """Resolve the org's ``org.yaml`` ``capabilities:`` (``kind: mcp``) entries
+    into fully-resolved ``ToolServerSpec`` objects.
 
     Each item is one of:
       - a bare string → catalog ref (copy)
@@ -346,37 +348,19 @@ def resolve_tool_servers(
     Raises ``ValueError`` on unknown catalog ref, unknown kind, missing
     transport-required fields, duplicate resolved name, or (unless
     ``permissive=True``) unresolved ``${VAR}`` placeholders. Returns ``[]``
-    when the org has no tool_servers declaration or the list is empty.
+    when the org declares no mcp capabilities or the list is empty.
 
     ``permissive=True`` is the offline-contract path: ``${VAR}`` placeholders
     are left unresolved instead of raising, so structural validation (the field
     is declared, the transport is known, the catalog ref resolves) can run
     without the operator's env/secret values. The runtime path
     (``permissive=False``, the default) fails loud on any unresolved var."""
-    from pux_harness.sandbox import policy as policy_mod
-    from pux_harness.sandbox.policy import NoPolicy
-
-    try:
-        pol = policy_mod.load(org, _orgs_dir().parent)
-    except NoPolicy:
-        pol = None
-    except (FileNotFoundError, ValueError):
-        # A malformed policy is the ``policy-parse`` rule's job, not
-        # ``tool-servers``' — don't double-report. Fall through with no policy
-        # items; org.yaml mcp sugar is still checked (it's a separate site).
-        pol = None
-    # policy.yaml ``tool_servers:`` items (empty when the org ships no policy or
-    # the policy has no tool_servers block).
-    items = policy_mod.tool_server_items(pol) if pol is not None else []
-    # CU-3 sugar: merge ``mcp`` entries declared in ``org.yaml capabilities:``
-    # (same shape as policy ``tool_servers:`` items — bare catalog-ref string or
-    # ``{ref, tools}`` allowlist override). They resolve IDENTICALLY to policy
-    # entries below, so runtime + the offline ``validate_tool_servers`` contract
-    # (which calls this with ``permissive=True``) cover them in one path.
-    # org.yaml is the org's primary descriptor — its mcp sugar resolves STANDALONE
-    # (an org with org.yaml mcp but no policy.yaml still gets its servers); the
-    # NoPolicy fall-through above is what makes that work.
-    items = [*items, *_org_yaml_mcp_items(org)]
+    # CU-4 (strict one-way): the ONE declaration site for foreign MCP servers is
+    # org.yaml ``capabilities:`` (kind: mcp). The pre-unification policy.yaml
+    # ``tool_servers:`` read path was REMOVED — that block is now a permanent
+    # contract failure (``no-legacy-tool-servers``) and can no longer influence
+    # resolution. ``_org_yaml_mcp_items`` is the sole source.
+    items = _org_yaml_mcp_items(org)
     if not items:
         return []
 
