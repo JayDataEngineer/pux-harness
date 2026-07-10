@@ -12,7 +12,7 @@ registry is a flat ``dict[str, HarnessProfile]`` keyed by *model spec* (e.g.
 ``openai:gpt-4o``), and ``_get_harness_profile`` rejects any key with more than
 one colon — it resolves only ``provider:model`` -> bare ``provider``. There is
 no per-org namespace. Two orgs sharing a model (twitter + deep-research both on
-``mimo-v2.5``) would merge-collide, and the long-lived ``server.py``/ACP path
+``mimo-v2.5``) would merge-collide, and the long-lived Aegra/ACP path
 builds graphs for multiple orgs in one process -> a cross-org leak. So we reuse
 deepagents' own ``HarnessProfileConfig`` SCHEMA (faithful field set) but apply
 its three fields directly at the ``build_graph(org)`` call site — collision-free
@@ -52,12 +52,14 @@ __all__ = [
     "RubricGate",
     "ModelRetryConfig",
     "ToolRetryConfig",
+    "WebRouterConfig",
     "MiddlewareOverrides",
     "load_profile",
     "load_rubric_gate",
     "load_model_retry",
     "load_tool_retry",
     "load_middleware_overrides",
+    "load_web_router_config",
     "load_ask_user_enabled",
     "default_rubric",
     "validate_profile",
@@ -632,6 +634,54 @@ def load_tool_retry(org: str) -> ToolRetryConfig | None:
     if data is None or "tool_retry" not in data:
         return None
     return _tool_retry_from_block(org, data["tool_retry"])
+
+
+@dataclass(frozen=True)
+class WebRouterConfig:
+    """Per-org ``web_router:`` tuning block for ``WebRouterMiddleware``.
+
+    The middleware itself is opt-in via ``middleware.supervisor.add: [web-router]``
+    (NOT default-on — it spends a worker round per firing turn, so it must be a
+    deliberate per-org choice). This block only TUNES it: ``model_router: true``
+    swaps the free deterministic heuristic (recency / "look up" / version-number
+    / future-event regexes) for a one-call WORKER classifier with higher recall —
+    the "cheap classifier" spirit. An absent block returns the shipped
+    ``WebRouterConfig()`` (the free heuristic, the conservative default).
+
+    Note: ``_build_web_router`` returns ``None`` (the middleware never mounts)
+    when no ``mcp__web_research__*`` tool is armed — so this config only matters
+    for an org that BOTH adds ``web-router`` AND arms ``web_research``."""
+
+    model_router: bool = False
+
+
+def load_web_router_config(org: str) -> WebRouterConfig:
+    """Read the ``web_router:`` block from ``orgs/<org>/profile.yaml``.
+
+    ``None``-free: an absent file / block returns the shipped ``WebRouterConfig()``
+    (free heuristic). ``web_router: {model_router: true}`` opts into the worker
+    classifier. A non-mapping ``web_router:`` raises ``TypeError`` (no silent
+    skip) — the only documented form is a mapping; a bare bool here is a config
+    error (the middleware opt-in lives under ``middleware:``, not this flag).
+    Read independently of ``load_profile`` (peeled out before
+    ``HarnessProfileConfig.from_dict``) so the stack factory resolves it without
+    disturbing the config path.
+
+    Inheritance-aware: reads the ``extends:``-chain-merged block
+    (``_resolved_profile_yaml``); a child inherits a parent's tuning and
+    overrides the fields it restates. For a non-extending org, byte-identical to
+    the raw own read."""
+    data = _resolved_profile_yaml(org)
+    if data is None or "web_router" not in data:
+        return WebRouterConfig()
+    block = data["web_router"]
+    if not isinstance(block, dict):
+        raise TypeError(
+            f"{org}: profile.yaml: `web_router:` must be a mapping "
+            f"(e.g. `web_router: {{model_router: true}}`), got "
+            f"{type(block).__name__}"
+        )
+    return WebRouterConfig(model_router=bool(block.get("model_router", False)))
 
 
 def load_ask_user_enabled(org: str) -> bool:

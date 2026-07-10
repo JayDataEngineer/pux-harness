@@ -91,6 +91,7 @@ from pux_harness.agent.profile import (
     load_middleware_overrides,
     load_model_retry,
     load_tool_retry,
+    load_web_router_config,
 )
 from pux_harness.context.audit import AuditMiddleware
 from pux_harness.context.browser_vision import (
@@ -101,6 +102,7 @@ from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
 from pux_harness.context.prepare_warmup import PrepareWarmupMiddleware
 from pux_harness.context.session_guide import SessionGuideMiddleware
+from pux_harness.context.web_router import WebRouterMiddleware
 from pux_harness.agent.capabilities import CapabilityResolver
 from pux_harness.sandbox.tools import build_grader_tools
 from pux_harness.sandbox.tools.declared import (
@@ -228,6 +230,17 @@ class StackCtx:
     # the list itself is mutable — specs extend it. Fresh per ``build_stack``
     # call (a new ``StackCtx`` each time), so no cross-org leakage.
     emitted_tools_supervisor: list = field(default_factory=list)
+    # The MCP tools armed this run (``build_stack``'s ``mcp_tools`` param). The
+    # capability facade consumes them, but ``web-router`` ALSO filters them for
+    # ``mcp__web_research__*`` to fire its web round — it reuses what's already
+    # armed rather than re-resolving the org. ``()`` default = byte-identical to
+    # today for orgs that arm no MCP tools (so the web-router spec returns None).
+    mcp_tools: Sequence[BaseTool] = ()
+    # ``WebRouterMiddleware`` tuning (profile.WebRouterConfig). Default None when
+    # unresolvable — read by the ``web-router`` spec ONLY when it's in the
+    # supervisor on-set; ``model_router`` swaps the free heuristic for a worker
+    # classifier.
+    web_router_cfg: Any = None
 
 
 # --- THE registry ---------------------------------------------------------
@@ -485,6 +498,42 @@ def _build_interpreter(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     )
 
 
+def _build_web_router(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
+    """``WebRouterMiddleware`` — the auto-firing websearch router.
+
+    When the latest USER turn clearly needs fresh external info (a recency word,
+    an explicit "look up", a version number, a future-event ref) a cheap
+    WORKER-model web round fires using the org's already-armed ``web_research``
+    MCP tools, and a compact URL-cited brief is injected into the message list —
+    so the big CTO model never spends its OWN turn calling a web tool. Inspired
+    by "Supra-Router" (a pre-routing enrichment hop).
+
+    Opt-in only — ``middleware.supervisor.add: [web-router]``; NOT in
+    ``DEFAULT_SUPERVISOR`` (it spends a worker round per firing turn, so it must
+    be a deliberate per-org choice). Returns ``None`` (skip, the middleware never
+    mounts) when NO ``mcp__web_research__*`` tool is armed: the round reuses the
+    org's armed web tools and is NEVER synthesized from nothing. ``model_router``
+    (``profile.yaml`` ``web_router: {model_router: true}``) swaps the free
+    deterministic heuristic for a one-call worker classifier with higher recall.
+
+    Innermost wrap (registry position LAST — the specs after it, ``prepare`` /
+    ``interpreter``, are non-``wrap_model_call``): the round runs right before
+    the model call, after context + routing assembled the message list, so the
+    injected brief lands intact at position 0. An enhancement, not a gate: any
+    round failure is logged + skipped — the model can still call its own
+    web-search subagent / web tools. See ``context/web_router.py``."""
+    web_tools = [t for t in ctx.mcp_tools if t.name.startswith("mcp__web_research__")]
+    if not web_tools:
+        return None  # nothing armed -> never mount (no synthesized round)
+    cfg = ctx.web_router_cfg
+    use_model_router = bool(getattr(cfg, "model_router", False))
+    worker = get_model(role="worker", org=ctx.org)
+    return WebRouterMiddleware(
+        web_tools=web_tools,
+        worker=worker,
+        use_model_router=use_model_router,
+        org=ctx.org,
+    )
 
 
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
@@ -514,6 +563,15 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # ``DEFAULT_SUPERVISOR``: strength-gated (armed in ``_resolve_toggles`` iff
     # the base model is ``strength: pro``); ``add/remove`` overrides per-org.
     MiddlewareSpec("interpreter", frozenset({Scope.SUPERVISOR}), _build_interpreter),
+    # ``web-router`` (WebRouterMiddleware) is a ``wrap_model_call`` injector that
+    # fires a worker-model web round + prepends a brief. Appended LAST so it is
+    # the INNERMOST wrap (runs right before the model, after the other wrap
+    # layers assembled the message list — the injected brief lands intact).
+    # ``prepare`` / ``interpreter`` above are non-``wrap_model_call``, so this is
+    # the genuine innermost wrapper. NOT in ``DEFAULT_SUPERVISOR``: opt-in
+    # (``middleware.supervisor.add: [web-router]``) AND returns None when no
+    # ``web_research`` tool is armed (never synthesizes a round from nothing).
+    MiddlewareSpec("web-router", frozenset({Scope.SUPERVISOR}), _build_web_router),
 ]
 
 
@@ -703,6 +761,8 @@ def build_stack(
         exec_client=exec_client,
         model_retry_cfg=load_model_retry(org),
         tool_retry_cfg=load_tool_retry(org),
+        mcp_tools=mcp_tools,
+        web_router_cfg=load_web_router_config(org),
     )
     overrides = load_middleware_overrides(org)
     scoped = _normalize_overrides(profile, overrides)
@@ -797,6 +857,7 @@ def build_stack(
         profile=profile,
         subagent_middleware=subagent_middleware,
         retrieval_tools=ctx_tools,
+        mcp_tools=caps.mcp,
     )
 
     # Own the general-purpose subagent. deepagents auto-adds a HEAVY
