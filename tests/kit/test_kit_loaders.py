@@ -15,7 +15,6 @@ from pux_harness.kit.loaders import (
     build_system_prompt,
     discover_orgs,
     load_org_prompt,
-    load_root_prompt,
     org_agent_slugs,
 )
 
@@ -50,15 +49,18 @@ def test_org_agent_slugs(tree: Path) -> None:
     assert org_agent_slugs("kitorg", tree) == ["worker"]
 
 
-def test_load_root_prompt_and_overlay(tree: Path) -> None:
-    assert "You are an assistant." in load_root_prompt(tree)
+def test_load_org_prompt_reads_overlay(tree: Path) -> None:
+    """load_org_prompt returns the org's own AGENTS.md body (the CTO overlay)."""
     assert "Overlay instructions." in load_org_prompt("kitorg", tree)
 
 
 def test_build_system_prompt_combines_then_addendum(tree: Path) -> None:
+    """build_system_prompt = chain-inherited overlay + addendum. The root
+    AGENTS.md is NOT read (it is a developer guide; the base flows from a base
+    org via ``extends:``, or — for a non-extending org — is just the overlay)."""
     prompt = build_system_prompt("kitorg", project_root=tree)
-    assert "You are an assistant." in prompt  # root
-    assert "Overlay instructions." in prompt   # org overlay
+    assert "Overlay instructions." in prompt    # org overlay (chain root)
+    assert "You are an assistant." not in prompt  # root AGENTS.md no longer read
     # addendum is appended verbatim, default empty
     with_add = build_system_prompt("kitorg", project_root=tree, addendum="\nEXTRA RULES\n")
     assert with_add.endswith("EXTRA RULES\n")

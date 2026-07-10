@@ -66,8 +66,10 @@ from pux_harness.agent.orgs import (
     _org_path,
     _orgs_dir,
     _parse_list,
+    build_system_prompt,
     discover_orgs,
     org_agent_slugs,
+    org_extends_chain,
 )
 from pux_harness.kit._paths import _PROJECT_ROOT_ENV
 from pux_harness.kit._paths import project_root as _default_project_root
@@ -630,6 +632,50 @@ def _normalize_specialists_refs(data: bytes) -> bytes:
     return text.replace("orgs/specialists/", "orgs/").encode("utf-8")
 
 
+def _flatten_chain_overlay(org: str) -> str:
+    """The flattened ``AGENTS.md`` body for an extending org — the FULL chain
+    overlay (base org ``general``'s overlay + this org's, root→child) baked
+    into ONE body. The base-org model: the universal runtime base flows to
+    specialists via ``extends: general``; export flattens that chain away so
+    the archive is a self-contained flat org.
+
+    At consumer runtime the packaged org has no ``extends:`` (see
+    ``_flatten_org_yaml``), so ``_resolved_org_chain`` is ``[org]`` and the
+    kit's ``_chain_overlay`` reads EXACTLY this baked body — no runtime walk,
+    no dependency on ``orgs/general/`` being unpacked. Cycle-safe
+    (``build_system_prompt`` walks the cycle-safe chain; a broken chain falls
+    back to ``[org]`` and this returns just the org's own overlay)."""
+    return build_system_prompt(org)
+
+
+def _flatten_org_yaml(source: str, roster: list[str]) -> str:
+    """Rewrite an org.yaml for a flattened archive: replace ``agents:`` with the
+    full UNION roster (general's inherited agents + own, root→child) and DROP
+    the ``extends:`` line (the chain is baked into AGENTS.md; no runtime
+    parent). ``inherit_roster:`` is dropped too — it only governed the union,
+    which is already baked, so it has no meaning against a parentless archive.
+    Every other line — comments, ``capabilities:``, ``package:`` — is preserved
+    verbatim, so the archive's org.yaml stays as legible as the source. An org
+    with no ``agents:`` line (CTO-only) gets one prepended."""
+    agents_line = f"agents: [{', '.join(roster)}]"
+    out: list[str] = []
+    wrote_agents = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("extends:"):
+            continue
+        if stripped.startswith("inherit_roster:"):
+            continue
+        if stripped.startswith("agents:") and not wrote_agents:
+            out.append(agents_line)
+            wrote_agents = True
+            continue
+        out.append(line)
+    if not wrote_agents:
+        out.insert(0, agents_line)
+    return "\n".join(out) + "\n"
+
+
 def pack_org(
     org: str,
     output: Path | None = None,
@@ -687,21 +733,45 @@ def pack_org(
         # org.yaml; defaults when the org declares no ``package:`` block).
         manifest = load_manifest(org_dir, org)
 
-        # 1. Root AGENTS.md (base prompt)
-        root_agents_md = root / "AGENTS.md"
-        files: dict[str, Path] = {}
-        if root_agents_md.is_file():
-            files["AGENTS.md"] = root_agents_md
-
-        # 2. Org-local files — MANIFEST-DRIVEN, default-deny (was the
+        # 1. Org-local files — MANIFEST-DRIVEN, default-deny (was the
         # _collect_org_files allowlist). data/.pux pruned during the walk.
+        # (Root ``AGENTS.md`` is NO LONGER packaged: it was the old base-prompt
+        # carrier read by ``load_root_prompt``, which is gone — root AGENTS.md
+        # is now a developer guide, and the runtime base flows from the base
+        # org ``general`` via the flattened chain below. Packaging it would
+        # ship a dev guide that nothing in the runtime reads.)
+        files: dict[str, Path] = {}
         files.update(collect_pack_files(org_dir, manifest))
 
-        # 3. Shared dependencies
+        # 2. Shared dependencies
         files.update(_resolve_shared_agents(org))
         files.update(_resolve_shared_skills(org, root))
         files.update(_resolve_shared_sandbox(org, root))
         files.update(_resolve_tool_servers(org))
+
+        # 3. Flatten the ``extends:`` chain for export (base-org model). An org
+        # that ``extends: general`` bakes the base prompt + inherited roster
+        # into its OWN files at pack time, so the archive is a self-contained
+        # FLAT org — no ``extends:``, no runtime chain walk, no dependency on
+        # ``orgs/general/`` being unpacked. This is load-bearing for export:
+        # ``compile_org`` runs at CONSUMER runtime against the unpacked tree,
+        # and the archive does not carry ``orgs/general/`` — without flattening
+        # the chain would fall back to ``[org]`` and the base prompt + the
+        # inherited roster (researcher/browser/explorer/web-search) would
+        # silently VANISH from the exported org. Only extending orgs flatten;
+        # a standalone org (``general`` itself, or a future non-extending org)
+        # packs verbatim.
+        flattened: dict[str, bytes] = {}
+        if len(org_extends_chain(org)) > 1:
+            roster = org_agent_slugs(org)
+            flattened[f"orgs/{org}/AGENTS.md"] = _flatten_chain_overlay(
+                org
+            ).encode("utf-8")
+            org_yaml_host = _org_path(org) / "org.yaml"
+            if org_yaml_host.is_file():
+                flattened[f"orgs/{org}/org.yaml"] = _flatten_org_yaml(
+                    org_yaml_host.read_text(encoding="utf-8"), roster
+                ).encode("utf-8")
 
         # 4. Pack-time validation hooks (P4): AST + gitleaks gate the pack
         # BEFORE the tarball is written. A syntax-broken agent function or a
@@ -741,10 +811,15 @@ def pack_org(
             tar.addfile(info)
 
             for archive_path, host_path in sorted(files.items()):
-                try:
-                    data = host_path.read_bytes()
-                except (PermissionError, OSError):
-                    continue
+                # Flattened chain content (extends baked in) overrides the
+                # verbatim host file for the org's AGENTS.md + org.yaml.
+                if archive_path in flattened:
+                    data = flattened[archive_path]
+                else:
+                    try:
+                        data = host_path.read_bytes()
+                    except (PermissionError, OSError):
+                        continue
                 # Keep content refs consistent with the flattened tree (see
                 # _normalize_specialists_refs). Size is computed AFTER rewrite.
                 if archive_path.endswith(_TEXT_SUFFIXES):

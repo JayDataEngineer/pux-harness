@@ -196,6 +196,35 @@ def test_roster_empty_when_no_agents_key(tmp_path: Path) -> None:
     assert org_agent_slugs("ctoonly", tmp_path) == []
 
 
+# --- inherit_roster: false (roster-only opt-out; prompt overlay still flows) -
+
+def test_roster_inherit_roster_false_prunes_parent(tmp_path: Path) -> None:
+    # A child that sets ``inherit_roster: false`` extends the base PROMPT but
+    # makes its own roster authoritative — the parent's slugs are NOT unioned
+    # (dev-bot: base prompt flows, but no inherited researcher/browser).
+    _make_org(tmp_path, "base", body="# Base\n", agents=["alpha", "beta"])
+    _make_org(tmp_path, "child", body="# Child\n", agents=["gamma"], extends="base")
+    (tmp_path / "orgs" / "child" / "org.yaml").write_text(
+        "extends: base\ninherit_roster: false\nagents: [gamma]\n")
+    assert org_agent_slugs("child", tmp_path) == ["gamma"]
+    # pruned resolution is byte-identical to the own-only reader.
+    assert org_agent_slugs("child", tmp_path) == _own_org_agent_slugs("child", tmp_path)
+
+
+def test_inherit_roster_false_keeps_prompt_overlay(tmp_path: Path) -> None:
+    # The opt-out is ROSTER-only: the AGENTS.md overlay still flows via extends:
+    # (base + child), even though the parent's roster is pruned. This is the D4
+    # contract — partial inheritance (prompt yes, roster no).
+    _make_org(tmp_path, "base", body="# Base overlay\n", agents=["alpha"])
+    _make_org(tmp_path, "child", body="# Child overlay\n", agents=["gamma"], extends="base")
+    (tmp_path / "orgs" / "child" / "org.yaml").write_text(
+        "extends: base\ninherit_roster: false\nagents: [gamma]\n")
+    prompt = build_system_prompt("child", project_root=tmp_path)
+    assert "# Base overlay" in prompt
+    assert "# Child overlay" in prompt
+    assert org_agent_slugs("child", tmp_path) == ["gamma"]
+
+
 # --- _agent_search_dirs (chain-aware: child-local -> ancestors -> _shared) --
 
 def test_search_dirs_child_first_then_ancestors_then_shared(tmp_path: Path) -> None:
@@ -256,13 +285,15 @@ def test_chain_overlay_non_extending_is_own_only(tmp_path: Path) -> None:
     assert _chain_overlay("solo", tmp_path) == "SOLO OVERLAY"
 
 
-def test_build_system_prompt_root_plus_chain_overlay_plus_addendum(tmp_path: Path) -> None:
-    (tmp_path / "AGENTS.md").write_text("ROOT PROMPT")
+def test_build_system_prompt_chain_overlay_plus_addendum(tmp_path: Path) -> None:
+    """build_system_prompt = chain-inherited overlay (base→child) + addendum.
+    The root AGENTS.md is NOT read — it is a developer guide; the base flows
+    from a base org via ``extends:``, baked into the chain overlay."""
+    (tmp_path / "AGENTS.md").write_text("ROOT PROMPT")  # dev guide — must be ignored
     _make_org(tmp_path, "base", body="BASE OVERLAY")
     _make_org(tmp_path, "child", body="CHILD OVERLAY", extends="base")
     prompt = build_system_prompt("child", project_root=tmp_path)
-    assert "ROOT PROMPT" in prompt
-    assert prompt.index("ROOT PROMPT") < prompt.index("BASE OVERLAY")
+    assert "ROOT PROMPT" not in prompt             # root AGENTS.md no longer read
     assert prompt.index("BASE OVERLAY") < prompt.index("CHILD OVERLAY")
     # addendum appended verbatim
     with_add = build_system_prompt("child", project_root=tmp_path, addendum="\nADDENDUM\n")
@@ -270,9 +301,9 @@ def test_build_system_prompt_root_plus_chain_overlay_plus_addendum(tmp_path: Pat
 
 
 def test_build_system_prompt_non_extending_byte_identical_shape(tmp_path: Path) -> None:
-    # non-extending org: root + own overlay (no parent fragment, single seam).
-    (tmp_path / "AGENTS.md").write_text("ROOT")
+    # non-extending org: just its own overlay (no parent fragment, no root read).
+    (tmp_path / "AGENTS.md").write_text("ROOT")  # dev guide — must be ignored
     _make_org(tmp_path, "solo", body="SOLO OVERLAY")
     prompt = build_system_prompt("solo", project_root=tmp_path)
-    assert "ROOT" in prompt and "SOLO OVERLAY" in prompt
+    assert "ROOT" not in prompt and "SOLO OVERLAY" in prompt
     assert prompt.count("SOLO OVERLAY") == 1

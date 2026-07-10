@@ -1,6 +1,7 @@
 """Org + specialist-agent loading for the deepagents harness.
 
-System prompt = root AGENTS.md + orgs/<name>/AGENTS.md + harness addendum.
+System prompt = the chain-inherited org overlay (base org ``general`` + the
+org's own, via ``extends:``) + harness addendum.
 Each org is a self-contained bundle: ``orgs/<name>/agents/<slug>.md`` is ONE
 file — YAML frontmatter (``name``/``description`` + optional ``tools``/
 ``skills``/``model``) + a markdown body that IS the system prompt (mirrors the
@@ -55,12 +56,10 @@ if TYPE_CHECKING:
 # delegates so the verbatim duplication can't silently return.
 #
 # Harness-local (genuinely harness-specific, NOT delegated): the ``_orgs_dir()``
-# / ``_specialists_dir()`` seams; ``load_root_prompt`` (the root AGENTS.md is
-# pinned to ``PROJECT_ROOT``, NOT the ``_orgs_dir()`` seam — a tempdir test
-# patches ``_orgs_dir`` but the base prompt stays the real one); ``_read``
-# (the PROJECT_ROOT-bound reader); ``build_system_prompt`` (the static base of
-# the supervisor prompt — root + org overlay only; the addendum + every suffix is
-# folded on top by ``prompt_parts.assemble_prompt``);
+# / ``_specialists_dir()`` seams; ``build_system_prompt`` (the static base of the
+# supervisor prompt — the chain-inherited org overlay only; the base org
+# ``general`` IS the base prompt, flowing to specialists via ``extends:``; the
+# addendum + every suffix is folded on top by ``prompt_parts.assemble_prompt``);
 # ``_resolve_tools`` (strict registry); ``_build_sub`` + ``load_subagents``
 # (profile/middleware/retrieval enrichment).
 from pux_harness.kit import loaders as _aloaders
@@ -123,13 +122,6 @@ def _agent_search_dirs(org: str) -> list[Path]:
     return _aloaders._agent_search_dirs(org, _orgs_dir().parent)
 
 
-def _read(rel: str) -> str:
-    """Read a project-relative file (used for the root ``AGENTS.md`` only —
-    org/agent/skill reads go through the injectable helpers above so the loader
-    is testable via monkeypatch)."""
-    return (project_root() / rel).read_text()
-
-
 def discover_orgs() -> list[str]:
     """Sorted names of every org dir containing ``AGENTS.md``. Data-driven —
     no hardcoded manifest. An org's specialist roster lives in its
@@ -148,19 +140,6 @@ def org_agent_slugs(name: str) -> list[str]:
     return _aloaders.org_agent_slugs(name, _orgs_dir().parent)
 
 
-def load_root_prompt() -> str:
-    """Body of the root AGENTS.md (the base 'Pux' system prompt).
-
-    Harness-local (NOT a delegate): the root prompt is read through ``_read``,
-    which resolves ``project_root()`` LIVE — NOT the ``_orgs_dir()`` seam. A
-    tempdir contract test patches ``_orgs_dir`` to a throwaway tree, but the base
-    'Pux' prompt must stay the real shipped one — so this reads through
-    ``project_root()``, deliberately outside the delegated seam (the kit's
-    ``load_root_prompt`` would return ``""`` against a tempdir with no AGENTS.md,
-    changing ``build_system_prompt``)."""
-    return _aloaders._split_frontmatter(_read("AGENTS.md"))[1]
-
-
 def load_org_prompt(name: str) -> str:
     """Body of orgs/<name>/AGENTS.md (the per-org CTO overlay).
 
@@ -169,14 +148,17 @@ def load_org_prompt(name: str) -> str:
 
 
 def build_system_prompt(org: str) -> str:
-    """root AGENTS.md + the chain-inherited org overlay — the STATIC base of the
-    supervisor prompt. The harness addendum + every conditional suffix is folded
-    on top by ``prompt_parts.assemble_prompt``; this returns ONLY the base, so the
-    no-gap registry owns the full assembly. The overlay is the parent's + own
-    AGENTS.md concatenated (own last) when the org ``extends:`` a parent — read
-    via the kit's cycle-aware ``_chain_overlay``."""
-    overlay = _aloaders._chain_overlay(org, _orgs_dir().parent)
-    return f"{load_root_prompt()}\n\n{overlay}"
+    """The chain-inherited org overlay — the STATIC base of the supervisor
+    prompt. The base org (``general``) is the root of the ``extends:`` chain; its
+    overlay IS the base prompt, and a specialist that extends it layers its own
+    overlay on top (additive — base first, specialization after). The harness
+    addendum + every conditional suffix is folded on top by
+    ``prompt_parts.assemble_prompt``; this returns ONLY the chain overlay (no
+    addendum — the harness addendum is folded by the registry), so the no-gap
+    registry owns the full assembly. Routes through the kit's canonical
+    ``build_system_prompt`` (cycle-aware; falls back to ``[org]`` on a broken
+    chain) — ONE entrypoint shared by harness + standalone consumers."""
+    return _aloaders.build_system_prompt(org, project_root=_orgs_dir().parent)
 
 
 def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:

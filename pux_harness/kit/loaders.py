@@ -8,14 +8,16 @@ pux context layer, no model registry. That's what makes it reusable from a
 different, standalone project.
 
 Every function that needs to find files takes an explicit ``project_root`` (the
-directory that contains ``orgs/`` and the root ``AGENTS.md``). There is no
-module-level ``PROJECT_ROOT`` global — the caller (the kit compiler, the pux
-harness shim, or a consumer app) supplies it.
+directory that contains ``orgs/``). There is no module-level ``PROJECT_ROOT``
+global — the caller (the kit compiler, the pux harness shim, or a consumer app)
+supplies it.
 
-System prompt shape (mirrors the harness): root ``AGENTS.md`` body +
-``orgs/<name>/AGENTS.md`` body + an optional ``addendum``. The kit default
-addendum is empty (the pux harness supplies its own ``/sandbox/workspace``
-addendum via its shim — see ``harness/pux_harness/agent/orgs.py``).
+System prompt shape (mirrors the harness): the chain-inherited org overlay —
+base org ``general``'s ``AGENTS.md`` body + ``orgs/<name>/AGENTS.md`` body via
+``extends:`` — plus an optional ``addendum``. The base org IS the base prompt
+(no specially-read root file); the kit default addendum is empty (the pux harness
+supplies its own ``/sandbox/workspace`` addendum via its shim — see
+``harness/pux_harness/agent/orgs.py``).
 
 An org is a self-contained bundle: ``orgs/<name>/agents/<slug>.md`` is ONE file
 — YAML frontmatter (``name``/``description`` + optional ``tools``/``skills``/
@@ -224,11 +226,6 @@ def _agent_search_dirs(org: str, project_root: Path) -> list[Path]:
     return [*local, _orgs_dir(project_root) / "_shared" / "agents"]
 
 
-def _read(rel: str, project_root: Path) -> str:
-    """Read a project-relative file (used for the root ``AGENTS.md``)."""
-    return (project_root / rel).read_text()
-
-
 # --- org discovery + roster ------------------------------------------------
 
 def discover_orgs(project_root: Path) -> list[str]:
@@ -262,6 +259,24 @@ def _own_org_agent_slugs(name: str, project_root: Path) -> list[str]:
     return _parse_list(data.get("agents"))
 
 
+def _org_inherit_roster(name: str, project_root: Path) -> bool:
+    """Whether ``name`` opts INTO the parent-roster union. ``inherit_roster:``
+    defaults True (a child that ``extends:`` inherits the parent's roster). A
+    specialist that extends a base org for the base PROMPT but whose own roster
+    is authoritative sets ``inherit_roster: false`` — ``org_agent_slugs`` then
+    returns only its own ``agents:`` (the AGENTS.md overlay still flows via
+    ``_chain_overlay``; this is a roster-only opt-out, the D4 mechanism).
+
+    Malformed yaml is left to ``_own_org_agent_slugs`` to raise the real error."""
+    manifest = _org_path(name, project_root) / "org.yaml"
+    if not manifest.is_file():
+        return True
+    data = yaml.safe_load(manifest.read_text()) or {}
+    if not isinstance(data, dict):
+        return True
+    return bool(data.get("inherit_roster", True))
+
+
 def org_agent_slugs(name: str, project_root: Path) -> list[str]:
     """The specialist slugs this org delegates to — the chain-INHERITED roster
     (parent ``agents:`` ∪ own, walked root→child; a slug in both appears once at
@@ -270,7 +285,11 @@ def org_agent_slugs(name: str, project_root: Path) -> list[str]:
     ``[name]`` (the contract's ``org-extends-*`` rules report the fault).
 
     For a non-extending org the chain is ``[name]`` → byte-identical to reading
-    just its own ``org.yaml``."""
+    just its own ``org.yaml``. An org that declares ``inherit_roster: false``
+    opts out of the union: its OWN ``agents:`` is authoritative (the base
+    PROMPT still flows via ``extends:``; only the roster is pruned)."""
+    if not _org_inherit_roster(name, project_root):
+        return _own_org_agent_slugs(name, project_root)
     seen: set[str] = set()
     roster: list[str] = []
     for org in _resolved_org_chain(name, project_root):  # root→child
@@ -282,16 +301,6 @@ def org_agent_slugs(name: str, project_root: Path) -> list[str]:
 
 
 # --- prompt assembly -------------------------------------------------------
-
-def load_root_prompt(project_root: Path) -> str:
-    """Body of the root ``AGENTS.md`` (the base system prompt). Returns ``""``
-    if there is no root ``AGENTS.md`` — a standalone consumer app may keep its
-    base prompt entirely in the org overlay."""
-    path = project_root / "AGENTS.md"
-    if not path.is_file():
-        return ""
-    return _split_frontmatter(path.read_text())[1]
-
 
 def load_org_prompt(name: str, project_root: Path) -> str:
     """Body of ``orgs/<name>/AGENTS.md`` (the per-org CTO overlay)."""
@@ -314,15 +323,13 @@ def _chain_overlay(org: str, project_root: Path) -> str:
 
 
 def build_system_prompt(org: str, *, project_root: Path, addendum: str = "") -> str:
-    """root ``AGENTS.md`` + the chain-inherited org overlay + ``addendum``. The
-    overlay is the parent's + own AGENTS.md concatenated (own last) when the org
-    ``extends:`` a parent; otherwise just the org's own. The kit default
-    addendum is empty; the pux harness passes its own ``/sandbox/workspace``
-    addendum."""
-    root = load_root_prompt(project_root)
-    overlay = _chain_overlay(org, project_root)
-    head = f"{root}\n\n{overlay}" if root else overlay
-    return f"{head}{addendum}"
+    """The chain-inherited org overlay + ``addendum`` — the STATIC base of the
+    supervisor prompt. The base org (``general``) is the root of the ``extends:``
+    chain; its overlay IS the base prompt, and a specialist that extends it
+    appends its own overlay (base first, own last). For a non-extending org this
+    is just its own overlay. The kit default addendum is empty; the pux harness
+    passes its own ``/sandbox/workspace`` addendum. Cycle-safe."""
+    return f"{_chain_overlay(org, project_root)}{addendum}"
 
 
 # --- agent specs + skills --------------------------------------------------
