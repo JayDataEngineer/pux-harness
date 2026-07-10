@@ -458,6 +458,16 @@ def _build_tool_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     )
 
 
+# langchain-quickjs (CodeInterpreterMiddleware) is bound LAZILY by
+# ``_build_interpreter`` on the first strength:pro build — kept ``None`` at
+# import time so the many weak-model builds (and the contract tests) never load
+# the quickjs/wasmtime native libs. Exposed as a module-level NAME (not a local
+# import inside the builder) so the contract-test stub patches it to a stable
+# marker exactly like the eager middleware imports above — see
+# ``test_real_orgs_build``.
+CodeInterpreterMiddleware: Any = None
+
+
 def _build_interpreter(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     """``CodeInterpreterMiddleware`` (langchain-quickjs) — the dynamic-subagent
     happy path. Injects an ``eval`` tool (a sandboxed QuickJS JS REPL) plus a
@@ -486,12 +496,19 @@ def _build_interpreter(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     ``interrupt_on`` / HITL approval per dispatch — gate ``eval`` itself if an
     org needs pre-dispatch approval.
 
-    The langchain-quickjs import is LAZY (inside the build) so the many
+    The langchain-quickjs import is LAZY (bound into the module-level
+    ``CodeInterpreterMiddleware`` on the first strength:pro build) so the many
     weak-model builds that never mount the interpreter skip the
     quickjs/wasmtime native load entirely. It is a CORE dep, so the import
     cannot fail in a real install — this is a perf gate, not a guarded
-    fallback. See ``AGENTS.md`` (Orchestrator pattern) for the dispatch contract."""
-    from langchain_quickjs import CodeInterpreterMiddleware
+    fallback. The class is a module-level NAME (not a local import) so the
+    contract stub can patch it to a stable marker the way it patches every
+    other middleware class — see ``test_real_orgs_build``. See ``AGENTS.md``
+    (Orchestrator pattern) for the dispatch contract."""
+    global CodeInterpreterMiddleware
+    if CodeInterpreterMiddleware is None:
+        from langchain_quickjs import CodeInterpreterMiddleware as _cls
+        CodeInterpreterMiddleware = _cls
     return CodeInterpreterMiddleware(
         subagents=True,
         ptc=["glob", "grep", "ls", "read_file"],
