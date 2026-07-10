@@ -27,7 +27,7 @@ from typing import Sequence
 
 from langchain_core.tools import BaseTool
 
-from pux_harness.agent.tool_servers import ToolServerSpec
+from pux_harness.agent.tool_servers import ToolServerSpec, resolve_tool_servers
 
 logger = logging.getLogger(__name__)
 
@@ -231,3 +231,47 @@ class McpSessionManager:
     async def close(self) -> None:
         """Best-effort close. No-op for remote today."""
         _ = self._client
+
+
+async def open_org_mcp(org: str, *, timeout: float = 30.0) -> list[BaseTool]:
+    """Resolve ``org``'s foreign MCP servers + open them, returning namespaced
+    ``BaseTool`` ready for the supervisor stack. The single source of truth for
+    the resolve→open dance shared by all three lanes (``pux direct``,
+    ``pux acp``, and the Aegra production factory in ``runtime/upstream.py``).
+
+    Failures are PER-ORG isolated and degrade to zero tools — the agent still
+    starts. ``McpSessionManager.open()`` already isolates per-**server** (one
+    bad server → zero tools from it); this adds a per-org wrapper so one bad
+    org's resolution/timeout can't abort a lane that builds many orgs.
+
+    * ``resolve_tool_servers`` raising ``ValueError`` (an unset ``${VAR}``) →
+      ``[]`` (the operator's env is missing a required var; loud ``ERROR`` log).
+    * ``open()`` taking longer than ``timeout`` → ``[]`` (a hung server probe
+      can't wedge the whole startup).
+    * any other ``Exception`` from open → ``[]``.
+
+    No ``close()`` is taken on the manager — verified no-op, and each loaded
+    tool opens a fresh per-call session on whatever loop later invokes it (see
+    ``MultiServerMCPClient.get_tools`` docstring: "A new session will be
+    created for each tool call"), so the loop the probe ran on is irrelevant.
+    """
+    try:
+        specs = resolve_tool_servers(org)
+    except ValueError as exc:
+        logger.error("org %s: tool_servers resolution failed — %s", org, exc)
+        return []
+    if not specs:
+        return []
+    mgr = McpSessionManager(org, specs)
+    try:
+        await asyncio.wait_for(mgr.open(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error(
+            "org %s: MCP open() timed out after %.1fs — starting with no MCP tools",
+            org, timeout,
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001 — per-org degrade, don't brick the lane
+        logger.error("org %s: MCP open() failed — %s", org, exc)
+        return []
+    return list(mgr.tools)

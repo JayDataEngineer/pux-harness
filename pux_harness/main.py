@@ -21,6 +21,7 @@ import sys
 import uuid
 
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphRecursionError
 
 from pux_harness.agent.contract import (
     check_all,
@@ -33,7 +34,6 @@ from pux_harness.agent.graph import build_graph, shared_backend, shared_exec
 from pux_harness.agent.observability import build_invoke_config
 from pux_harness.agent.profile import default_rubric
 from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
-from pux_harness.agent.tool_servers import resolve_tool_servers
 from pux_harness.threads import open_thread_store
 from pux_harness.sandbox.tools import (
     LEGACY_TOOL_NAMES,
@@ -103,6 +103,20 @@ def _trace(messages: list) -> None:
         print(f"  [{i}] {t}{tag}{tcstr}: {cstr}")
 
 
+async def _recover_partial(agent, config) -> tuple[list, object]:
+    """Fetch the partial checkpoint after a ``GraphRecursionError``.
+
+    langgraph persists state at the end of every super-step, so when the step
+    cap fires the last checkpoint holds whatever the agent had produced. We
+    surface that instead of dying on a bare traceback. Returns ``(messages,
+    todos)``; ``( [], None )`` when nothing was checkpointed yet (the caller
+    must not assume ``messages`` is non-empty).
+    """
+    partial = await agent.aget_state(config)
+    values = partial.values if partial is not None else {}
+    return list(values.get("messages", [])), values.get("todos")
+
+
 async def _run(
     org: str,
     task: str,
@@ -110,15 +124,10 @@ async def _run(
     rubric: str | None = None,
     thread: str | None = None,
 ) -> None:
-    from pux_harness.agent.mcp_client import McpSessionManager  # noqa: PLC0415
+    from pux_harness.agent.mcp_client import open_org_mcp  # noqa: PLC0415
     mcp_tools: list[BaseTool] = []
-    _mcp_mgr = None
     try:
-        specs = resolve_tool_servers(org)
-        if specs:
-            _mcp_mgr = McpSessionManager(org, specs)
-            await _mcp_mgr.open()
-            mcp_tools = _mcp_mgr.tools
+        mcp_tools = await open_org_mcp(org)
     except ValueError as exc:
         print(f"  [mcp] tool_servers resolution failed: {exc}")
     thread_id = thread or f"{org}-{uuid.uuid4().hex[:8]}"
@@ -163,19 +172,43 @@ async def _run(
             dr = default_rubric(org)
             if dr:
                 state["rubric"] = dr
-        result = await agent.ainvoke(
-            state,
-            config=build_invoke_config(
-                thread_id, recursion_limit, org, transport="direct"
-            ),
+        invoke_config = build_invoke_config(
+            thread_id, recursion_limit, org, transport="direct"
         )
+        try:
+            result = await agent.ainvoke(state, config=invoke_config)
+        except GraphRecursionError:
+            # The run hit the step cap (--recursion-limit). The partial
+            # checkpoint is still in the checkpointer, so surface what the
+            # agent had produced so far instead of dying on a bare traceback.
+            # Resume with `pux resume <thread_id>` (same thread).
+            print(
+                f"\n=== RECURSION LIMIT HIT (--recursion-limit {recursion_limit}) ===",
+                file=sys.stderr,
+            )
+            print(
+                "  The agent exceeded its step cap. Partial progress is "
+                "surfaced below; resume with `pux resume "
+                f"{thread_id}` (same thread) to continue.\n",
+                file=sys.stderr,
+            )
+            partial_messages, todos = await _recover_partial(agent, invoke_config)
+            if todos:
+                print("=== OPEN TODOS (partial) ===", file=sys.stderr)
+                print(f"  {todos}", file=sys.stderr)
+            result = {"messages": partial_messages}
     messages = result["messages"]
     print("=== MESSAGE TRACE ===")
     _trace(messages)
     print("\n=== FINAL ANSWER ===")
-    final = messages[-1]
-    content = getattr(final, "content", final)
-    print(content if content else "(empty content)")
+    # ``messages`` is empty only in the recursion path when nothing checkpointed
+    # before the cap — guard so the handler degrades gracefully, not via IndexError.
+    if not messages:
+        print("(no messages surfaced — the run produced no partial output)")
+    else:
+        final = messages[-1]
+        content = getattr(final, "content", final)
+        print(content if content else "(empty content)")
     print("\n=== USAGE ===")
     print(_usage(messages))
     print(f"messages in thread: {len(messages)}")
@@ -192,7 +225,7 @@ async def _run(
         for tc in (getattr(m, "tool_calls", None) or []):
             used.add(tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", ""))
     leaked = used & LEGACY_TOOL_NAMES
-    print(f"\n=== SURFACE CHECK (main agent only) ===")
+    print("\n=== SURFACE CHECK (main agent only) ===")
     print(f"  tools used: {sorted(used)}")
     print(f"  native fs used: {sorted(used & NATIVE_FS_TOOLS) or 'NONE'}")
     print(f"  legacy pux_sandbox fs/shell leaked: {sorted(leaked) or 'NONE'}")
@@ -210,9 +243,6 @@ async def _run(
         print(f"  $ {one[:140]}")
     if not backend.execute_log:
         print("  (none — no native fs/shell call was made this run)")
-
-    if _mcp_mgr is not None:
-        await _mcp_mgr.close()
 
 
 def _jobs_run(org: str, job: str | None) -> int:
@@ -382,7 +412,7 @@ def _print_status(sb, name: str, project: str, org: str) -> None:
     import docker  # noqa: PLC0415
 
     c = docker.from_env(timeout=10).containers.get(name)
-    print(f"running")
+    print("running")
     print(f"  Container   {name}")
     print(f"  Image       {c.image.tags[0] if c.image.tags else c.image.id[:19]}")
     print(f"  Status      {c.status}")

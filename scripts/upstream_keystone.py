@@ -185,7 +185,7 @@ def main() -> int:
             for g, r in bad:
                 print(f"  {g}: {r}", file=sys.stderr)
             return 1
-        print(f"PROVEN — every graph_id serves the full SDK surface upstream")
+        print("PROVEN — every graph_id serves the full SDK surface upstream")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"FAILED (unexpected): {type(e).__name__}: {e}", file=sys.stderr)
