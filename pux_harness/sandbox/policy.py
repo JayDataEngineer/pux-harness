@@ -229,7 +229,10 @@ class Policy:
     browser: BrowserSpec = field(default_factory=BrowserSpec)
     host_setup: list[HostSetupHook] = field(default_factory=list)
     jobs: list[JobSpec] = field(default_factory=list)
-    tool_servers: list = field(default_factory=list)
+    # NOTE: foreign MCP servers are declared in org.yaml ``capabilities:``
+    # (kind: mcp) — the ONE canonical site (CU-4). policy.yaml ``tool_servers:``
+    # is a permanent contract failure (``no-legacy-tool-servers``); there is no
+    # ``Policy.tool_servers`` field and no parse path for it.
     protocols: list = field(default_factory=list)
 
 
@@ -403,13 +406,6 @@ def _policy_from_dict(d: Mapping) -> Policy:
             )
         )
     pol.jobs = jobs
-    # tool_servers: a list of foreign MCP server declarations (strings for
-    # catalog refs, or mappings for inline/catalog-ref-with-override). Absent
-    # or empty -> no external tool servers.
-    ts_raw = d.get("tool_servers") or []
-    if not isinstance(ts_raw, list):
-        raise PolicyError("policy: section 'tool_servers' must be a list")
-    pol.tool_servers = list(ts_raw)
     # protocols: which agent-facing surfaces this org declares (see
     # DEFAULT_PROTOCOLS). Absent or empty -> resolve_protocols() yields the
     # DEFAULT, preserving today's "all surfaces for all orgs".
@@ -691,12 +687,3 @@ def job_specs(p: Policy | None) -> list[JobSpec]:
     if p is None:
         return []
     return list(p.jobs)
-
-
-def tool_server_items(p: Policy | None) -> list:
-    """The policy's raw ``tool_servers`` list (strings and/or mappings).
-    Empty/None policy -> empty list. Resolution to ``ToolServerSpec`` is
-    ``tool_servers.py``'s job (it needs the shared catalog)."""
-    if p is None:
-        return []
-    return list(p.tool_servers)

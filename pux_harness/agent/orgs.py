@@ -214,6 +214,138 @@ def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:
     return resolved
 
 
+def _org_declared_mcp_servers(org: str) -> frozenset[str]:
+    """The MCP server names this org DECLARES in its own ``org.yaml``
+    ``capabilities: [{kind: mcp, ref: <server>}]`` block — the two-level
+    grant gate's level-1 set (``_resolve_mcp``'s ``declared_servers``).
+
+    This is the SAME source ``resolve_tool_servers`` arms from
+    (``_org_yaml_mcp_items``), so the agent-level gate and the org-level arming
+    agree by construction: an agent may route a subset of EXACTLY the servers
+    the org declared — never a server the org didn't. Lazy import
+    (``tool_servers`` imports ``orgs`` at module load -> a top-level import here
+    would cycle). Offline-safe: a pure ``org.yaml`` read with no server
+    reachability, so the declared set is stable whether or not any server is
+    up. Returns ``frozenset()`` for an org that ships no mcp sugar (no
+    ``org.yaml`` or no ``capabilities:`` block).
+    """
+    # Lazy: ``tool_servers`` line 29 does ``from .orgs import _org_path,
+    # _orgs_dir`` at module load -> importing it at the top of THIS module
+    # cycles. Importing inside the function breaks the cycle cleanly.
+    from pux_harness.agent.tool_servers import _org_yaml_mcp_items
+    names: set[str] = set()
+    for item in _org_yaml_mcp_items(org):
+        if isinstance(item, str):
+            ref = item.strip()
+        elif isinstance(item, dict):
+            ref = str(item.get("ref", "")).strip()
+        else:
+            ref = ""
+        if ref:
+            names.add(ref)
+    return frozenset(names)
+
+
+def _resolve_mcp(
+    raw_mcp: Any, mcp_tools: Sequence[BaseTool], slug: str,
+    *, declared_servers: Container[str] = frozenset(),
+) -> list[BaseTool]:
+    """Map an agent's desugared ``mcp:`` list to the org's ARMED MCP tools.
+
+    The focused-MCP path: ``kind: mcp`` in agent frontmatter (CU-3) desugars to a
+    ``mcp:`` list (see ``kit.capabilities_decl.desugar_agent_capabilities``) of
+    bare catalog-ref strings (take EVERY tool from that server) or
+    ``{ref, tools: [...]}`` mappings (narrow to the named bare tools). This
+    resolves that list against ``mcp_tools`` — the org's already-armed,
+    namespaced MCP tools (``caps.mcp`` from the factory) — and returns the
+    focused subset to splice into the subagent's ``tools`` whitelist.
+
+    Matching is by the namespacing PREFIX ``mcp__<ref>__*`` — the ``<ref>`` is the
+    catalog key, which is the ``<server>`` segment ``mcp_client._namespace_tools``
+    stamps (``mcp__{server_name}__{tool}``). The trailing ``__`` makes it an
+    EXACT-server match (``equibles`` never matches ``equibles-extra``), and it is
+    robust to a bare tool name that itself contains ``__``. The bare tool name is
+    the segment AFTER the prefix — the SAME pre-namespace name
+    ``mcp_client._apply_allowlist`` filters on, so the agent's allowlist uses the
+    names you'd see in ``tools/list``.
+
+    LENIENT TWO-LEVEL GRANT GATE — ``declared_servers`` is the level-1 set (the
+    MCP server names the org DECLARES in its own ``org.yaml``
+    ``capabilities: [{kind: mcp, ref: <server>}]``, the SAME source
+    ``resolve_tool_servers`` arms from — see ``_org_declared_mcp_servers``).
+    An agent ``ref`` NOT in ``declared_servers`` is a CONFIG ERROR and fails
+    loud (naming the agent, the ref, and the declared set), so a typo'd ref can
+    never silently inherit the supervisor's whole MCP surface: the org MUST
+    declare it first. But a ref that IS declared yet resolves to no armed tools
+    this run (the server unreachable/offline, ``mcp_tools`` empty) contributes
+    ZERO tools and the org still builds — mirrors the org layer's OWN leniency
+    (``resolve_tool_servers`` tolerates an unreachable declared server). So an
+    org builds offline with its mcp agents carrying an empty mcp subset; a real
+    misconfig still fails loud at build time. A bare-name allowlist the server
+    doesn't expose fails loud too (mirrors ``mcp_client._apply_allowlist``) —
+    but only when the server is actually armed (unreachable -> skipped). Empty
+    ``declared_servers`` (the default) treats EVERY ref as undeclared and fails
+    loud — the safe misuse-guard for a caller that forgot to pass the real set;
+    ``load_subagents`` always passes the org's declared set. ``raw_mcp``
+    empty/None -> ``[]`` (the agent declared no mcp; its surface is whatever
+    ``_resolve_tools`` produced, or deepagents inheritance when that's also
+    empty)."""
+    if not raw_mcp:
+        return []
+    if not isinstance(raw_mcp, list):  # the desugarer always emits a list
+        raise KeyError(
+            f"agent {slug!r}: mcp frontmatter must be a list, "
+            f"got {type(raw_mcp).__name__}"
+        )
+    resolved: list[BaseTool] = []
+    for entry in raw_mcp:
+        if isinstance(entry, str):
+            ref: str = entry.strip()
+            allowlist: Any = None
+        elif isinstance(entry, dict):
+            ref = str(entry.get("ref", "")).strip()
+            allowlist = entry.get("tools")
+            if allowlist is not None and not isinstance(allowlist, list):
+                raise KeyError(
+                    f"agent {slug!r}: mcp {ref!r} allowlist must be a list, "
+                    f"got {type(allowlist).__name__}"
+                )
+        else:
+            raise KeyError(
+                f"agent {slug!r}: mcp entry must be a ref string or a "
+                f"{{ref, tools}} mapping, got {type(entry).__name__}"
+            )
+        if not ref:
+            raise KeyError(f"agent {slug!r}: mcp ref must be a non-empty string")
+        prefix = f"mcp__{ref}__"
+        server_tools = [t for t in mcp_tools if t.name.startswith(prefix)]
+        # Lenient two-level gate (see docstring). Level 1 = declared-by-org:
+        # a ref the org never declared is a CONFIG ERROR -> fail loud. Level 2
+        # = armed-this-run: a declared ref with zero armed tools (server
+        # unreachable/offline) is lenient -> contributes nothing, build lives.
+        if ref not in declared_servers:
+            raise KeyError(
+                f"agent {slug!r}: mcp ref {ref!r} is not declared by this org "
+                f"(declared: {sorted(declared_servers) or '<none>'}). Declare "
+                f"it in org.yaml capabilities: [{{kind: mcp, ref: {ref}}}] "
+                f"first, then route it to this agent."
+            )
+        if not server_tools:
+            continue  # declared but not armed this run -> lenient empty subset
+        if allowlist is None:
+            resolved.extend(server_tools)
+        else:
+            by_bare = {t.name[len(prefix):]: t for t in server_tools}
+            missing = [str(n) for n in allowlist if str(n) not in by_bare]
+            if missing:
+                raise KeyError(
+                    f"agent {slug!r}: mcp ref {ref!r} allowlist names {missing} "
+                    f"not exposed by server (exposed: {sorted(by_bare)})"
+                )
+            resolved.extend(by_bare[str(n)] for n in allowlist)
+    return resolved
+
+
 def _resolve_skills(raw: Any, slug: str) -> list[str]:
     """``skills`` value -> container-absolute skills-ROOT paths.
 
@@ -274,6 +406,8 @@ def _load_agent_spec(slug: str, org: str) -> dict[str, Any] | None:
 def _build_sub(
     slug: str, spec: dict[str, Any], tool_map: dict[str, BaseTool], system_prompt: str,
     org: str, *, middleware: list[AgentMiddleware],
+    mcp_tools: Sequence[BaseTool] = (),
+    declared_servers: Container[str] = frozenset(),
 ) -> dict[str, Any]:
     """Build a deepagents SubAgent dict from a spec mapping (the module's
     ``SUBAGENT`` dict). ``system_prompt`` is passed in explicitly.
@@ -302,8 +436,19 @@ def _build_sub(
         "description": spec.get("description", slug),
         "system_prompt": system_prompt,
     }
-    if spec.get("tools"):
-        sub["tools"] = _resolve_tools(spec["tools"], tool_map)
+    # Focused whitelist: ANY declared ``tools`` OR ``mcp`` flips the subagent out
+    # of deepagents' "inherit the main agent's tools" default (omitted ``tools``
+    # -> inherit). Composing the mcp subset (``_resolve_mcp``) into the SAME
+    # ``tools`` key is what makes a focused mcp-only specialist possible — it
+    # gets EXACTLY its declared servers (plus any ``tools``), not the inherited
+    # kitchen sink. ``_resolve_tools([])`` is ``[]`` so an mcp-only decl still
+    # works; the gate is ``tools or mcp`` so a present ``mcp`` alone flips it.
+    raw_mcp = spec.get("mcp")
+    if spec.get("tools") or raw_mcp:
+        sub["tools"] = (
+            _resolve_tools(spec.get("tools") or [], tool_map)
+            + _resolve_mcp(raw_mcp, mcp_tools, slug, declared_servers=declared_servers)
+        )
     if spec.get("model"):
         sub["model"] = get_model(model=spec["model"])
     else:
@@ -456,6 +601,7 @@ def load_subagents(
     *,
     subagent_middleware: list[AgentMiddleware],
     retrieval_tools: list[BaseTool],
+    mcp_tools: Sequence[BaseTool] = (),
 ) -> list[dict[str, Any]]:
     """Build deepagents SubAgent dicts for ``org``'s specialists.
 
@@ -511,6 +657,12 @@ def load_subagents(
         from pux_harness.agent.profile import apply_profile_to_tools as _aptt
         apply_profile_to_tools = _aptt
     subs: list[dict[str, Any]] = []
+    # Level-1 of the two-level grant gate: the servers this org DECLARES in its
+    # own org.yaml (the same source resolve_tool_servers arms from). Computed
+    # ONCE per org (offline-safe config read), so every agent's mcp ref is
+    # checked against the same declared set — declared-but-unreachable -> empty
+    # subset (build lives), undeclared -> fail loud (config error).
+    declared_servers = _org_declared_mcp_servers(org)
     for slug in org_agent_slugs(org):
         spec = _load_agent_spec(slug, org)
         if spec is None:
@@ -520,6 +672,8 @@ def load_subagents(
         sub = _build_sub(
             slug, spec, tool_map, spec["system_prompt"], org,
             middleware=subagent_middleware,
+            mcp_tools=mcp_tools,
+            declared_servers=declared_servers,
         )
         # Per-agent overrides from the spec's OWN frontmatter.
         agent_cfg = _agent_profile_from_spec(spec)

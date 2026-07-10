@@ -84,7 +84,6 @@ from pux_harness.agent import tool_servers as tool_servers_mod
 from pux_harness.sandbox.tools import declared as declared_mod
 from pux_harness.sandbox.tools import dynamic as dynamic_mod
 from pux_harness.sandbox.tools import (
-    NATIVE_FS_TOOLS,
     SPECIALIST_TOOL_NAMES,
     Category,
     classify_slug,
@@ -125,11 +124,6 @@ KNOWN_POLICY_SECTIONS: frozenset[str] = frozenset({
     "workspace", "egress", "credentials", "sandbox", "browser", "host_setup",
     "jobs", "tool_servers", "protocols",
 })
-
-# ``NATIVE_FS_TOOLS`` is imported from ``pux_harness.sandbox.tools`` (derived
-# from the single ``REGISTRY``) — see the import above. Re-exported through
-# this module's namespace so the contract tests can keep importing it from
-# ``contract`` (``from pux_harness.agent.contract import NATIVE_FS_TOOLS``).
 
 # Agent-Skills spec: a skill dir name (and its ``SKILL.md`` ``name``) must be
 # kebab-case — lowercase letters/digits joined by single hyphens.
@@ -959,8 +953,10 @@ def _no_legacy_agent_capability_keys() -> list[Violation]:
     Before CU-4, three fragmented channels (``tools:``, ``skills:``, and the
     org-level ``tool_servers:``) each had their own declaration surface + loader.
     CU-4 collapsed them into ONE ``capabilities:`` block — ``kind: tool`` /
-    ``kind: skill`` in the agent .md, ``kind: mcp`` in org.yaml — behind the
-    single ``CapabilityResolver`` front-door. A re-introduced ``tools:``/
+    ``kind: skill`` in the agent .md, and ``kind: mcp`` in EITHER home (agent .md
+    to route a FOCUSED subset of the org's armed servers into one subagent;
+    org.yaml to ARM the server for the org) — behind the single
+    ``CapabilityResolver`` front-door. A re-introduced ``tools:``/
     ``skills:`` key (someone adds one because it "used to work") bypasses that
     front-door — the exact drift CU killed. Mirrors ``no-legacy-agent-py``: a
     fleet scan over EVERY agent .md (roster agents, extended parents, orphans

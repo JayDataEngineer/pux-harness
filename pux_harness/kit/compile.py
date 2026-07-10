@@ -60,6 +60,45 @@ def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:
     return resolved
 
 
+def _resolve_mcp(
+    raw_mcp: Any, tools: Sequence[BaseTool], slug: str,
+) -> list[BaseTool]:
+    """Resolve an agent's desugared ``mcp:`` list against the consumer's tools.
+
+    The kit sibling of the harness ``agent.orgs._resolve_mcp``: an mcp entry (a
+    bare catalog-ref string, or ``{ref, tools: [...]}``) selects the
+    ``mcp__<ref>__*`` tools from ``tools`` — what the consumer passed (the kit
+    has no "org arms the server" concept; passing the namespaced mcp tools IS the
+    arming). LENIENT like ``_resolve_tools``: a ref matching nothing in ``tools``
+    is SKIPPED, not raised — an org authored under the pux harness may reference a
+    server a standalone consumer doesn't ship, and a strict raise would make that
+    org un-compilable here (the HARNESS is the strict/loud path; the kit compiles
+    what it can). Empty/absent ``raw_mcp`` -> ``[]``."""
+    if not raw_mcp or not isinstance(raw_mcp, list):
+        return []
+    resolved: list[BaseTool] = []
+    for entry in raw_mcp:
+        if isinstance(entry, str):
+            ref, allowlist = entry.strip(), None
+        elif isinstance(entry, dict):
+            ref = str(entry.get("ref", "")).strip()
+            allowlist = entry.get("tools")
+        else:
+            continue
+        if not ref:
+            continue
+        prefix = f"mcp__{ref}__"
+        server_tools = [t for t in tools if t.name.startswith(prefix)]
+        if not server_tools:
+            continue  # lenient — the consumer didn't ship this server
+        if allowlist is None:
+            resolved.extend(server_tools)
+        else:
+            by_bare = {t.name[len(prefix):]: t for t in server_tools}
+            resolved.extend(by_bare[n] for n in allowlist if n in by_bare)
+    return resolved
+
+
 def _build_sub(
     slug: str,
     spec: dict[str, Any],
@@ -67,6 +106,7 @@ def _build_sub(
     *,
     model_resolver: Callable[[str | None], BaseChatModel | str],
     project_root: Path,
+    tools: Sequence[BaseTool] = (),
 ) -> dict[str, Any]:
     """Build a deepagents SubAgent dict from a spec, kit-style.
 
@@ -80,8 +120,16 @@ def _build_sub(
         "description": spec.get("description", slug),
         "system_prompt": spec["system_prompt"],
     }
-    if spec.get("tools"):
-        sub["tools"] = _resolve_tools(spec["tools"], tool_map)
+    # Focused whitelist: ANY declared ``tools`` OR ``mcp`` flips the subagent out
+    # of deepagents' "inherit the main agent's tools" default. The mcp subset
+    # (``_resolve_mcp``) splices into the SAME ``tools`` key so an mcp-only
+    # specialist gets EXACTLY its declared servers, not the inherited surface.
+    raw_mcp = spec.get("mcp")
+    if spec.get("tools") or raw_mcp:
+        sub["tools"] = (
+            _resolve_tools(spec.get("tools") or [], tool_map)
+            + _resolve_mcp(raw_mcp, tools, slug)
+        )
     sub["model"] = model_resolver(spec.get("model"))
     if "skills" in spec:
         sub["skills"] = _resolve_skills(spec["skills"], slug, project_root=project_root)
@@ -116,7 +164,7 @@ def load_subagents(
                 f"no agent {slug!r} for org {org!r} — searched {searched}"
             )
         subs.append(
-            _build_sub(slug, spec, tool_map, model_resolver=model_resolver, project_root=project_root)
+            _build_sub(slug, spec, tool_map, model_resolver=model_resolver, project_root=project_root, tools=tools)
         )
     return subs
 

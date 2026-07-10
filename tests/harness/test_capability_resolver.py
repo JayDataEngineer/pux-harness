@@ -161,6 +161,60 @@ def test_resolver_dynamic_on_when_enabled(
     assert surface[-4:] == _names(resolved.dynamic)
 
 
+# --- the lib/-inert warning (no silent gap when dynamic_tools is off) --------
+
+
+def test_resolver_warns_when_lib_modules_present_but_flag_off(
+    org_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No silent gap: an org ships ``lib/*.py`` helpers (promoted dynamic tools,
+    host-authored functions) but leaves ``sandbox.dynamic_tools`` off. Those
+    modules are ONLY callable through the gated ``pux_dyn_*`` surface, so with
+    the flag off they are inert — the resolver WARNS rather than letting the
+    operator discover it via a 404'd tool call."""
+    lib = _org_path(_ORG) / "lib"
+    lib.mkdir(parents=True)
+    (lib / "helper.py").write_text("# promoted helper\n")
+    (lib / "another.py").write_text("# another\n")
+    # flag OFF (the default — the scratch org has no policy.yaml).
+    assert not caps_mod.load_dynamic_tools_enabled(_ORG)
+
+    with caplog.at_level("WARNING", logger="pux_harness.agent.capabilities"):
+        resolved = CapabilityResolver(_FakeExec()).resolve(_ORG)
+
+    assert resolved.dynamic == []  # gating unchanged — just signalled now
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("sandbox.dynamic_tools" in m and "inert" in m for m in msgs), msgs
+    assert any(_ORG in m for m in msgs)  # the org is named for grep-ability
+
+
+def test_resolver_silent_when_flag_off_and_no_lib_modules(
+    org_root: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No lib/ (or empty lib/) + flag off → no warning. The signal fires ONLY
+    when there is actual inert content, so orgs that simply don't use dynamic
+    tooling stay quiet."""
+    # scratch org ships no lib/ at all.
+    assert not (_org_path(_ORG) / "lib").exists()
+    with caplog.at_level("WARNING", logger="pux_harness.agent.capabilities"):
+        CapabilityResolver(_FakeExec()).resolve(_ORG)
+    assert not [r for r in caplog.records if "dynamic_tools" in r.getMessage()]
+
+
+def test_resolver_silent_when_dynamic_enabled_with_lib(
+    org_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Flag ON + lib/ modules → the 4 tools mount (no inert gap), so no warning."""
+    lib = _org_path(_ORG) / "lib"
+    lib.mkdir(parents=True)
+    (lib / "helper.py").write_text("# promoted helper\n")
+    monkeypatch.setattr(caps_mod, "load_dynamic_tools_enabled", lambda org: True)
+    with caplog.at_level("WARNING", logger="pux_harness.agent.capabilities"):
+        resolved = CapabilityResolver(_FakeExec()).resolve(_ORG)
+    assert len(resolved.dynamic) == 4
+    assert not [r for r in caplog.records if "dynamic_tools" in r.getMessage()]
+
+
 # --- the unified index (the CU-2 audit / CU-5 export surface) ---------------
 
 

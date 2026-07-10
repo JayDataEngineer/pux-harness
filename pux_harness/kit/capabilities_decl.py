@@ -7,17 +7,26 @@ PURE SUGAR: the leaf resolvers (``classify_slug`` / ``resolve_tool_servers`` /
 holds. An org written in the new form resolves bit-identically to its old form
 (the CU-3 parity proof in ``tests/harness/test_capabilities_decl.py``).
 
-Homes (kind-routed — each kind has ONE natural home):
+Homes (kind-routed). ``tool`` / ``skill`` each have ONE natural home (per-agent
+frontmatter); ``mcp`` is the exception — it lives in BOTH, at TWO different layers:
 - **Agent frontmatter** (``<slug>.md``): ``capabilities:`` with
-  ``kind ∈ {tool, skill}`` desugars into that agent's ``tools:`` / ``skills:``
-  lists (``desugar_agent_capabilities``). The org-level kinds are REJECTED here —
-  a per-agent file is the wrong home for an org-level transport/middleware/
-  schedule.
+  ``kind ∈ {tool, skill, mcp}`` desugars into that agent's ``tools:`` /
+  ``skills:`` lists, or — for ``mcp`` — a new ``mcp:`` list
+  (``desugar_agent_capabilities``). ``middleware`` / ``job`` are REJECTED here
+  (no ``ref``-catalog).
 - **``org.yaml``**: ``capabilities:`` with ``kind == mcp`` desugars into
   ``tool_server`` items (a bare catalog-ref string, or a
   ``{ref, tools}`` allowlist override) that ``resolve_tool_servers`` merges in
   (``org_mcp_items_from_dict``). The per-agent kinds (``tool``/``skill``) are
   REJECTED here.
+
+The ``mcp`` two-level model: the **org** arms the server (boots its process,
+owns its egress ACL) and the **agent** routes a *focused subset* of the org's
+already-armed MCP tools into one subagent's whitelist. An agent ``mcp`` ref to
+a server the org did NOT arm fails loud at build (the two-level grant gate —
+see ``_resolve_mcp``). This is the one kind that legitimately spans both homes
+(org = transport/egress, agent = routing) — unlike ``tool``/``skill``, which are
+purely per-agent.
 
 Scope (CU-3): the THREE model add-on channels the operator named — skills,
 tools, mcp — all of which have a clean ``ref`` semantics (a skills-root path, a
@@ -62,10 +71,12 @@ __all__ = [
 ]
 
 
-# The kinds each home accepts — kind-routed (each kind has ONE natural home).
-# These are the CU-3 sugar surface: the three model add-on channels with a clean
-# ``ref`` semantics. ``middleware`` / ``job`` are deferred (no ref-catalog).
-AGENT_CAPABILITY_KINDS = ("tool", "skill")
+# The kinds each home accepts. ``tool`` / ``skill`` are per-agent ONLY;
+# ``mcp`` is the one kind valid in BOTH homes (org arms the server; agent routes
+# a focused subset — see the module docstring's two-level model). These are the
+# CU-3 sugar surface: the three model add-on channels with a clean ``ref``
+# semantics. ``middleware`` / ``job`` are deferred (no ref-catalog).
+AGENT_CAPABILITY_KINDS = ("tool", "skill", "mcp")
 ORG_CAPABILITY_KINDS = ("mcp",)
 
 
@@ -96,23 +107,35 @@ def desugar_agent_capabilities(
     fm: dict[str, Any], slug: str
 ) -> dict[str, Any]:
     """Expand a frontmatter ``capabilities:`` block into ``tools:`` / ``skills:``
-    on ``fm`` (returns the merged dict). Accepts ONLY ``kind ∈ {tool, skill}``
-    (the per-agent kinds); ``mcp`` / ``middleware`` / ``job`` raise
-    ``CapabilitiesSugarError`` (wrong home — those are org-level, declared in
-    ``org.yaml``).
+    / ``mcp:`` on ``fm`` (returns the merged dict). Accepts ``kind ∈ {tool,
+    skill, mcp}``; ``middleware`` / ``job`` raise ``CapabilitiesSugarError``
+    (not in the sugar surface — those stay in ``profile.yaml`` / ``policy.yaml``).
+
+    ``kind == mcp`` is special: unlike tool/skill (a bare ``ref`` appended to a
+    list), an mcp entry carries an OPTIONAL per-tool allowlist, so it desugars to
+    a NEW ``mcp:`` key — a list in the SAME shape ``org_mcp_items_from_dict``
+    produces (a bare catalog-ref string, or ``{ref, tools: [...]}``) — NOT into
+    ``tools:``. The leaf resolver ``_resolve_mcp`` (harness ``agent/orgs.py`` +
+    kit ``kit/compile.py``) matches the org's ARMED mcp tools by the
+    ``mcp__<ref>__*`` prefix, narrowing to the allowlist's bare tool names, and
+    fails loud if the ref matches no armed server (the two-level grant gate: the
+    org must have armed it).
 
     ``capabilities:`` ADDS to any explicit ``tools:`` / ``skills:`` already on
     ``fm`` (both forms compose during the CU-3 transition): the legacy list is
     preserved first, then sugar entries appended in order, deduped. The
     ``capabilities:`` key is then POPPED — the leaf resolvers
-    (``_resolve_tools`` / ``_resolve_skills``) never see it; they see the merged
-    ``tools:`` / ``skills:`` and behave exactly as on an org written the old way.
+    (``_resolve_tools`` / ``_resolve_skills`` / ``_resolve_mcp``) never see it;
+    they see the merged ``tools:`` / ``skills:`` / ``mcp:`` and behave exactly as
+    on an org written the old way.
 
     Runs in ``kit.loaders._load_agent_spec`` on EACH agent's OWN frontmatter,
     BEFORE the ``extends:`` merge — so a parent's ``capabilities:`` becomes the
     parent's ``tools:`` / ``skills:`` and the existing
     ``tools`` / ``tools_add`` / ``skills`` / ``skills_add`` inheritance machinery
-    operates on the desugared form unchanged.
+    operates on the desugared form unchanged. NOTE: there is no ``mcp`` /
+    ``mcp_add`` delta vocabulary yet, so agent-level ``extends:`` does NOT carry
+    a ``mcp:`` list up the chain — declare ``mcp:`` on the leaf agent.
     """
     block = fm.get("capabilities")
     if block is None:
@@ -125,6 +148,7 @@ def desugar_agent_capabilities(
     where = f"agent {slug!r}"
     tools = _coerce_str_list(fm.get("tools"), where=where)
     skills = _coerce_str_list(fm.get("skills"), where=where)
+    mcp_items: list[Any] = []
     for i, entry in enumerate(block):
         if not isinstance(entry, dict):
             raise CapabilitiesSugarError(
@@ -135,9 +159,9 @@ def desugar_agent_capabilities(
         ref = entry.get("ref")
         if kind not in AGENT_CAPABILITY_KINDS:
             raise CapabilitiesSugarError(
-                f"agent {slug!r}: capabilities[{i}] kind={kind!r} is not a "
-                f"per-agent kind; frontmatter accepts {list(AGENT_CAPABILITY_KINDS)} "
-                f"(org-level kinds go in org.yaml capabilities:)"
+                f"agent {slug!r}: capabilities[{i}] kind={kind!r} is not in the "
+                f"agent frontmatter sugar surface; accepts {list(AGENT_CAPABILITY_KINDS)} "
+                f"(middleware/job stay in profile.yaml/policy.yaml)"
             )
         if not isinstance(ref, str) or not ref.strip():
             raise CapabilitiesSugarError(
@@ -145,6 +169,21 @@ def desugar_agent_capabilities(
                 f"non-empty string"
             )
         ref = ref.strip()
+        if kind == "mcp":
+            # The one kind with an optional per-tool allowlist → ``mcp:`` key, in
+            # the SAME shape ``org_mcp_items_from_dict`` emits (bare ref string,
+            # or ``{ref, tools}``). Routed by ``_resolve_mcp``, NOT ``_resolve_tools``.
+            allow = entry.get("allowlist", entry.get("tools"))
+            if allow is None:
+                mcp_items.append(ref)
+            elif isinstance(allow, list):
+                mcp_items.append({"ref": ref, "tools": [str(t) for t in allow]})
+            else:
+                raise CapabilitiesSugarError(
+                    f"agent {slug!r}: capabilities[{i}] mcp allowlist must be a "
+                    f"list, got {type(allow).__name__}"
+                )
+            continue
         target = tools if kind == "tool" else skills
         if ref not in target:
             target.append(ref)
@@ -156,6 +195,10 @@ def desugar_agent_capabilities(
         fm["skills"] = skills
     else:
         fm.pop("skills", None)
+    if mcp_items:
+        fm["mcp"] = mcp_items
+    else:
+        fm.pop("mcp", None)
     fm.pop("capabilities", None)  # consumed — the leaves never see it
     return fm
 

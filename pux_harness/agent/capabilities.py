@@ -24,6 +24,7 @@ capabilities`` CLI) and the MDA export seam (CU-5) both read that index.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
@@ -43,6 +44,8 @@ from pux_harness.sandbox.tools.dynamic import (
     load_dynamic_index,
 )
 from pux_harness.sandbox.tools.registry import REGISTRY
+
+_log = logging.getLogger(__name__)
 
 # The kind taxonomy — chosen to map 1:1 onto MDA's export fields
 # (tool→tools/, skill→skills/, mcp→connectors/, middleware→middleware/,
@@ -166,11 +169,25 @@ class CapabilityResolver:
         declared = build_declared_tools(_org_path(org) / "sandbox", self._exec_client)
         # Dynamic (level c) tools — opt-in via ``sandbox.dynamic_tools: true``.
         # Byte-identical ([]) for orgs that do not opt in.
-        dynamic = (
-            build_dynamic_tools(_org_path(org) / "lib", self._exec_client)
-            if load_dynamic_tools_enabled(org)
-            else []
-        )
+        lib_dir = _org_path(org) / "lib"
+        if load_dynamic_tools_enabled(org):
+            dynamic = build_dynamic_tools(lib_dir, self._exec_client)
+        else:
+            dynamic = []
+            # No silent gap: an org may ship ``lib/*.py`` helper modules
+            # (promoted dynamic tools, host-authored helpers) which are ONLY
+            # callable through the ``pux_dyn_*`` surface — gated on the opt-in
+            # flag. With it off those modules are INERT. Surface that rather
+            # than let an operator wonder why a ``pux_dyn_call_function`` 404s.
+            modules = sorted(lib_dir.glob("*.py")) if lib_dir.is_dir() else []
+            if modules:
+                _log.warning(
+                    "%s: lib/ has %d Python module(s) but `sandbox.dynamic_tools` "
+                    "is off — they are inert (not callable). Set "
+                    "`sandbox.dynamic_tools: true` in policy.yaml to mount the "
+                    "dynamic + promoted tooling surface.",
+                    org, len(modules),
+                )
         skill_roots = supervisor_skills_roots(org)
         specialists_ = list(specialists)
         return ResolvedCapabilities(
