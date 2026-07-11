@@ -390,7 +390,7 @@ def _resolve_shared_sandbox(
 
     # ``host_setup`` hooks (``helper_script``) AND ``jobs`` (``script``) both
     # reference shared sandbox files. ``jobs`` is the newer mechanism
-    # (sandbox/policy.py JobSpec) and was missed here: dev-bot/general's
+    # (sandbox/policy.py JobSpec) and was missed here: coder/general's
     # ``warmup_browser.py`` silently dropped out of the archive, so the exported
     # org's pre-run job FileNotFound'd at serve time. Schema source-of-truth is
     # ``policy_mod.host_setup_hooks`` / ``job_specs`` (sandbox/policy.py); we
@@ -461,23 +461,34 @@ def _resolve_shared_sandbox(
 
 
 def _resolve_tool_servers(org: str) -> dict[str, Path]:
-    """Shared tool_servers.yaml if the org's policy declares tool_servers."""
+    """Shared tool_servers.yaml if the org declares MCP capabilities.
+
+    Post CU-4: the declaration site moved from ``policy.yaml``'s removed
+    ``tool_servers:`` key to ``org.yaml``'s ``capabilities:`` (kind: mcp).
+    This function follows the new declaration site."""
     files: dict[str, Path] = {}
     org_dir = _org_path(org)
-    policy_path = org_dir / "policy.yaml"
-    if not policy_path.is_file():
+    org_yaml_path = org_dir / "org.yaml"
+    if not org_yaml_path.is_file():
         return files
 
     try:
-        policy = yaml.safe_load(policy_path.read_text()) or {}
+        org_cfg = yaml.safe_load(org_yaml_path.read_text()) or {}
     except yaml.YAMLError:
         return files
 
-    if not isinstance(policy, dict):
+    if not isinstance(org_cfg, dict):
         return files
 
-    tool_servers = policy.get("tool_servers")
-    if not tool_servers:
+    capabilities = org_cfg.get("capabilities")
+    if not capabilities:
+        return files
+
+    has_mcp = any(
+        isinstance(c, dict) and c.get("kind") == "mcp"
+        for c in capabilities
+    )
+    if not has_mcp:
         return files
 
     ts_path = _orgs_dir() / "_shared" / "tool_servers.yaml"
