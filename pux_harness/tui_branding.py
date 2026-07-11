@@ -63,17 +63,23 @@ def get_pux_banner(unicode_mode: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 ORG_BRANDING: dict[str, dict[str, str]] = {
-    "dev-bot": {
+    "coder": {
         "subheader": "Engineering mode. What are we building?",
     },
     "deep-research-engine": {
         "subheader": "Research mode. What should I investigate?",
+    },
+    "fs-explorer": {
+        "subheader": "Explorer mode. Where are we navigating?",
     },
     "game-studio": {
         "subheader": "Studio mode. What's the creative brief?",
     },
     "invest": {
         "subheader": "Trading mode. What's the market signal?",
+    },
+    "orchestrator": {
+        "subheader": "Orchestration mode. What's the objective?",
     },
     "social-media-pipeline": {
         "subheader": "Content mode. What are we publishing?",
@@ -86,6 +92,9 @@ ORG_BRANDING: dict[str, dict[str, str]] = {
     },
     "video-production": {
         "subheader": "Production mode. What are we rendering?",
+    },
+    "web-search": {
+        "subheader": "Search mode. What should I look up?",
     },
 }
 
