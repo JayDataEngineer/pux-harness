@@ -95,7 +95,7 @@ DEFAULT_NETWORK = "shared-infra"
 DEFAULT_POLICIES_DIR = "/etc/openshell/policies"
 DEFAULT_POLICY = "developer"
 DEFAULT_SANDBOX_ID = "mcp-default"
-DEFAULT_NETWORK_ALLOW = "github.com,api.anthropic.com,api.openai.com,api.openrouter.com"
+DEFAULT_NETWORK_ALLOW = "github.com,api.anthropic.com,api.openai.com,api.openrouter.com,api.z.ai,opencode.ai,pypi.org,files.pythonhosted.org"
 
 DEFAULT_MEMORY_MB = 2048
 DEFAULT_CPU_CORES = 2.0
