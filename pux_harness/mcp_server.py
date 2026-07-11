@@ -275,45 +275,29 @@ def _find_org_for_session(session_id: str) -> OrgConnection | None:
 # MCP Tools — subagent management (pure ACP)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@MCP.tool()
-async def list_orgs() -> str:
-    """List available subagent orgs (specialist agents) you can delegate to.
+# Build org + model lists at load time so they're baked into tool descriptions.
+# The LLM reads the description on connect (ListToolsRequest) and immediately
+# knows what orgs/models exist — no separate discovery call needed. Same pattern
+# as Pux's `task` tool (subagents.py: TASK_TOOL_DESCRIPTION.format(available_agents=...)).
+_ORGS = sorted(discover_orgs())
+_MODELS = available_model_ids()
 
-    Each org is a specialist subagent: coder, deep-research-engine,
-    twitter-agent, etc. Start a session with new_session(org).
-    """
-    orgs = sorted(discover_orgs())
-    lines = [f"**{len(orgs)} worker orgs available:**"]
-    for o in orgs:
-        lines.append(f"- `{o}`")
-    return "\n".join(lines)
+_ORG_LINES = "\n".join(f"  - `{o}`" for o in _ORGS)
+_MODEL_LINES = "\n".join(f"  - `{m}`" for m in _MODELS)
 
-
-@MCP.tool()
-async def list_models() -> str:
-    """List available models the subagents can use.
-
-    Pass a model name to new_session(org, model) or set_model(session_id, model).
-    """
-    models = available_model_ids()
-    lines = [f"**{len(models)} models available:**"]
-    for m in models:
-        lines.append(f"- `{m}`")
-    return "\n".join(lines)
+_NEW_SESSION_DESC = (
+    "Start a new subagent session — creates an ACP session on an org.\n\n"
+    "Available orgs:\n"
+    f"{_ORG_LINES}\n\n"
+    "Args:\n"
+    "  org: One of the orgs listed above. Default: 'general'.\n"
+    f"  model: Optional override. Available models:\n{_MODEL_LINES}\n\n"
+    "Returns the session_id. Use prompt_subagent() to delegate tasks."
+)
 
 
-@MCP.tool()
+@MCP.tool(description=_NEW_SESSION_DESC)
 async def new_session(org: str = "general", model: str | None = None) -> str:
-    """Start a new subagent session — creates an ACP session on an org.
-
-    Args:
-        org: Subagent org to delegate to (e.g. 'coder', 'general',
-             'deep-research-engine'). Use list_orgs() for all options.
-        model: Optional model override (e.g. 'glm-5.2'). See list_models().
-
-    Returns:
-        The session_id for the new subagent. Use prompt_subagent() to delegate.
-    """
     known = discover_orgs()
     if org not in known:
         return f"Error: unknown org '{org}'. Available: {', '.join(sorted(known))}"
@@ -448,17 +432,19 @@ async def cancel_session(session_id: str) -> str:
         return f"Error: {exc}"
 
 
-@MCP.tool()
+_SET_MODEL_DESC = (
+    "Change the model on a subagent session.\n\n"
+    "Available models:\n"
+    f"{_MODEL_LINES}\n\n"
+    "Args:\n"
+    "  session_id: The subagent session.\n"
+    "  model: One of the models listed above.\n\n"
+    "Returns confirmation of model change."
+)
+
+
+@MCP.tool(description=_SET_MODEL_DESC)
 async def set_model(session_id: str, model: str) -> str:
-    """Change the model on a subagent session.
-
-    Args:
-        session_id: The subagent session.
-        model: Model to use (e.g. 'glm-5.2'). See list_models().
-
-    Returns:
-        Confirmation of model change.
-    """
     oc = _find_org_for_session(session_id)
     if oc is None:
         return f"Error: no active connection for session '{session_id}'."
