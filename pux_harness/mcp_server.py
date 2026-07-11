@@ -65,6 +65,9 @@ class SubagentClient:
     def messages(self, session_id: str) -> list[str]:
         return self._buffers.get(session_id, {}).get("messages", [])
 
+    def thoughts(self, session_id: str) -> list[str]:
+        return self._buffers.get(session_id, {}).get("thoughts", [])
+
     @staticmethod
     def _text(content: Any) -> str:
         return getattr(content, "text", "") or ""
@@ -194,7 +197,7 @@ class OrgConnection:
                 await self._set_model(sid, model)
             return sid
 
-    async def prompt(self, session_id: str, message: str) -> tuple[str, str]:
+    async def prompt(self, session_id: str, message: str) -> tuple[str, str, str]:
         async with self._lock:
             await self.ensure()
             self.client.reset(session_id)
@@ -204,7 +207,8 @@ class OrgConnection:
             )
             msgs = self.client.messages(session_id)
             text = "\n".join(msgs) if msgs else ""
-            return text, resp.stop_reason
+            thoughts = "\n".join(self.client.thoughts(session_id))
+            return text, thoughts, resp.stop_reason
 
     async def list_sessions_raw(self) -> list[dict]:
         async with self._lock:
@@ -339,12 +343,14 @@ async def prompt(session_id: str, message: str) -> str:
             f"Create one with new_session(org)."
         )
     try:
-        text, stop = await oc.prompt(session_id, message)
+        text, thoughts, stop = await oc.prompt(session_id, message)
         parts = []
         if text:
             parts.append(text)
         else:
             parts.append("(no response)")
+        if thoughts:
+            parts.append(f"\n<thinking>\n{thoughts}\n</thinking>")
         parts.append(f"\n*[{stop}]*")
         if stop == "end_turn":
             parts.append(
