@@ -24,7 +24,7 @@ no ``importlib``. Tool + skills resolution stays CENTRAL (here, via
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Container, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Container, Sequence, TYPE_CHECKING
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
@@ -478,8 +478,8 @@ def _agent_profile_from_spec(spec: dict[str, Any]) -> HarnessProfileConfig | Non
 # ``_HARNESS_PROFILES`` registry (two orgs on one model would merge-collide; the
 # long-lived server builds many orgs per process; and there is no
 # ``unregister``). So without an explicit spec the auto-add fires for EVERY pux
-# org — including dev-bot, the Claude-Code-equivalent coding org whose roster
-# rule (``dev-bot-no-general-subagent``) checks ``org.yaml`` and so NEVER sees
+# org — including coder, the Claude-Code-equivalent coding org whose roster
+# rule (``coder-no-general-subagent``) checks ``org.yaml`` and so NEVER sees
 # the auto-added slot.
 #
 # The fix honors the NATIVE field (no parallel grammar): when an org's
@@ -584,6 +584,7 @@ def load_subagents(
     subagent_middleware: list[AgentMiddleware],
     retrieval_tools: list[BaseTool],
     mcp_tools: Sequence[BaseTool] = (),
+    build_subagent_middleware: Callable[[list[str]], list[AgentMiddleware]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build deepagents SubAgent dicts for ``org``'s specialists.
 
@@ -602,6 +603,13 @@ def load_subagents(
     - ``retrieval_tools``: ``ctx_recall``/``ctx_search``, appended to each
       specialist's resolved whitelist AFTER profile filtering (so an org's
       ``excluded_tools`` can never strip retrieval).
+    - ``build_subagent_middleware``: a per-subagent resolver (built by
+      ``stack.make_subagent_middleware_builder``) that, when a subagent's
+      frontmatter carries ``middleware: [name, ...]``, resolves the org's
+      subagent baseline PLUS those per-agent names into a fresh, validated,
+      registry-ordered list for THAT subagent only. ``None`` (a direct/test
+      caller that doesn't need per-agent middleware) leaves the shared
+      ``subagent_middleware`` on every subagent — the parity path.
 
     ``profile`` (optional ``HarnessProfileConfig`` from ``orgs/<org>/
     profile.yaml) applies the ORG-WIDE overrides to EACH
@@ -657,6 +665,25 @@ def load_subagents(
             mcp_tools=mcp_tools,
             declared_servers=declared_servers,
         )
+        # Per-subagent middleware: a frontmatter ``middleware: [name, ...]``
+        # mounts those REGISTERED middleware on THIS subagent only (e.g.
+        # ``audit`` on a read-only investigator). The resolver (from
+        # ``stack.make_subagent_middleware_builder``) re-resolves the org's
+        # subagent baseline + the per-agent names, validated + registry-ordered,
+        # so ``audit`` lands outermost. A bare string is accepted (one name);
+        # ``None`` frontmatter keeps the shared list.
+        extra_mw = spec.get("middleware")
+        if extra_mw:
+            if build_subagent_middleware is None:
+                raise ValueError(
+                    f"{org}/{slug}: agent frontmatter declares `middleware:` "
+                    f"{extra_mw!r} but no per-subagent resolver was supplied "
+                    f"(the runtime factory always supplies one; a direct/test "
+                    f"caller that arms per-agent middleware must pass "
+                    f"build_subagent_middleware=...)."
+                )
+            mw_names = [extra_mw] if isinstance(extra_mw, str) else list(extra_mw)
+            sub["middleware"] = build_subagent_middleware(mw_names)
         # Per-agent overrides from the spec's OWN frontmatter.
         agent_cfg = _agent_profile_from_spec(spec)
         # Subagent prompt = its OWN body + the org-wide suffix + its own

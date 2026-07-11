@@ -15,7 +15,7 @@ nuclear-replace is GONE (a permanent contract failure — see
 
 **The supervisor/subagent boundary (load-bearing).** The two registries are
 DISJOINT: ``SUBAGENT_PROMPT_PARTS`` contains ``agents_md_core`` / ``harness_addendum``
-/ ``dynamic_dispatch_suffix`` NOWHERE. A subagent never sees the root ``AGENTS.md``,
+/ ``dynamic_dispatch_suffix`` NOWHERE. A subagent never sees the base-org overlay,
 the orchestrator pattern, the harness addendum, or the dynamic-dispatch notice —
 only its OWN specialization body + optional suffixes. (Verified as today's behavior;
 this module makes it structural.)
@@ -75,7 +75,7 @@ class PromptCtx:
     """
 
     # --- supervisor ---
-    agents_md_base: str = ""  # root AGENTS.md + org overlay (from orgs.build_system_prompt)
+    agents_md_base: str = ""  # chain-inherited org overlay (base org `general` + own; from orgs.build_system_prompt)
     system_prompt_suffix: str | None = None  # org-wide suffix (supervisor + subagent)
     ask_user_active: bool = False
     interpreter_mounted: bool = False
@@ -225,8 +225,8 @@ SUPERVISOR_PROMPT_PARTS: tuple[PromptPartSpec, ...] = (
 
 # --- SUBAGENT registry (a delegated specialist's prompt) ---------------------
 # Order == output order. NO supervisor content: a subagent gets its OWN body +
-# the org-wide suffix + its own per-agent suffix — never the root AGENTS.md, the
-# orchestrator pattern, the harness addendum, or the dynamic-dispatch notice.
+# the org-wide suffix + its own per-agent suffix — never the base org overlay,
+# the orchestrator pattern, the harness addendum, or the dynamic-dispatch notice.
 # (The user's hard rule: subagents are SPECIALIZED for independent tasks.)
 SUBAGENT_PROMPT_PARTS: tuple[PromptPartSpec, ...] = (
     PromptPartSpec(

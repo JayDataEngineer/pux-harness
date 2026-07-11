@@ -21,12 +21,11 @@ from pux_harness.sandbox.tools._shared import PUX_PREFIX, SKILL_FILE, _result, _
 def _parse_skill(raw: str) -> tuple[str, str]:
     """Pull (name, description) from SKILL.md frontmatter."""
     name, desc = "", ""
-    body = raw
     if raw.startswith("---"):
         parts = raw.split("---", 2)
         if len(parts) >= 3:
             fm = parts[1]
-            body = parts[2]
+            parts[2]
             for line in fm.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or ":" not in line:

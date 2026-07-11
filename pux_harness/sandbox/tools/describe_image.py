@@ -66,7 +66,7 @@ def _describe_image_tool(
                 })
             except Exception as exc:
                 primary_error = str(exc)
-        pe = {"primary_error": _tail(primary_error, 300)} if primary_error else {}
+        {"primary_error": _tail(primary_error, 300)} if primary_error else {}
 
         return _result(_onnx_describe(
             exec_client, image_path=image_path, image_url=image_url,

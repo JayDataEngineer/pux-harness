@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
 from pux_harness.sandbox.policy import Policy, job_specs

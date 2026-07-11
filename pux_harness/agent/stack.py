@@ -80,6 +80,7 @@ from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
     _build_general_purpose_sub,
     _org_path,
+    _orgs_dir,
     build_system_prompt,
     load_subagents,
 )
@@ -101,10 +102,13 @@ from pux_harness.context.browser_vision import (
 from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
 from pux_harness.context.prepare_warmup import PrepareWarmupMiddleware
+from pux_harness.context.prompt_capture import PromptCaptureMiddleware
 from pux_harness.context.session_guide import SessionGuideMiddleware
 from pux_harness.context.web_router import WebRouterMiddleware
 from pux_harness.agent.capabilities import CapabilityResolver
+from pux_harness.sandbox.policy import NoPolicy, load as _load_policy, resolve_tool_allowlist as _resolve_tool_allowlist
 from pux_harness.sandbox.tools import build_grader_tools
+from pux_harness.sandbox.tools._shared import PUX_PREFIX
 from pux_harness.sandbox.tools.declared import (
     build_script_redirects,
     load_declared_specs,
@@ -281,6 +285,17 @@ def _build_session_guide(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     return SessionGuideMiddleware()
 
 
+def _build_prompt_capture(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
+    """PromptCaptureMiddleware — the UserPromptSubmit + Stop equivalents (see
+    ``context/prompt_capture.py``). Captures ``HumanMessage`` prompts +
+    final ``AIMessage`` turns into the shared ``EventStore`` so they survive
+    compaction and are reachable via ``ctx_search``. Supervisor-only (subagents
+    don't receive user prompts directly; their inputs are task strings from the
+    orchestrator, already captured as ``task_started`` events by the
+    orchestrator's own tool-call capture)."""
+    return PromptCaptureMiddleware()
+
+
 def _build_prepare(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     """PrepareWarmupMiddleware — the serve-lane owner of the ``prepare()`` seam.
 
@@ -319,8 +334,13 @@ def _build_context(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
     on the SUPERVISOR tier only — the subagent tree reuses the supervisor's
     ctx_tools (threaded through ``load_subagents(retrieval_tools=)``), one
     shared store, two scope-local instances. Byte-identical to the pre-factory
-    build (which called ``build_context_layer`` once per scope)."""
-    mw, tools = build_context_layer()
+    build (which called ``build_context_layer`` once per scope).
+
+    ``exec_client`` is threaded in so the 4 exec-dependent tools
+    (ctx_execute / ctx_execute_file / ctx_batch_execute / ctx_fetch_and_index)
+    are built with the same Docker bridge the sandbox tools use — parity with
+    context-mode's sandbox + fetch surface."""
+    mw, tools = build_context_layer(exec_client=ctx.exec_client)
     if scope is Scope.SUPERVISOR:
         ctx.emitted_tools_supervisor.extend(tools)
     return mw
@@ -564,7 +584,18 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     MiddlewareSpec("context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context),
     MiddlewareSpec("routing", frozenset({Scope.SUPERVISOR}), _build_routing),
     MiddlewareSpec("session_guide", frozenset({Scope.SUPERVISOR}), _build_session_guide),
-    MiddlewareSpec("rubric", frozenset({Scope.SUPERVISOR}), _build_rubric),
+    # prompt_capture mounts AFTER session_guide so its before_model/after_agent
+    # hooks fire inside the session-guide wrap (a snapshot built on compaction
+    # sees the latest user_message + turn_end). Supervisor-only.
+    MiddlewareSpec("prompt_capture", frozenset({Scope.SUPERVISOR}), _build_prompt_capture),
+    # ``rubric`` is dual-scope: a worker (e.g. coder's code-worker) can opt into
+    # the same non-skippable grader gate the supervisor has via frontmatter
+    # ``middleware: [rubric]`` — the grader runs in the worker's own graph with
+    # the ``pux_grader_*`` tools, so a dumb editor gets tool-enforced
+    # verification instead of a prompt plea. Construction stays gate-driven
+    # (``_build_rubric`` -> None without an armed ``rubric_gate``), so the scope
+    # only LIFTS the opt-in — read-only agents still pay nothing by default.
+    MiddlewareSpec("rubric", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_rubric),
     MiddlewareSpec("model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry),
     MiddlewareSpec("tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry),
     MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
@@ -604,7 +635,7 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
 # (default-on, removable via ``middleware.supervisor.remove``) — the user's
 # "selectively remove/add middleware" request, applied uniformly to the
 # formerly-non-toggleable layers too.
-DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "model_retry", "browser_vision", "prepare"]
+DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "prompt_capture", "model_retry", "browser_vision", "prepare"]
 
 # Subagents get the context layer + browser_vision by default; routing /
 # session_guide / rubric are supervisor concerns. An org MAY add a subagent
@@ -712,6 +743,62 @@ def _resolve_toggles(
     return out
 
 
+def make_subagent_middleware_builder(
+    ctx: StackCtx, sub_add: list[str], sub_remove: set[str],
+) -> Callable[[list[str]], list[AgentMiddleware]]:
+    """A per-subagent middleware resolver for ``load_subagents``.
+
+    A subagent's frontmatter may carry ``middleware: [name, ...]`` — names of
+    REGISTERED middleware to mount on THAT subagent only (e.g. ``audit`` on a
+    read-only investigator). The resolver applies the org's subagent baseline
+    (``DEFAULT_SUBAGENT`` + the org's ``middleware.subagent.add`` − ``remove``)
+    and then the per-agent names as ADDITIONAL adds (add wins over remove),
+    reusing ``_resolve_toggles`` so the merged set is validated (an unknown name
+    or a supervisor-only name on a subagent fails loud) AND emitted in registry
+    order (``audit`` outermost, ``browser_vision`` innermost — the canonical
+    mount positions, not insertion order). See ``load_subagents`` (``orgs.py``)
+    + the ``agent-middleware-scope`` contract rule.
+
+    Built once per ``build_stack`` (closes over the single ``StackCtx``); the
+    no-extra call ``builder([])`` is byte-identical to the pre-per-agent shared
+    list, so subagents that declare no ``middleware:`` are unchanged. A
+    subagent that DOES declare ``middleware:`` gets its OWN freshly-resolved
+    list (a new ``context``/``browser_vision`` instance for that agent only) —
+    the shared EventStore is passed by reference, so separate instances still
+    write to the one store."""
+    def build(extra: list[str]) -> list[AgentMiddleware]:
+        return _resolve_toggles(
+            ctx, Scope.SUBAGENT, DEFAULT_SUBAGENT,
+            list(sub_add) + list(extra), sub_remove,
+        )
+
+    return build
+
+
+def _scope_supervisor_tools(
+    tools: list[BaseTool], allowed: frozenset[str] | None,
+) -> list[BaseTool]:
+    """Drop specialist tools the org's ``tool_surface.groups`` policy excluded
+    from the SUPERVISOR's own surface. ``allowed`` is the set of permitted
+    specialist slugs (``None`` => keep everything, byte-identical to today).
+
+    Only ``pux_sandbox_*`` specialists are scoped — native fs/shell (no prefix,
+    injected by ``FilesystemMiddleware``), MCP tools (``mcp__``), the context
+    retrieval tools, ``ask_user`` (appended after), and every SUBAGENT (which
+    resolves its own ``tools:`` allowlist against the FULL ``tools_surface``)
+    are untouched. So a coding org can keep browser/desktop out of the CTO prompt
+    while still delegating to a browser subagent that carries them."""
+    if not allowed:
+        return tools
+    out: list[BaseTool] = []
+    for t in tools:
+        name = getattr(t, "name", "")
+        if name.startswith(PUX_PREFIX) and name[len(PUX_PREFIX):] not in allowed:
+            continue
+        out.append(t)
+    return out
+
+
 def _apply_rules(facts: RuntimeFacts, scope: Scope, names: list[str]) -> list[str]:
     """Runtime-facts rules seam for the MIDDLEWARE list. Identity today — kept as
     an explicit, tested function so the policy layer is legible + extensible
@@ -794,9 +881,13 @@ def build_stack(
     supervisor_middleware: list[AgentMiddleware] = _resolve_toggles(
         ctx, Scope.SUPERVISOR, DEFAULT_SUPERVISOR, sup_add, sup_remove,
     )
-    subagent_middleware: list[AgentMiddleware] = _resolve_toggles(
-        ctx, Scope.SUBAGENT, DEFAULT_SUBAGENT, sub_add, sub_remove,
-    )
+    build_subagent_mw = make_subagent_middleware_builder(ctx, sub_add, sub_remove)
+    # The shared subagent baseline (no per-agent extras) — byte-identical to the
+    # pre-per-agent single list. ``load_subagents`` calls ``build_subagent_mw``
+    # again with a subagent's frontmatter ``middleware:`` names for per-agent
+    # middleware (e.g. ``audit`` on one investigator); every other subagent
+    # reuses this shared list.
+    subagent_middleware: list[AgentMiddleware] = build_subagent_mw([])
     ctx_tools = list(ctx.emitted_tools_supervisor)
 
     # The capability facade — ONE front-door for the org-local tool + skill
@@ -839,6 +930,21 @@ def build_stack(
             make_ask_user_tool(facts.transport),
         ]
 
+    # Per-org SUPERVISOR tool-surface scoping (``policy.yaml``
+    # ``tool_surface.groups``). An org without a policy or without a
+    # ``tool_surface`` block keeps the FULL specialist surface (byte-identical to
+    # today). A coding org sets ``groups: [code, skills, media]`` to drop the
+    # browser/desktop specialists from the CTO prompt — the big prompt-bloat
+    # win — while subagents still resolve their own tools against the full
+    # surface. ``NoPolicy`` (no policy.yaml) is the "all tools" path.
+    try:
+        _pol = _load_policy(org, _orgs_dir().parent)
+    except NoPolicy:
+        _pol = None
+    supervisor_tools = _scope_supervisor_tools(
+        supervisor_tools, _resolve_tool_allowlist(_pol)
+    )
+
     # Prompt: constructed from an ORDERED registry of parts (``prompt_parts``).
     # ``base_system_prompt`` (the old global-REPLACE that wiped root + overlay +
     # addendum + the orchestrator pattern) is GONE — a permanent contract failure
@@ -875,6 +981,7 @@ def build_stack(
         subagent_middleware=subagent_middleware,
         retrieval_tools=ctx_tools,
         mcp_tools=caps.mcp,
+        build_subagent_middleware=build_subagent_mw,
     )
 
     # Own the general-purpose subagent. deepagents auto-adds a HEAVY
@@ -884,8 +991,8 @@ def build_stack(
     # the model-keyed ``_HARNESS_PROFILES`` registry (two orgs on one model
     # would merge-collide; the long-lived server builds many orgs per process;
     # there is no ``unregister``), so without an explicit spec the auto-add
-    # fires for EVERY org — even dev-bot, whose roster rule
-    # (``dev-bot-no-general-subagent``) reads ``org.yaml`` and so NEVER sees the
+    # fires for EVERY org — even coder, whose roster rule
+    # (``coder-no-general-subagent``) reads ``org.yaml`` and so NEVER sees the
     # auto-added slot.
     #
     # Honor the NATIVE field (no parallel grammar): when the org's profile

@@ -725,16 +725,26 @@ def _browser_drag_tool(exec_client: DockerExecClient) -> StructuredTool:
         if not has_tgt:
             return _result({"success": False, "error": "drag needs a target: to_index/to_selector, to_x/to_y, or dx/dy"})
         body: dict = {"strategy": strategy, "steps": steps}
-        if from_index is not None: body["from_index"] = from_index
-        if from_selector: body["from_selector"] = from_selector
-        if from_x is not None: body["from_x"] = from_x
-        if from_y is not None: body["from_y"] = from_y
-        if to_index is not None: body["to_index"] = to_index
-        if to_selector: body["to_selector"] = to_selector
-        if to_x is not None: body["to_x"] = to_x
-        if to_y is not None: body["to_y"] = to_y
-        if dx is not None: body["dx"] = dx
-        if dy is not None: body["dy"] = dy
+        if from_index is not None:
+            body["from_index"] = from_index
+        if from_selector:
+            body["from_selector"] = from_selector
+        if from_x is not None:
+            body["from_x"] = from_x
+        if from_y is not None:
+            body["from_y"] = from_y
+        if to_index is not None:
+            body["to_index"] = to_index
+        if to_selector:
+            body["to_selector"] = to_selector
+        if to_x is not None:
+            body["to_x"] = to_x
+        if to_y is not None:
+            body["to_y"] = to_y
+        if dx is not None:
+            body["dx"] = dx
+        if dy is not None:
+            body["dy"] = dy
         return _sb_post(exec_client, "/drag", body)
 
     return StructuredTool(
@@ -770,10 +780,14 @@ def _browser_hover_tool(exec_client: DockerExecClient) -> StructuredTool:
         if not has_el and (x is None or y is None):
             return _result({"success": False, "error": "hover needs index/selector OR x,y"})
         body: dict = {}
-        if index is not None: body["index"] = index
-        if selector: body["selector"] = selector
-        if x is not None: body["x"] = x
-        if y is not None: body["y"] = y
+        if index is not None:
+            body["index"] = index
+        if selector:
+            body["selector"] = selector
+        if x is not None:
+            body["x"] = x
+        if y is not None:
+            body["y"] = y
         return _sb_post(exec_client, "/hover", body)
 
     return StructuredTool(
@@ -807,8 +821,10 @@ def _browser_press_tool(exec_client: DockerExecClient) -> StructuredTool:
         if not keys:
             return _result({"success": False, "error": "keys is required"})
         body: dict = {"keys": keys}
-        if index is not None: body["index"] = index
-        if selector: body["selector"] = selector
+        if index is not None:
+            body["index"] = index
+        if selector:
+            body["selector"] = selector
         return _sb_post(exec_client, "/press", body)
 
     return StructuredTool(
@@ -851,10 +867,14 @@ def _browser_click_at_tool(exec_client: DockerExecClient) -> StructuredTool:
         if not has_target:
             return _result({"success": False, "error": "click_at needs x,y OR index/selector"})
         body: dict = {"button": button, "double": double, "right": right}
-        if x is not None: body["x"] = x
-        if y is not None: body["y"] = y
-        if index is not None: body["index"] = index
-        if selector: body["selector"] = selector
+        if x is not None:
+            body["x"] = x
+        if y is not None:
+            body["y"] = y
+        if index is not None:
+            body["index"] = index
+        if selector:
+            body["selector"] = selector
         if trusted:
             body["trusted"] = True
         return _sb_post(exec_client, "/click_at", body)
@@ -887,8 +907,10 @@ def _browser_scroll_into_view_tool(exec_client: DockerExecClient) -> StructuredT
         if index is None and not selector:
             return _result({"success": False, "error": "either index or selector is required"})
         body: dict = {}
-        if index is not None: body["index"] = index
-        if selector: body["selector"] = selector
+        if index is not None:
+            body["index"] = index
+        if selector:
+            body["selector"] = selector
         return _sb_post(exec_client, "/scroll_into_view", body)
 
     return StructuredTool(
@@ -949,10 +971,14 @@ def _browser_iframe_tool(exec_client: DockerExecClient) -> StructuredTool:
     def _run(action: str = "list", index: int | None = None, selector: str | None = None,
              inner_selector: str | None = None, code: str | None = None) -> str:
         body: dict = {"action": action}
-        if index is not None: body["index"] = index
-        if selector: body["selector"] = selector
-        if inner_selector: body["inner_selector"] = inner_selector
-        if code: body["code"] = code
+        if index is not None:
+            body["index"] = index
+        if selector:
+            body["selector"] = selector
+        if inner_selector:
+            body["inner_selector"] = inner_selector
+        if code:
+            body["code"] = code
         return _sb_post(exec_client, "/iframe", body)
 
     return StructuredTool(

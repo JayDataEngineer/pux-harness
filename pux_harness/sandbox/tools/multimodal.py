@@ -198,7 +198,7 @@ def _multimodal_mega_tool(
             })
 
         if media_url and not media_path:
-            dl = (f"curl -s -L --max-time 60 -o /tmp/pux_mm_video "
+            dl = ("curl -s -L --max-time 60 -o /tmp/pux_mm_video "
                   + shlex.quote(media_url))
             out, exit_code = exec_client.exec(dl, timeout=_IMAGE_FETCH_TIMEOUT)
             if exit_code != 0:

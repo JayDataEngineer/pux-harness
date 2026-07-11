@@ -122,7 +122,7 @@ _REQUIRED_AGENT_KEYS: frozenset[str] = frozenset({
 # ``build`` is a sub-key under ``sandbox``, NOT a top-level section.
 KNOWN_POLICY_SECTIONS: frozenset[str] = frozenset({
     "workspace", "egress", "credentials", "sandbox", "browser", "host_setup",
-    "jobs", "tool_servers", "protocols",
+    "jobs", "tool_servers", "protocols", "tool_surface",
 })
 
 # Agent-Skills spec: a skill dir name (and its ``SKILL.md`` ``name``) must be
@@ -386,37 +386,37 @@ def check_org(name: str) -> list[Violation]:
         except Exception:
             roster = slugs
 
-    # Permanent tripwire (no-legacy-left-behind): dev-bot is the
+    # Permanent tripwire (no-legacy-left-behind): coder is the
     # Claude-Code-equivalent CODING org — the CTO does all the thinking and
-    # delegates only narrow execution (code-worker) / recon (dev-bot-explorer)
+    # delegates only narrow execution (code-worker) / recon (coder-explorer)
     # / e2e verification (web-agent). A generic catch-all subagent
     # (``general`` / ``general-purpose`` / the shared ``researcher``) would let
     # the CTO delegate the DESIGN itself, which is exactly the anti-pattern the
     # roster exists to prevent. A future re-add is a HARD contract failure, not
     # a silent drift.
-    if name == "dev-bot":
+    if name == "coder":
         forbidden = {"general", "general-purpose", "researcher"}
         bad = sorted(set(slugs) & forbidden)
         if bad:
             v.append(Violation(
-                "error", "dev-bot-no-general-subagent",
-                f"dev-bot: roster must not include a generic subagent "
+                "error", "coder-no-general-subagent",
+                f"coder: roster must not include a generic subagent "
                 f"({bad}); the CTO does the thinking — delegate only to "
-                f"dev-bot-explorer / code-worker / web-agent"))
+                f"coder-explorer / code-worker / web-agent"))
 
     # Defense in depth via a SECOND code path. The roster rule above
-    # (``dev-bot-no-general-subagent``) reads org.yaml, so it NEVER sees the
+    # (``coder-no-general-subagent``) reads org.yaml, so it NEVER sees the
     # ``general-purpose`` slot deepagents auto-adds to EVERY graph
     # (deepagents/graph.py:716-717) when no inline spec owns that name. This
-    # sibling rule reads profile.yaml and asserts dev-bot OPTS OUT of that
+    # sibling rule reads profile.yaml and asserts coder OPTS OUT of that
     # auto-add via the NATIVE ``general_purpose_subagent.enabled: false`` field
     # — which the harness turns into a neutered spec (``orgs.
     # _build_general_purpose_sub``, Safeguard S1). Two layers, two files, one
-    # intent: dev-bot must not ship a generic catch-all worker. A re-enable OR a
+    # intent: coder must not ship a generic catch-all worker. A re-enable OR a
     # dropped field is a HARD contract failure, not a silent drift back to the
     # heavy auto-add. (Skipped on a malformed profile — the ``profile-schema``
     # rule below already reports that, no double-noise.)
-    if name == "dev-bot":
+    if name == "coder":
         gp_cfg: Any = None
         gp_ok = True
         try:
@@ -427,11 +427,11 @@ def check_org(name: str) -> list[Violation]:
             gp = gp_cfg.general_purpose_subagent if gp_cfg is not None else None
             if gp is None or gp.enabled is not False:
                 v.append(Violation(
-                    "error", "dev-bot-disables-general-purpose",
-                    "dev-bot: profile.yaml must declare "
+                    "error", "coder-disables-general-purpose",
+                    "coder: profile.yaml must declare "
                     "'general_purpose_subagent: {enabled: false}' — deepagents "
                     "otherwise auto-adds a heavy generic worker the roster rule "
-                    "(dev-bot-no-general-subagent) cannot see"))
+                    "(coder-no-general-subagent) cannot see"))
 
     # Rule 3: every slug resolves to a valid agent .md (org-local or _shared)
     # with required frontmatter keys + a non-empty body (system_prompt).
@@ -499,6 +499,10 @@ def check_org(name: str) -> list[Violation]:
         if profile_mod.load_dynamic_tools_enabled(name)
         else frozenset()
     )
+    # Per-subagent ``middleware:`` frontmatter names are validated against the
+    # SAME registry as the org-wide overrides (``stack.validate_overrides``);
+    # hoisted once for the per-agent loop below.
+    mw_by_name = {s.name: s for s in stack_mod.MIDDLEWARE_REGISTRY}
     for slug, sub in agent_subagents.items():
         for raw in _parse_list(sub.get("tools", [])):
             tool = raw.rsplit("/", 1)[-1]
@@ -516,6 +520,23 @@ def check_org(name: str) -> list[Violation]:
                                    f"not a native fs tool, a "
                                    f"pux_sandbox_* specialist, a declared "
                                    f"sandbox tool, or a pux_dyn_* dynamic tool"))
+        # Per-subagent ``middleware:`` frontmatter — each name must be a
+        # registered middleware allowed in the SUBAGENT scope. Mirrors the
+        # runtime check (``load_subagents`` → ``_resolve_toggles``) so a typo'd
+        # per-agent middleware — or a supervisor-only name (e.g. ``routing``)
+        # on a subagent — fails ``--check-contract``, not the first build.
+        for raw in _parse_list(sub.get("middleware", [])):
+            if raw not in mw_by_name:
+                v.append(Violation(
+                    "error", "agent-middleware-scope",
+                    f"{name}/{slug}: per-agent middleware {raw!r} is not "
+                    f"registered (known: {sorted(mw_by_name)})"))
+            elif stack_mod.Scope.SUBAGENT not in mw_by_name[raw].scope:
+                v.append(Violation(
+                    "error", "agent-middleware-scope",
+                    f"{name}/{slug}: per-agent middleware {raw!r} is not "
+                    f"allowed in the subagent scope (allowed: "
+                    f"{sorted(s.value for s in mw_by_name[raw].scope)})"))
 
     # The model add-on capability channels (declared sandbox tools, the
     # exec-guard, jobs, MCP tool_servers) are validated in ONE unified pass
@@ -597,7 +618,7 @@ def check_org(name: str) -> list[Violation]:
         # contract failure pointing at the replacement. ``load_profile`` /
         # ``HarnessProfileConfig.from_dict`` reject the same key at BUILD time
         # too (unknown key → ``profile-schema`` below) — two layers over one
-        # fault, mirroring the dev-bot GP defense-in-depth (Safeguard S2).
+        # fault, mirroring the coder GP defense-in-depth (Safeguard S2).
         # Scanned RAW (not via validate_profile) so the message names the fix.
         try:
             _profile_top = yaml.safe_load(profile_path.read_text())
@@ -1167,10 +1188,8 @@ def _no_legacy_memory_saver_in_runtimes() -> list[Violation]:
 
 
 # Consolidation — the 7 ``orgs.py`` functions that must be thin
-# delegates to ``pux_harness.kit.loaders``. ``load_root_prompt`` is INTENTIONALLY
-# exempt (PROJECT_ROOT-pinned root prompt, NOT the ``_orgs_dir()`` seam — see
-# its docstring). Re-implementing any of these here re-creates the verbatim
-# drift the consolidation removed.
+# delegates to ``pux_harness.kit.loaders``. Re-implementing any of these here
+# re-creates the verbatim drift the consolidation removed.
 _DELEGATED_ORGS_LOADERS: frozenset[str] = frozenset({
     "_org_path",
     "_agent_search_dirs",
@@ -1273,10 +1292,7 @@ def _no_duplicate_loaders_in_orgs() -> list[Violation]:
     ``<alias>.<method>(...)`` call, where ``<alias>`` is the local name bound to
     ``pux_harness.kit.loaders``. AST (not regex) so a docstring or comment mention
     doesn't false-trip, and a delegate that silently stopped delegating (no kit
-    call) DOES trip. ``load_root_prompt`` is exempt — it deliberately reads the
-    root AGENTS.md from ``PROJECT_ROOT`` (not the seam), so it is NOT a delegate
-    (delegating it would change ``build_system_prompt`` under a tempdir-patched
-    ``_orgs_dir``)."""
+    call) DOES trip."""
     src = Path(__file__).with_name("orgs.py")
     if not src.is_file():
         return []  # pragma: no cover - orgs.py is imported, so present

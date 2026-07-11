@@ -63,6 +63,7 @@ def build_graph(
     store: Any | None = None,
     facts: RuntimeFacts | None = None,
     mcp_tools: Sequence[BaseTool] = (),
+    base_model_override: str | None = None,
 ) -> CompiledStateGraph:
     """Compile the deepagents graph for ``org`` against ``checkpointer``.
 
@@ -95,7 +96,11 @@ def build_graph(
     # Roles: the CTO runs on `base`; describe_image runs on
     # `multimodal` (decoupled so an org can pin a vision model != the driver).
     # Both resolve through models.yaml + org profile + env, never a hardcoded id.
-    base_model = get_model(role="base", org=org)
+    # ``base_model_override`` (from the ACP model picker, via ``context.model``)
+    # re-pins the supervisor/base role to a literal id; None → the org's tier
+    # base. An explicit pin disables the tier's ``base_fallbacks`` (see
+    # ``resolve_model_id``), matching the frontmatter/org/env override stack.
+    base_model = get_model(role="base", org=org, model=base_model_override)
     specialists = build_native_specialists(
         shared_exec(), vision_model=get_model(role="multimodal", org=org), org=org,
         backend=shared_backend(),

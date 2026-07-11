@@ -18,6 +18,7 @@ own ``tools:`` overrides (narrows) the catalog entry's allowlist.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ import yaml
 
 from pux_harness.agent.orgs import _org_path, _orgs_dir
 from pux_harness.kit.capabilities_decl import org_mcp_items_from_dict
+
+_log = logging.getLogger(__name__)
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -422,7 +425,22 @@ def resolve_tool_servers(
             )
         seen.add(name)
 
-        spec = _substitute_spec(spec, env, permissive=permissive)
+        try:
+            spec = _substitute_spec(spec, env, permissive=permissive)
+        except ValueError as exc:
+            if permissive:
+                raise  # offline contract — surface every error
+            # RUNTIME per-server isolation: one spec with an unset ${VAR} or
+            # missing credential is SKIPPED (logged), not allowed to kill the
+            # whole org. The yaml catalog promises "one unset var can't brick
+            # the org" — this catch makes that promise TRUE at resolution time
+            # (McpSessionManager.open already isolates per-server AFTER
+            # resolution; this extends it to the resolution step itself).
+            _log.error(
+                "org %s: tool server %r skipped at resolution — %s",
+                org, name, exc,
+            )
+            continue
         resolved.append(spec)
 
     return resolved

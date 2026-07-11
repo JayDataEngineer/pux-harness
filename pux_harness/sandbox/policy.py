@@ -188,6 +188,20 @@ class BrowserSpec:
 
 
 @dataclass
+class ToolSurfaceSpec:
+    """``tool_surface`` — scope the SUPERVISOR's specialist tool surface by
+    capability group. ``groups`` is an ALLOWLIST of group names (``code`` /
+    ``skills`` / ``media`` / ``browser`` / ``desktop``) and/or bare specialist
+    slugs (``python``); anything not listed is dropped from the supervisor's
+    own tool list (NOT from subagents — they resolve their own ``tools:``
+    allowlist against the FULL surface). Absent/empty -> the supervisor carries
+    EVERY specialist (byte-identical to today). See ``registry.resolve_tool_allowlist``
+    for the resolution + validation semantics."""
+
+    groups: list[str] = field(default_factory=list)
+
+
+@dataclass
 class HostSetupHook:
     """One host-side prep hook. Run BEFORE ``create()`` (so before
     ``validate_env``): each captures ``helper_script``'s stdout into the env
@@ -227,6 +241,7 @@ class Policy:
     credentials: Credentials = field(default_factory=Credentials)
     sandbox: SandboxSpec = field(default_factory=SandboxSpec)
     browser: BrowserSpec = field(default_factory=BrowserSpec)
+    tool_surface: ToolSurfaceSpec = field(default_factory=ToolSurfaceSpec)
     host_setup: list[HostSetupHook] = field(default_factory=list)
     jobs: list[JobSpec] = field(default_factory=list)
     # NOTE: foreign MCP servers are declared in org.yaml ``capabilities:``
@@ -361,6 +376,15 @@ def _policy_from_dict(d: Mapping) -> Policy:
         cookies_env=str(br.get("cookies_env", "") or ""),
         proxy=str(br.get("proxy", "") or ""),
     )
+    # tool_surface: scope the supervisor's specialist tools by capability group.
+    # Absent/empty -> ToolSurfaceSpec() (all groups) -> byte-identical to today.
+    # Entries are validated by registry.resolve_tool_allowlist (raises on an
+    # unknown group/slug) so a typo fails loud at load time, not silently.
+    ts = _section("tool_surface")
+    groups_raw = ts.get("groups") or []
+    if not isinstance(groups_raw, list):
+        raise PolicyError("policy: section 'tool_surface.groups' must be a list")
+    pol.tool_surface = ToolSurfaceSpec(groups=[str(x) for x in groups_raw])
     # host_setup: a list of host-side prep hooks (run before create(), produce
     # env exports that flow through credentials/cookies unchanged). Absent or
     # empty -> no hooks (today's behavior).
@@ -687,3 +711,23 @@ def job_specs(p: Policy | None) -> list[JobSpec]:
     if p is None:
         return []
     return list(p.jobs)
+
+
+# --- tool surface (supervisor specialist scoping) --------------------------
+
+
+def resolve_tool_allowlist(p: Policy | None) -> frozenset[str] | None:
+    """The specialist slugs the org's SUPERVISOR may carry, or ``None`` for
+    "all specialists" (byte-identical to today). Driven by
+    ``p.tool_surface.groups``; delegates the real resolution + validation to
+    ``registry.resolve_tool_allowlist`` (a typo'd group/slug raises
+    ``ValueError`` there, re-raised as ``PolicyError`` so the contract checker
+    reports it cleanly). ``None`` policy or empty ``groups`` -> ``None`` (all)."""
+    if p is None or not p.tool_surface.groups:
+        return None
+    from pux_harness.sandbox.tools.registry import resolve_tool_allowlist as _resolve
+
+    try:
+        return _resolve(p.tool_surface.groups)
+    except ValueError as exc:
+        raise PolicyError(f"policy: {exc}") from exc

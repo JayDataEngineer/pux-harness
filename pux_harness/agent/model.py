@@ -118,6 +118,10 @@ _LEGACY_DEFAULT_MODEL_ENV = "PUX_MODEL"        # base role only
 _LEGACY_BASE_URL_ENV = "OPENCODE_BASE_URL"
 # The runtime tier selector (set by --tier/--fast). Falls back to default_tier.
 _TIER_ENV = "PUX_TIER"
+# Per-deployment reasoning-depth override (OpenAI `reasoning_effort`, e.g.
+# "low"/"high"/"max"). Wins over the per-id default in models.yaml so depth is
+# tunable without editing the registry. Applied to openai-kind ids only.
+_REASONING_EFFORT_ENV = "PUX_REASONING_EFFORT"
 
 
 @lru_cache(maxsize=1)
@@ -267,6 +271,23 @@ def _transient_exceptions_for(model_id: str) -> tuple[type[BaseException], ...]:
     )
 
 
+def reasoning_effort_for(model_id: str) -> str | None:
+    """The reasoning-depth knob for ``model_id``: ``PUX_REASONING_EFFORT`` (a
+    deployment override) if set, else the per-id ``reasoning_effort`` declared in
+    the ``models:`` registry, else ``None``. Threaded as OpenAI ``extra_body``
+    (``_instantiate``) so a reasoning-capable OpenAI-kind model — e.g. glm-5.2 on
+    ZAI's coding endpoint — thinks at the configured depth. ``None`` for ids that
+    don't declare it (no extra_body sent → the model's own default)."""
+    env = os.environ.get(_REASONING_EFFORT_ENV)
+    if env:
+        return env
+    caps = _models_registry().get(model_id)
+    if not isinstance(caps, dict):
+        return None
+    val = caps.get("reasoning_effort")
+    return val if isinstance(val, str) and val else None
+
+
 def _tiers() -> dict:
     return _spec()["tiers"]
 
@@ -294,6 +315,14 @@ def _tier_role(role: str, tier: str) -> str:
 
 def _models_registry() -> dict:
     return _spec().get("models") or {}
+
+
+def available_model_ids() -> list[str]:
+    """Every model id declared in ``models.yaml`` (declaration order).
+
+    Public so the ACP model picker can advertise the full set — and tests can
+    assert it — without reaching into the private ``_models_registry``."""
+    return list(_models_registry().keys())
 
 
 def _dcode_block() -> dict:
@@ -376,6 +405,19 @@ def resolve_model_id(
     if org is not None:
         org_val = _org_role_override(org, role_key)
         if org_val:
+            # @role prefix — cross-reference another role from the active tier.
+            # `base_model: "@worker"` resolves to the tier's worker_model value,
+            # decoupling the org from a literal id so a cloner's tier remaps
+            # ripple through without per-org edits. Non-recursive: the
+            # referenced role resolves directly to the tier (no re-entry).
+            if org_val.startswith("@") and len(org_val) > 1:
+                ref_role = org_val[1:]
+                if ref_role not in ROLES:
+                    raise ValueError(
+                        f"org {org} profile.yaml models.{role_key}: "
+                        f"@{ref_role} is not a known role; known: {ROLES}"
+                    )
+                return _tier_role(ref_role, active_tier())
             return org_val
     # 3. env PUX_<ROLE>_MODEL (and the legacy PUX_MODEL for the base role).
     env_val = os.environ.get(f"PUX_{role.upper()}_MODEL")
@@ -583,6 +625,12 @@ def _instantiate(
         model=model_id, base_url=base_url, api_key=api_key, timeout=180, max_retries=6,
         max_tokens=max_tokens, temperature=temperature,
     )
+    # Reasoning-depth knob (OpenAI `reasoning_effort`): honored by reasoning-
+    # capable OpenAI-kind models (e.g. glm-5.2 on ZAI's coding endpoint).
+    # Sent as OpenAI `extra_body` only when the id declares/overrides a value.
+    effort = reasoning_effort_for(model_id)
+    if effort:
+        kwargs["extra_body"] = {"reasoning_effort": effort}
     if fallback_models:
         m = _FallbackReasoningChatOpenAI(**kwargs)
         m._fallback_models = list(fallback_models)

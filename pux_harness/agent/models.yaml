@@ -11,7 +11,10 @@
 #
 # RESOLUTION ORDER for a role (highest priority first)
 #   1. subagent frontmatter `model:`   — agent-level (subagents only; a literal id)
-#   2. org profile.yaml `models:` map  — org-level role override
+#   2. org profile.yaml `models:` map  — org-level role override. Literal id OR
+#                                        @role cross-reference (e.g. `@worker`
+#                                        resolves to the tier's worker_model —
+#                                        decouples the org from a literal id).
 #   3. env PUX_<ROLE>_MODEL             — deployment-level (e.g. PUX_GRADER_MODEL)
 #   4. the ACTIVE TIER's role map below — selected by --tier/--fast (sets PUX_TIER),
 #                                         defaulting to `default_tier`
@@ -21,9 +24,14 @@
 #   an OpenAI- or Anthropic-compatible `base_url`, and the env var holding the
 #   api key. A MODEL ID is bound to a profile in the `models:` registry
 #   (`provider: <name>`); ids without an explicit profile use `default_provider`.
-#   This is how one deployment serves models from DIFFERENT vendors/protoels at
-#   once — e.g. glm-5.2 over ZAI's Anthropic-compat endpoint (where its billing
-#   balance lives) while mimo-v2.5 rides OpenCode Go's OpenAI-compat router.
+#   This is how one deployment can serve models from DIFFERENT vendors/protocols
+#   at once. (Shipped: glm-5.2/glm-5.1 ride `zai-coding` — ZAI's GLM Coding Plan
+#   OpenAI endpoint — billed against the coding subscription; the cheap ids ride
+#   `opencode-go` (OpenCode Zen Go router). Both are OpenAI-compatible, so
+#   reasoning streams uniformly as the OpenAI `delta.reasoning_content` shape that
+#   `ReasoningChatOpenAI` captures → ACP thoughts for the DEFAULT supervisor with
+#   no Anthropic extractor. `zai-anthropic` is kept as an available profile; see
+#   its comment for why the shipped deployment does NOT route glm-5.2 through it.)
 #   No code edits, no per-model hardcodes: add a profile here, tag the id, done.
 #
 # THE ROLES (the keys inside every tier)
@@ -72,6 +80,12 @@
 #   The dynamic happy path auto-mounts iff the `base` role resolves to a `pro`
 #   id (shipped: glm-5.2/glm-5.1); `middleware.supervisor.add: [interpreter]`
 #   overrides it ON per-org, `remove` OFF. Set once here — the single source.
+#   `reasoning_effort:` is the OpenAI reasoning-depth knob (e.g. low/high/max),
+#   honored by reasoning-capable OpenAI-kind models. `reasoning_effort_for(id)`
+#   reads it and `_instantiate` threads it as OpenAI `extra_body` → the model
+#   thinks at that depth. An unset/absent flag sends NO extra_body (the model's
+#   own default). `PUX_REASONING_EFFORT` overrides per-deployment. openai-kind
+#   only (it's an OpenAI extension).
 #
 # THE `dcode:` BLOCK
 #   The TUI (dcode) names our opencode endpoint `opencode-go-openai` and uses the
@@ -80,19 +94,36 @@
 
 # Named provider profiles — each a wire protocol + endpoint + key env.
 providers:
-  # OpenCode Go — OpenAI-compatible router. Serves the cheap/multimodal ids.
-  # `OPENCODE_BASE_URL` (legacy) still overrides this profile's base_url for
-  # back-compat (matched by api_key_env), so existing dev workflows keep working.
+  # OpenCode Go — OpenAI-compatible router. Serves the cheap/multimodal ids
+  # (mimo/kimi/deepseek). `OPENCODE_BASE_URL` (legacy) still overrides this
+  # profile's base_url for back-compat (matched by api_key_env), so existing dev
+  # workflows keep working.
   opencode-go:
     kind: openai
     base_url: https://opencode.ai/zen/go/v1
     api_key_env: OPENCODE_API_KEY
     max_tokens: 8192
     temperature: 0.2
-  # ZAI — Anthropic-compatible endpoint. This is where the ZAI billing balance
-  # lives (the OpenAI-compat /api/paas/v4 endpoint authenticates the same token
-  # but returns code 1113 "insufficient balance" for chat completions). glm-5.2
-  # is served here via the same ANTHROPIC_AUTH_TOKEN ~/.claude uses.
+  # ZAI — GLM Coding Plan, OpenAI-compatible endpoint. This is where the coding
+  # subscription lives (glm-5.2/glm-5.1 bill here). Verified 07-10: streams full
+  # reasoning as `delta.reasoning_content` (ReasoningChatOpenAI captures it → ACP
+  # thoughts) and honors `reasoning_effort` (high/max) via extra_body. Auth reuses
+  # the same ANTHROPIC_AUTH_TOKEN that works on ZAI's Anthropic endpoint.
+  # NOTE the two /paas/v4 URLs are NOT the same: `/api/paas/v4` is the STANDARD
+  # pay-as-you-go endpoint — it returns code 1113 "insufficient balance" for this
+  # token (verified dead 07-10); `/api/coding/paas/v4` (below) is the CODING-PLAN
+  # endpoint and is the one that works.
+  zai-coding:
+    kind: openai
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+    max_tokens: 8192
+    temperature: 0.2
+  # ZAI — Anthropic-compatible endpoint. AVAILABLE but UNUSED by the shipped
+  # deployment: glm-5.2/glm-5.1 route through `zai-coding` (the OpenAI-shape
+  # coding endpoint) instead so reasoning streams as delta.reasoning_content.
+  # Kept for a cloner who prefers the Anthropic protocol / has live ZAI Anthropic
+  # balance — repoint a model's `provider:` here to use it. Same ANTHROPIC_AUTH_TOKEN.
   zai-anthropic:
     kind: anthropic
     base_url: https://api.z.ai/api/anthropic
@@ -106,8 +137,8 @@ default_provider: opencode-go
 
 # Per-id registry: capability flag + which profile serves it.
 models:
-  glm-5.2:           {provider: zai-anthropic, multimodal: false, strength: pro}
-  glm-5.1:           {provider: zai-anthropic, multimodal: false, strength: pro}
+  glm-5.2:           {provider: zai-coding, multimodal: false, strength: pro, reasoning_effort: max}
+  glm-5.1:           {provider: zai-coding, multimodal: false, strength: pro, reasoning_effort: max}
   mimo-v2.5:         {provider: opencode-go, multimodal: true, strength: flash}
   mimo-v2.5-pro:     {provider: opencode-go, multimodal: true, strength: flash}
   kimi-k2.7-code:    {provider: opencode-go, multimodal: false, strength: flash}
@@ -124,10 +155,12 @@ tiers:
   # BrowserVisionMiddleware text-pointer fallback, not native image blocks.
   default:
     base_model: glm-5.2
-    # glm-5.2 (zai-anthropic) -> glm-5.1 (zai-anthropic): same provider KIND, so
-    # the chain is protocol-homogeneous + non-multimodal throughout (supervisor
-    # behavior, incl. the describe_image vision path, is unchanged on failover).
-    base_fallbacks: [glm-5.1]
+    # glm-5.2 (zai-coding, kind: openai) -> mimo-v2.5-pro (opencode-go, kind:
+    # openai): cross-provider escape — when ZAI's coding-plan rate-limit window
+    # is exhausted, fail over to OpenCode Go. Both are OpenAI-compatible, so the
+    # chain stays protocol-homogeneous. Reasoning streams uniformly as
+    # delta.reasoning_content regardless of which provider serves the turn.
+    base_fallbacks: [mimo-v2.5-pro]
     worker_model: mimo-v2.5
     multimodal_model: mimo-v2.5
     grader_model: mimo-v2.5

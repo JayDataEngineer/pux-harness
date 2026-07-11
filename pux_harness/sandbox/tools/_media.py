@@ -7,20 +7,17 @@ function here is consumed by ``describe_image.py`` and/or ``multimodal.py``.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import mimetypes
 import shlex
-import tempfile
 from pathlib import Path
-from datetime import datetime
 
 from langchain_core.messages import HumanMessage
 
 from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
 from pux_harness.sandbox.backend import PuxSandboxBackend
-from pux_harness.sandbox.tools._shared import _tail, _result
+from pux_harness.sandbox.tools._shared import _tail
 
 log = logging.getLogger(__name__)
 
