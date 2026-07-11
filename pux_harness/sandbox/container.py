@@ -25,14 +25,15 @@ inspect of ``orchestrator-sandbox-mcp-default`` 2026-07-03: runc, shared-infra,
                ``sandbox-<id>-persist`` (named vol) → ``/sandbox/persist``,
                ``pux-cache-<sha16>`` (per-project, sha256 of the abs path) →
                ``/root/.cache`` (``PUX_CACHE_VOLUME=off`` disables).
-  env          ``SANDBOX_POLICY``/``NETWORK_ALLOW``/``FS_READONLY``/
-               ``FS_READWRITE``/``DOCKER_HOST``/``HOST_GATEWAY`` + policy creds.
+  env          ``SANDBOX_POLICY``/``DOCKER_HOST``/``HOST_GATEWAY`` + policy creds.
   resources    mem 2048MB / cpu 2.0 cores / pids 512 (``PUX_SANDBOX_MEMORY_MB``/
                ``PUX_SANDBOX_CPU_CORES``/``PUX_SANDBOX_PIDS`` env knobs).
   runtime      ``runsc`` when TierIsolated + installed; ``PUX_SANDBOX_RUNTIME``
                overrides (``none`` opts out). Bridged tier never overrides.
   network      ``shared-infra`` (``OPENSHELL_NETWORK``); host net for Bridged.
   extra_hosts  ``host.docker.internal:host-gateway``.
+  security_opt ``no-new-privileges:true`` — blocks setuid/setcap escalation
+               inside the container (zero behavioral impact on normal work).
   caps         ``NET_ADMIN`` only when policy stages an egress allowlist.
 
 Policy enforcement — the part that was blocked while the Go binary owned the
@@ -43,6 +44,23 @@ load → validate required creds → resolve ``${VAR}`` mounts → inject creds/
 env → ``run_as_host_user`` → ``UID:GID`` → stage ``<project>/.pux/egress.conf``
 + grant ``NET_ADMIN`` (skipped for effective TierBridged — host net makes
 iptables-in-container meaningless).
+
+Egress is enforced deny-by-default: ``apply-egress-policy.sh`` (supervised at
+boot) reads ``<project>/.pux/egress.conf`` and installs iptables DROP on OUTPUT
+except for the listed allow rules. The conf is only staged when
+``policy.yaml`` declares an ``egress.allow`` block — so an org WITHOUT the block
+has UNRESTRICTED egress (the default; opt in to restrict). When the block IS
+declared, ``NET_ADMIN`` is granted so the boot script can install the rules;
+``ensure()`` then fail-closes: a reused container missing ``NET_ADMIN`` while
+the policy has an allowlist is REJECTED (not silently reused with open egress).
+
+The legacy ``NETWORK_ALLOW`` / ``FS_READONLY`` / ``FS_READWRITE`` env vars were
+removed — they were vestigial from the Go entrypoint that never survived the
+port. Nothing in the image or harness consumed them (verified by grep of the
+live container + repo 2026-07-11). Filesystem read-only enforcement (Docker
+``--read-only`` + tmpfs for writable paths) is a separate hardening pass that
+needs image-level testing; the dead env vars are gone so operators aren't
+misled into thinking ``/etc`` is protected when it isn't.
 
 ``ensure()`` is the single-tenant gate: discover a running container by the
 project label and reuse it; create+start only when none is running (removing a
@@ -95,7 +113,6 @@ DEFAULT_NETWORK = "shared-infra"
 DEFAULT_POLICIES_DIR = "/etc/openshell/policies"
 DEFAULT_POLICY = "developer"
 DEFAULT_SANDBOX_ID = "mcp-default"
-DEFAULT_NETWORK_ALLOW = "github.com,api.anthropic.com,api.openai.com,api.openrouter.com,api.z.ai,opencode.ai,pypi.org,files.pythonhosted.org"
 
 DEFAULT_MEMORY_MB = 2048
 DEFAULT_CPU_CORES = 2.0
@@ -303,11 +320,12 @@ class SandboxContainer:
     def _build_env(self, pol: policy.Policy | None) -> list[str]:
         # Go defaults opts.Policy to "developer"; no knob is exposed, so the
         # SANDBOX_POLICY env + the openshell.policy label stay "developer".
+        # The legacy NETWORK_ALLOW / FS_READONLY / FS_READWRITE env vars were
+        # removed — nothing in the image or harness reads them (grep-verified
+        # against the live container 2026-07-11). Egress is enforced via the
+        # egress.conf → apply-egress-policy.sh → iptables path, NOT an env var.
         env = [
             f"SANDBOX_POLICY={DEFAULT_POLICY}",
-            f"NETWORK_ALLOW={_env_str('PUX_NETWORK_ALLOW', DEFAULT_NETWORK_ALLOW)}",
-            "FS_READONLY=/etc,/usr,/bin,/lib,/lib64",
-            "FS_READWRITE=/sandbox/workspace,/sandbox/tmp",
             "DOCKER_HOST=unix:///var/run/docker.sock",
             "HOST_GATEWAY=host.docker.internal",
             # Where the Agent Protocol server (Aegra) lives, so in-container prep
@@ -419,6 +437,11 @@ class SandboxContainer:
             nano_cpus=nano_cpus,
             pids_limit=pids,
             extra_hosts={"host.docker.internal": "host-gateway"},
+            # Block setuid/setcap privilege escalation inside the container.
+            # Zero impact on normal work (the agent runs as root already; this
+            # prevents a compromised process from gaining NEW caps via suid
+            # binaries like passwd, sudo, ping).
+            security_opt=["no-new-privileges:true"],
         )
         if user:
             create_kwargs["user"] = user
@@ -648,15 +671,51 @@ class SandboxContainer:
 
         The single-tenant gate: an already-running container for this project is
         reused (whoever booted it); we only create when none is running.
+
+        Fail-closed egress: when the org's policy declares an ``egress.allow``
+        block, the reused container MUST have ``NET_ADMIN`` (without it the
+        deny-by-default iptables rules can't be installed → traffic flows
+        unrestricted, defeating the policy). A stale container from before the
+        policy was added (or created by a path that skipped the cap) is REJECTED
+        here rather than silently reused — the operator destroys it and a fresh
+        one is created with the right caps.
         """
         if self._name:
             return self._name
         running = self._running_for_project()
         if running:
+            self._validate_reused_container(running)
             self._name = running
             log.info("reusing running container %s", running)
             return running
         return self.create()
+
+    def _validate_reused_container(self, name: str) -> None:
+        """Reject a reused container whose security posture doesn't match the
+        org's policy. Currently checks egress caps — extend as new invariants
+        are identified."""
+        pol, effective_tier = self._resolve_policy()
+        needs_egress = (
+            effective_tier != "bridged"
+            and pol is not None
+            and bool(pol.egress.allow)
+        )
+        if not needs_egress:
+            return
+        try:
+            c = self.client.containers.get(name)
+        except NotFound:
+            return  # vanished between list + get — create() will make a new one
+        host_config = c.attrs.get("HostConfig", {})
+        cap_add = host_config.get("CapAdd") or []
+        if "NET_ADMIN" not in cap_add:
+            raise ContainerError(
+                f"reused container {name!r} lacks NET_ADMIN but the org policy "
+                f"declares an egress.allow block — the deny-by-default firewall "
+                f"cannot be enforced. Destroy the stale container "
+                f"(``docker rm -f {name}``) and re-run so a fresh one is created "
+                f"with the correct capabilities."
+            )
 
     def destroy(self) -> None:
         """Stop + remove the sandbox container (save persisted state first).
