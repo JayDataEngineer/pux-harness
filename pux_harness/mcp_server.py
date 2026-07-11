@@ -11,7 +11,7 @@ Architecture:
 Each org gets one cached ACP subprocess. Sessions within that subprocess are
 individual subagent conversations. The ACP ask_user interrupt mechanic means
 a subagent asking a question simply ends its turn; the orchestrator's next
-prompt_subagent() call IS the resume answer.
+prompt() call IS the resume answer.
 """
 from __future__ import annotations
 
@@ -286,13 +286,13 @@ _ORG_LINES = "\n".join(f"  - `{o}`" for o in _ORGS)
 _MODEL_LINES = "\n".join(f"  - `{m}`" for m in _MODELS)
 
 _NEW_SESSION_DESC = (
-    "Start a new subagent session — creates an ACP session on an org.\n\n"
+    "Start a new subagent session on an org.\n\n"
     "Available orgs:\n"
     f"{_ORG_LINES}\n\n"
     "Args:\n"
     "  org: One of the orgs listed above. Default: 'general'.\n"
     f"  model: Optional override. Available models:\n{_MODEL_LINES}\n\n"
-    "Returns the session_id. Use prompt_subagent() to delegate tasks."
+    "Returns the session_id. Use prompt() to delegate tasks."
 )
 
 
@@ -307,32 +307,30 @@ async def new_session(org: str = "general", model: str | None = None) -> str:
         _session_org[sid] = org
         tag = f" (model: {model})" if model else ""
         return (
-            f"Subagent session started.\n"
+            f"Session started.\n"
             f"  session: `{sid}`\n"
             f"  org: `{org}`{tag}\n"
-            f"Use prompt_subagent() to delegate tasks."
+            f"Use prompt() to send tasks."
         )
     except Exception as exc:
         return f"Error creating session on '{org}': {exc}"
 
 
 @MCP.tool()
-async def prompt_subagent(session_id: str, message: str) -> str:
-    """Delegate a task to a subagent, or answer a subagent's question.
+async def prompt(session_id: str, message: str) -> str:
+    """Send a message to a subagent session — delegate a task, ask a follow-up,
+    or answer a question.
 
-    This is the universal delegation primitive:
-    - Give a task:    prompt_subagent(session_id, "build a script that does X")
-    - Answer a question: prompt_subagent(session_id, "use Python")
-      (After an end_turn, the next message IS the resume answer — ACP-native.
-       The ask_user interrupt persists in the checkpoint; your answer unblocks it.)
+    After an end_turn, the next prompt() IS the resume answer (ACP-native:
+    the ask_user interrupt persists in the checkpoint; your answer unblocks it).
 
     Args:
-        session_id: Subagent session from new_session() or load_session().
-        message: Task, follow-up, or answer to send.
+        session_id: From new_session() or load_session().
+        message: Task, follow-up, or answer.
 
     Returns:
-        Subagent's response text + stop reason. stop_reason='end_turn' means the
-        subagent finished OR is asking a question (the question is in the text).
+        Response text + stop reason. end_turn = done or asking a question
+        (the question is in the text).
     """
     oc = _find_org_for_session(session_id)
     if oc is None:
@@ -346,12 +344,12 @@ async def prompt_subagent(session_id: str, message: str) -> str:
         if text:
             parts.append(text)
         else:
-            parts.append("(subagent produced no text)")
+            parts.append("(no response)")
         parts.append(f"\n*[{stop}]*")
         if stop == "end_turn":
             parts.append(
-                "\n(Subagent done or asking a question. "
-                "If it asked something, answer with another prompt_subagent() call.)"
+                "\n(Done or asking a question. "
+                "If it asked something, answer with another prompt() call.)"
             )
         elif stop == "cancelled":
             parts.append("\n(Task cancelled.)")
@@ -399,7 +397,7 @@ async def load_session(session_id: str, org: str) -> str:
         org: The org the session belongs to.
 
     Returns:
-        Confirmation. Use prompt_subagent() to continue the conversation.
+        Confirmation. Use prompt() to continue the conversation.
     """
     try:
         conn = await _get_org(org)
@@ -432,19 +430,9 @@ async def cancel_session(session_id: str) -> str:
         return f"Error: {exc}"
 
 
-_SET_MODEL_DESC = (
-    "Change the model on a subagent session.\n\n"
-    "Available models:\n"
-    f"{_MODEL_LINES}\n\n"
-    "Args:\n"
-    "  session_id: The subagent session.\n"
-    "  model: One of the models listed above.\n\n"
-    "Returns confirmation of model change."
-)
-
-
-@MCP.tool(description=_SET_MODEL_DESC)
+@MCP.tool()
 async def set_model(session_id: str, model: str) -> str:
+    """Change the model on a session. See new_session for available models."""
     oc = _find_org_for_session(session_id)
     if oc is None:
         return f"Error: no active connection for session '{session_id}'."
