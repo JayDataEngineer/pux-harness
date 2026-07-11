@@ -543,6 +543,30 @@ class EventStore:
         ).fetchone()
         return row["content"] if row else None
 
+    def get_blob_by_tool(
+        self, tool_tag: str, *, max_age_s: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Most recent blob whose ``tool`` column equals ``tool_tag``, if any.
+
+        The TTL-cache primitive for ``ctx_fetch_and_index``: the fetch tool tags
+        each fetched URL's blob with ``ctx_fetch:<url>``; a re-fetch checks this
+        method first — if a fresh blob exists (age <= ``max_age_s``), return its
+        handle + chars without re-hitting the network. ``None`` means no match
+        (or stale match when ``max_age_s`` is set).
+
+        Returns ``{"handle": "ctx:...", "chars": N, "ts": float}`` or ``None``.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT id, ts, chars FROM blobs WHERE tool = ? ORDER BY ts DESC LIMIT 1",
+            (tool_tag,),
+        ).fetchone()
+        if not row:
+            return None
+        if max_age_s is not None and (time.time() - row["ts"]) > max_age_s:
+            return None
+        return {"handle": f"ctx:{row['id']}", "chars": int(row["chars"]), "ts": float(row["ts"])}
+
     def search_context(
         self, query: str, *, thread_id: str = "", limit: int = 8,
     ) -> list[SearchHit]:
@@ -728,6 +752,87 @@ class EventStore:
             "snapshot": row["snapshot"],
             "event_count": row["event_count"],
             "consumed": bool(row["consumed"]),
+        }
+
+    # -- introspection + maintenance ------------------------------------------
+
+    def stats(self, *, thread_id: str = "") -> dict[str, Any]:
+        """Counts + db size + FTS5 status, scoped to ``thread_id`` (empty =
+        process-wide). The ``ctx_stats`` tool surface; also the diagnostic
+        payload ``ctx_doctor`` folds in.
+
+        ``events_by_type`` is a ``{type: count}`` dict (no per-event PII — just
+        tallies). ``threads`` is the distinct non-empty thread_ids the store has
+        seen. ``fts5`` is False when the SQLite build lacks FTS5 (the store
+        degrades to LIKE; ``ctx_doctor`` surfaces this as a warning)."""
+        conn = self._get_conn()
+        where = "WHERE thread_id = ?" if thread_id else ""
+        params: tuple = (thread_id,) if thread_id else ()
+        event_count = conn.execute(
+            f"SELECT COUNT(*) FROM events {where}", params
+        ).fetchone()[0]
+        blob_count = conn.execute(
+            f"SELECT COUNT(*) FROM blobs {where}", params
+        ).fetchone()[0]
+        blob_chars_row = conn.execute(
+            f"SELECT COALESCE(SUM(chars), 0) FROM blobs {where}", params
+        ).fetchone()
+        blob_chars = int(blob_chars_row[0]) if blob_chars_row else 0
+        type_rows = conn.execute(
+            f"SELECT type, COUNT(*) AS n FROM events {where} "
+            f"GROUP BY type ORDER BY n DESC",
+            params,
+        ).fetchall()
+        by_type = {r["type"]: r["n"] for r in type_rows}
+        threads = [
+            r["thread_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT thread_id FROM events "
+                "WHERE thread_id != '' ORDER BY thread_id"
+            ).fetchall()
+        ]
+        db_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        fts5 = True
+        try:
+            conn.execute("SELECT 1 FROM events_fts LIMIT 0")
+            conn.execute("SELECT 1 FROM blobs_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            fts5 = False
+        return {
+            "events": int(event_count),
+            "blobs": int(blob_count),
+            "blob_chars": blob_chars,
+            "events_by_type": by_type,
+            "threads": threads,
+            "db_bytes": db_bytes,
+            "db_path": str(self.db_path),
+            "fts5": fts5,
+        }
+
+    def purge(self, *, thread_id: str = "") -> dict[str, int]:
+        """Delete all events + blobs (or just those scoped to ``thread_id``).
+
+        ``events_fts`` auto-syncs via the ``events_fts_ad`` AFTER DELETE trigger
+        (external-content table), so deleting from ``events`` is enough.
+        ``blobs_fts`` is a STANDALONE fts5 table (not external-content — blobs.id
+        is TEXT, incompatible with fts5 content_rowid), so its rows must be
+        cleared explicitly. ``session_resume`` snapshots are NOT touched — those
+        are compaction recovery state, a separate concern.
+
+        Returns ``{events_deleted, blobs_deleted}``. Rowcounts are best-effort:
+        sqlite3's ``rowcount`` on a ``DELETE`` is accurate for non-truncate
+        deletes (this path always uses WHERE, never ``DELETE *``)."""
+        conn = self._get_conn()
+        where = "WHERE thread_id = ?" if thread_id else ""
+        params: tuple = (thread_id,) if thread_id else ()
+        e_cur = conn.execute(f"DELETE FROM events {where}", params)
+        b_cur = conn.execute(f"DELETE FROM blobs {where}", params)
+        # Blobs FTS is standalone — no trigger syncs it; clear matching rows.
+        conn.execute(f"DELETE FROM blobs_fts {where}", params)
+        conn.commit()
+        return {
+            "events_deleted": int(e_cur.rowcount or 0),
+            "blobs_deleted": int(b_cur.rowcount or 0),
         }
 
     @staticmethod

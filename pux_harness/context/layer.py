@@ -27,15 +27,19 @@ def build_context_layer(
     threshold: int | None = None,
     preview: int | None = None,
     enabled: bool = True,
+    exec_client: object | None = None,
 ) -> tuple[list[AgentMiddleware], list[BaseTool]]:
     """Build the context layer: one ``ContextMiddleware`` + the
     ``ctx_recall``/``ctx_search`` retrieval tools, both bound to ``store``
     (default: the shared event store).
 
     ``threshold``/``preview``/``enabled`` forward to the middleware; ``None``
-    means "the middleware default" (8000 / 1500 / True). Returns a fresh tuple
-    each call so callers can mutate the lists (e.g. append more middleware)
-    without aliasing across the main agent and every subagent."""
+    means "the middleware default" (8000 / 1500 / True). ``exec_client`` (a
+    ``DockerExecClient``) adds the 4 exec-dependent tools
+    (ctx_execute/ctx_execute_file/ctx_batch_execute/ctx_fetch_and_index); None
+    omits them (tests stay offline-cheap). Returns a fresh tuple each call so
+    callers can mutate the lists (e.g. append more middleware) without aliasing
+    across the main agent and every subagent."""
     s = store or shared_event_store()
     mw_kwargs: dict[str, object] = {"enabled": enabled}
     if threshold is not None:
@@ -43,5 +47,5 @@ def build_context_layer(
     if preview is not None:
         mw_kwargs["preview"] = preview
     middleware: list[AgentMiddleware] = [ContextMiddleware(s, **mw_kwargs)]
-    tools = build_context_tools(s)
+    tools = build_context_tools(s, exec_client=exec_client)
     return middleware, tools

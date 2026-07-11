@@ -42,11 +42,34 @@ from pux_harness.context.events import EventStore, StashResult, shared_event_sto
 DEFAULT_THRESHOLD = 8000
 DEFAULT_PREVIEW = 1500
 
-# The retrieval surface — ctx_recall/ctx_search exist to bring (a slice of)
-# stashed content back INTO context. Offloading OR preview-logging their
-# output would defeat that (and re-stash a big recall instantly). So they
-# are exempt from BOTH capture-detail and offload.
-_RETRIEVAL_TOOLS = frozenset({"ctx_recall", "ctx_search"})
+# The retrieval + meta surface — ctx_recall/ctx_search exist to bring (a slice
+# of) stashed content back INTO context. Offloading OR preview-logging their
+# output would defeat that (and re-stash a big recall instantly). So they are
+# exempt from BOTH capture-detail and offload. The meta tools (ctx_stats,
+# ctx_doctor, ctx_purge) and the indexing tool (ctx_index) are exempt too:
+# their outputs are small by design (a one-line ack, a JSON blob, a check
+# list), and ctx_index's PURPOSE is to park content in the store — offloading
+# its tiny "Indexed N chars" ack would be noise. None of these names carry
+# large agent-facing payloads, so the exemption is safe.
+#
+# The exec tools (ctx_execute / ctx_execute_file / ctx_batch_execute /
+# ctx_fetch_and_index) are ALSO exempt: their entire purpose is to keep large
+# outputs OUT of context (the agent asked for stdout-only, or the fetch already
+# indexed into the store). Re-offloading their result would double-handle the
+# content. ctx_batch_execute + ctx_fetch_and_index explicitly stash to the
+# store themselves and return a short summary — offloading that summary is noise.
+_RETRIEVAL_TOOLS = frozenset({
+    "ctx_recall",
+    "ctx_search",
+    "ctx_index",
+    "ctx_stats",
+    "ctx_doctor",
+    "ctx_purge",
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_batch_execute",
+    "ctx_fetch_and_index",
+})
 
 
 def _is_text_tm(result: Any) -> bool:
