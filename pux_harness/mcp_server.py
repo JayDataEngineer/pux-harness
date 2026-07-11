@@ -349,8 +349,6 @@ async def prompt(session_id: str, message: str) -> str:
             parts.append(text)
         else:
             parts.append("(no response)")
-        if thoughts:
-            parts.append(f"\n<thinking>\n{thoughts}\n</thinking>")
         parts.append(f"\n*[{stop}]*")
         if stop == "end_turn":
             parts.append(
