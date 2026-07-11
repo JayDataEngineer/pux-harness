@@ -27,7 +27,6 @@ from pux_harness.kit.loaders import (
     build_system_prompt,
     discover_orgs,
     org_agent_slugs,
-    org_extends,
 )
 from pux_harness.kit.loaders import _org_path  # the ONE resolver delegate
 
@@ -100,8 +99,10 @@ def test_search_org_dir_local_wins_over_pux_namespace(monkeypatch, tmp_path: Pat
 def test_extra_org_roots_parses_env_drops_missing(monkeypatch, tmp_path: Path):
     """``$PUX_ORG_PATHS`` is colon-separated; non-existent entries are dropped;
     order preserved."""
-    a = tmp_path / "a"; a.mkdir()
-    b = tmp_path / "b"; b.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
     monkeypatch.setenv("PUX_ORG_PATHS", f"{a}{os.pathsep}/no/such/dir{os.pathsep}{b}")
     assert _paths.extra_org_roots() == [a, b]
 

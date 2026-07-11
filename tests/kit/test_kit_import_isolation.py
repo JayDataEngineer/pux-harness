@@ -49,7 +49,7 @@ def test_tripwire_registered_in_global_gate():
     # hook by asserting the helper is wired in (the function exists + is called
     # by check_harness). Drive the helper directly to confirm it produces the
     # rule id on a provocation.
-    fake = Path(__file__)  # any real file; overwritten below via tmp
+    Path(__file__)  # any real file; overwritten below via tmp
     assert callable(_kit_import_isolation)
     assert "kit-import-isolation" not in ids  # green → no violation emitted
 

@@ -93,7 +93,7 @@ def test_resolve_literal_wins_over_everything(monkeypatch):
     """A caller-supplied ``model=`` literal beats org, env, AND default."""
     monkeypatch.setenv("PUX_GRADER_MODEL", "env-glm")
     assert model.resolve_model_id(
-        role="grader", org="dev-bot", model="literal-x",
+        role="grader", org="coder", model="literal-x",
     ) == "literal-x"
 
 
@@ -237,9 +237,9 @@ def test_fallback_keys_align_with_roles():
 
 
 def test_shipped_default_base_has_fallback_chain():
-    """The shipped default tier declares a base fallback chain (the demonstrator
-    that the feature is live in the real config, not dormant)."""
-    assert model.resolve_fallback_ids(role="base") == ["glm-5.1"]
+    """The shipped default tier declares a base fallback chain (cross-provider
+    escape: glm-5.2 zai-coding → mimo-v2.5-pro opencode-go)."""
+    assert model.resolve_fallback_ids(role="base") == ["mimo-v2.5-pro"]
 
 
 def test_worker_role_has_no_shipped_fallbacks():
@@ -284,7 +284,7 @@ def test_org_override_disables_fallbacks(fake_org_tree):
     (fake_org_tree / "orgs" / "p" / "profile.yaml").write_text(
         "system_prompt_suffix: hi\n"
     )
-    assert model.resolve_fallback_ids(role="base", org="p") == ["glm-5.1"]
+    assert model.resolve_fallback_ids(role="base", org="p") == ["mimo-v2.5-pro"]
 
 
 def test_get_model_attaches_fallback_chain(monkeypatch):
@@ -302,7 +302,7 @@ def test_get_model_attaches_fallback_chain(monkeypatch):
     # And NOT a RunnableWithFallbacks (the pre-fix shape that crashed serve startup).
     assert not isinstance(m, RunnableWithFallbacks)
     assert _model_id(m) == "glm-5.2"
-    assert [_model_id(fb) for fb in m._fallback_models] == ["glm-5.1"]
+    assert [_model_id(fb) for fb in m._fallback_models] == ["mimo-v2.5-pro"]
 
 
 def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
@@ -438,7 +438,7 @@ def test_resolve_fallback_ids_returns_a_copy():
     (a later call would otherwise see the mutation)."""
     chain = model.resolve_fallback_ids(role="base")
     chain.append("mutated")
-    assert model.resolve_fallback_ids(role="base") == ["glm-5.1"]
+    assert model.resolve_fallback_ids(role="base") == ["mimo-v2.5-pro"]
 
 
 # --- validate_models_spec rejects malformed fallback chains ----------------

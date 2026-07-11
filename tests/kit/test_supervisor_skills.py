@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from pux_harness.kit.loaders import supervisor_skills_roots
 
@@ -68,15 +67,15 @@ def test_drops_missing_dirs_existing_only(tmp_path: Path):
 
 
 def test_specialist_org_uses_specialists_path(tmp_path: Path):
-    """A specialist org (e.g. ``dev-bot``) keeps its skills under
+    """A specialist org (e.g. ``coder``) keeps its skills under
     ``orgs/specialists/<org>/skills``; the bare ``orgs/<org>/skills``
     candidate is correctly absent for it."""
     _make_skills(tmp_path, "orgs/_shared/skills")
-    _make_skills(tmp_path, "orgs/specialists/dev-bot/skills")
-    out = supervisor_skills_roots("dev-bot", tmp_path, workspace_root="/sandbox/workspace")
+    _make_skills(tmp_path, "orgs/specialists/coder/skills")
+    out = supervisor_skills_roots("coder", tmp_path, workspace_root="/sandbox/workspace")
     assert out == [
         "/sandbox/workspace/orgs/_shared/skills",
-        "/sandbox/workspace/orgs/specialists/dev-bot/skills",
+        "/sandbox/workspace/orgs/specialists/coder/skills",
     ]
 
 

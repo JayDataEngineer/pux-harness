@@ -89,13 +89,13 @@ def test_config_carries_callbacks_and_metadata_when_on(monkeypatch) -> None:
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-x")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-x")
 
-    cfg = obs.build_invoke_config("thread-abc", 200, "dev-bot", "serve")
+    cfg = obs.build_invoke_config("thread-abc", 200, "coder", "serve")
     assert cfg["configurable"] == {"thread_id": "thread-abc"}
     assert cfg["recursion_limit"] == 200
     assert cfg["callbacks"] == [sentinel]
     # v4 attribute-propagation keys (read by the handler from run metadata).
     assert cfg["metadata"]["langfuse_session_id"] == "thread-abc"
-    assert cfg["metadata"]["langfuse_tags"] == ["org:dev-bot", "transport:serve"]
+    assert cfg["metadata"]["langfuse_tags"] == ["org:coder", "transport:serve"]
 
 
 @pytest.mark.skipif(not obs._HAS_LANGFUSE,

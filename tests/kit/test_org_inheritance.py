@@ -201,7 +201,7 @@ def test_roster_empty_when_no_agents_key(tmp_path: Path) -> None:
 def test_roster_inherit_roster_false_prunes_parent(tmp_path: Path) -> None:
     # A child that sets ``inherit_roster: false`` extends the base PROMPT but
     # makes its own roster authoritative — the parent's slugs are NOT unioned
-    # (dev-bot: base prompt flows, but no inherited researcher/browser).
+    # (coder: base prompt flows, but no inherited researcher/browser).
     _make_org(tmp_path, "base", body="# Base\n", agents=["alpha", "beta"])
     _make_org(tmp_path, "child", body="# Child\n", agents=["gamma"], extends="base")
     (tmp_path / "orgs" / "child" / "org.yaml").write_text(

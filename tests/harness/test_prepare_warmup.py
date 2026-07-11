@@ -53,7 +53,7 @@ from pux_harness.context.prepare_warmup import PrepareWarmupMiddleware
 
 def _ctx(facts: RuntimeFacts) -> StackCtx:
     return StackCtx(
-        org="dev-bot",
+        org="coder",
         facts=facts,
         rubric_gate=None,
         exec_client=None,
@@ -101,11 +101,11 @@ def test_prepare_registered_default_on_supervisor_only():
 # ------------------------------------------------------------------------------------
 
 async def test_abefore_agent_fires_prepare_once(record_prepare):
-    mw = PrepareWarmupMiddleware(org="dev-bot", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
     ret = await mw.abefore_agent(SimpleNamespace(), SimpleNamespace())
     assert ret is None, "before_agent must not mutate state"
     assert len(record_prepare) == 1, f"prepare called {len(record_prepare)}x, want 1"
-    assert record_prepare[0]["org"] == "dev-bot"
+    assert record_prepare[0]["org"] == "coder"
     assert record_prepare[0]["universal_warmup"] is True
 
 
@@ -129,7 +129,7 @@ async def test_abefore_agent_offloads_to_thread(monkeypatch, record_prepare):
         return await real_to_thread(fn, *a, **kw)
 
     monkeypatch.setattr(pwm.asyncio, "to_thread", _capture_to_thread)
-    mw = PrepareWarmupMiddleware(org="dev-bot", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
     await mw.abefore_agent(SimpleNamespace(), SimpleNamespace())
     assert seen == [True], "abefore_agent must offload via asyncio.to_thread"
     assert len(record_prepare) == 1
@@ -154,7 +154,7 @@ async def test_abefore_agent_fires_via_real_runnable_callable_wrap(record_prepar
         RunnableCallable,
     )
 
-    mw = PrepareWarmupMiddleware(org="dev-bot", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
     # EXACTLY what factory.py does: RunnableCallable(sync_before_agent, async_before_agent, trace=False)
     node = RunnableCallable(mw.before_agent, mw.abefore_agent, trace=False)
     runtime = object()  # opaque — the hook ignores it; the framework injects it by name
@@ -197,7 +197,7 @@ async def test_prepare_exception_is_swallowed(monkeypatch):
         raise RuntimeError("docker daemon down")
 
     monkeypatch.setattr(container, "prepare", _boom)
-    mw = PrepareWarmupMiddleware(org="dev-bot", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
     # Must NOT raise — prep failures are warn-and-continue, never block the run.
     ret = await mw.abefore_agent(SimpleNamespace(), SimpleNamespace())
     assert ret is None

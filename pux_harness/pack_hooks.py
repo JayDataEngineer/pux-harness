@@ -24,7 +24,6 @@ Hook contract:
 """
 from __future__ import annotations
 
-import ast
 import json
 import subprocess
 import tempfile

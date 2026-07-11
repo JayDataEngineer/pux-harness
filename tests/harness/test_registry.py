@@ -19,13 +19,16 @@ from pux_harness.sandbox.tools import (
     GRADER_TOOL_NAMES,
     LEGACY_TOOL_NAMES,
     NATIVE_FS_TOOLS,
+    SPECIALIST_GROUPS,
     SPECIALIST_TOOL_NAMES,
     SPECIALISTS,
+    TOOL_GROUP_TOOLS,
     ToolSpec,
     build_grader_tools,
     build_native_specialists,
     classify_slug,
     prefixed,
+    resolve_tool_allowlist,
 )
 from pux_harness.sandbox.tools._shared import PUX_GRADER_PREFIX, PUX_PREFIX
 
@@ -198,7 +201,7 @@ def test_prefixed_maps_category_to_prefix():
 def test_legacy_tool_names_is_non_empty_denylist():
     """The frozen ``pux_sandbox_bash`` / ``pux_sandbox_file_*`` surface the
     native flip replaced. A denylist (deliberately absent from REGISTRY) so
-    the dev-bot forcing surface check (main.py) imports one constant instead
+    the coder forcing surface check (main.py) imports one constant instead
     of re-declaring the literal."""
     assert LEGACY_TOOL_NAMES == {
         "pux_sandbox_bash", "pux_sandbox_file_read", "pux_sandbox_file_write",
@@ -212,3 +215,62 @@ def test_legacy_names_are_not_re_introduced_as_specialists():
     (no-legacy-left-behind)."""
     assert LEGACY_TOOL_NAMES.isdisjoint(SPECIALIST_TOOL_NAMES)
     assert LEGACY_TOOL_NAMES.isdisjoint(NATIVE_FS_TOOLS)
+
+
+# --- capability groups (tool_surface scoping) -----------------------------
+
+
+def test_every_specialist_has_a_group():
+    """A specialist without a ``group`` can never be scoped by
+    ``tool_surface.groups``, so it would silently leak into every supervisor.
+    Every REGISTRY specialist MUST declare a group."""
+    ungrouped = [
+        s.slug for s in REGISTRY
+        if s.category is Category.SPECIALIST and s.group is None
+    ]
+    assert ungrouped == [], f"specialists missing a group: {ungrouped}"
+
+
+def test_tool_group_tools_derives_from_registry():
+    """``TOOL_GROUP_TOOLS`` is derived from REGISTRY (single source), so the
+    per-org surface can't drift from the declared tools."""
+    assert SPECIALIST_GROUPS == frozenset(TOOL_GROUP_TOOLS)
+    # Spot-check the known groups are non-empty and disjoint.
+    assert TOOL_GROUP_TOOLS["browser"]
+    assert TOOL_GROUP_TOOLS["desktop"]
+    assert TOOL_GROUP_TOOLS["media"]
+    assert TOOL_GROUP_TOOLS["code"] == frozenset({"python"})
+    assert TOOL_GROUP_TOOLS["skills"] == frozenset({"list_skills"})
+    # groups are disjoint sets of slugs
+    seen: set[str] = set()
+    for slugs in TOOL_GROUP_TOOLS.values():
+        assert seen.isdisjoint(slugs)
+        seen |= set(slugs)
+    assert seen == set(SPECIALISTS)
+
+
+def test_resolve_tool_allowlist_empty_means_all():
+    """No ``tool_surface.groups`` → ``None`` → the supervisor carries EVERY
+    specialist (byte-identical to today)."""
+    assert resolve_tool_allowlist([]) is None
+    assert resolve_tool_allowlist(()) is None
+
+
+def test_resolve_tool_allowlist_expands_groups_and_slugs():
+    """A group entry expands to every tool in the group; a bare slug enables
+    just that one tool."""
+    got = resolve_tool_allowlist(["code", "media"])
+    assert got == (TOOL_GROUP_TOOLS["code"] | TOOL_GROUP_TOOLS["media"])
+    got = resolve_tool_allowlist(["python"])
+    assert got == frozenset({"python"})
+
+
+def test_resolve_tool_allowlist_rejects_unknown():
+    """A typo'd group or slug fails loud — it must not silently ship the full
+    surface."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        resolve_tool_allowlist(["browsr"])  # typo
+    with pytest.raises(ValueError):
+        resolve_tool_allowlist(["not_a_tool"])

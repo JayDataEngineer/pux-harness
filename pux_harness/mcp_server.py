@@ -188,10 +188,12 @@ class OrgConnection:
 
     # ── ACP operations ──────────────────────────────────────────────────
 
-    async def new_session(self, model: str | None = None) -> str:
+    async def new_session(self, model: str | None = None,
+                           cwd: str | None = None) -> str:
         async with self._lock:
             await self.ensure()
-            resp = await self.conn.new_session(cwd=PUX_PROJECT_ROOT)
+            workdir = cwd or PUX_PROJECT_ROOT
+            resp = await self.conn.new_session(cwd=workdir)
             sid = resp.session_id
             if model:
                 await self._set_model(sid, model)
@@ -295,21 +297,30 @@ _NEW_SESSION_DESC = (
     f"{_ORG_LINES}\n\n"
     "Args:\n"
     "  org: One of the orgs listed above. Default: 'general'.\n"
-    f"  model: Optional override. Available models:\n{_MODEL_LINES}\n\n"
+    f"  model: Optional override. Available models:\n{_MODEL_LINES}\n"
+    "  cwd: Optional working directory (absolute path). When set, the agent's\n"
+    "    filesystem operations are relative to this directory. Default: the\n"
+    "    sandbox project root.\n\n"
     "Returns the session_id. Use prompt() to delegate tasks."
 )
 
 
 @MCP.tool(description=_NEW_SESSION_DESC)
-async def new_session(org: str = "general", model: str | None = None) -> str:
+async def new_session(org: str = "general", model: str | None = None,
+                      cwd: str | None = None) -> str:
     known = discover_orgs()
     if org not in known:
         return f"Error: unknown org '{org}'. Available: {', '.join(sorted(known))}"
     try:
         conn = await _get_org(org)
-        sid = await conn.new_session(model=model)
+        sid = await conn.new_session(model=model, cwd=cwd)
         _session_org[sid] = org
-        tag = f" (model: {model})" if model else ""
+        tag_parts = []
+        if model:
+            tag_parts.append(f"model: {model}")
+        if cwd:
+            tag_parts.append(f"cwd: {cwd}")
+        tag = f" ({', '.join(tag_parts)})" if tag_parts else ""
         return (
             f"Session started.\n"
             f"  session: `{sid}`\n"

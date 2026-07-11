@@ -4,7 +4,7 @@ custom_app end-to-end via the upstream ``langgraph_sdk`` wire format.
 
 Aegra ([[aegra-verified]], [[langgraph-api-license-gate]]) is the OSS
 self-hosted langgraph-api drop-in (FastAPI + PostgreSQL, Apache-2.0). This
-script drives the SAME surface a real AP consumer (Hermes, dev-bot, MCP) uses:
+script drives the SAME surface a real AP consumer (Hermes, coder, MCP) uses:
 
   1. ``assistants.search``  — every discovered org is registered as a graph_id.
   2. ``threads.create``     — AP thread CRUD.

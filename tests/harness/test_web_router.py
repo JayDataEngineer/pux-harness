@@ -103,7 +103,7 @@ def test_web_router_registered_supervisor_only_last_not_default():
 
 def test_load_web_router_config_absent_block_is_default():
     # An org with no profile.yaml / no web_router block gets the free heuristic.
-    cfg = load_web_router_config("dev-bot")
+    cfg = load_web_router_config("coder")
     assert cfg == WebRouterConfig()
     assert cfg.model_router is False
 

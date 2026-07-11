@@ -4,8 +4,9 @@
   ],
   "graphs": {
     "_demo": "pux_harness.runtime.upstream:graph___demo",
+    "coder": "pux_harness.runtime.upstream:graph__coder",
     "deep-research-engine": "pux_harness.runtime.upstream:graph__deep_research_engine",
-    "dev-bot": "pux_harness.runtime.upstream:graph__dev_bot",
+    "fs-explorer": "pux_harness.runtime.upstream:graph__fs_explorer",
     "game-studio": "pux_harness.runtime.upstream:graph__game_studio",
     "general": "pux_harness.runtime.upstream:graph__general",
     "invest": "pux_harness.runtime.upstream:graph__invest",
@@ -13,7 +14,8 @@
     "social-media-pipeline": "pux_harness.runtime.upstream:graph__social_media_pipeline",
     "telegram-agent": "pux_harness.runtime.upstream:graph__telegram_agent",
     "twitter-agent": "pux_harness.runtime.upstream:graph__twitter_agent",
-    "video-production": "pux_harness.runtime.upstream:graph__video_production"
+    "video-production": "pux_harness.runtime.upstream:graph__video_production",
+    "web-search": "pux_harness.runtime.upstream:graph__web_search"
   },
   "http": {
     "app": "pux_harness.runtime.custom_app:app"

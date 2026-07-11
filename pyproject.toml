@@ -5,7 +5,7 @@ description = "deepagents-based Pux harness — the org+skill compiler (slim kit
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "deepagents",
-    "deepagents-acp>=0.0.8",
+    "deepagents-acp>=0.0.9",
     "docker>=7.1.0",
     "fastapi>=0.139.0",
     "httpx>=0.28.1",

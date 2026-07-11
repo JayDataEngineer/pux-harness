@@ -65,7 +65,7 @@ DCODE_CLI = DCODE_VENV / "bin" / "dcode"
 # `web-agent` is intentionally excluded: it drives pux-only browser tools
 # (browser_navigate/click/...) absent in dcode — porting it would
 # need a browser MCP. See ``_adapt_cto_prompt`` for how its clause is reworked.
-_PORTED_SUBAGENTS = ("code-worker", "dev-bot-explorer")
+_PORTED_SUBAGENTS = ("code-worker", "coder-explorer")
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ def _adapt_cto_prompt(text: str) -> str:
 
     Targeted transforms (the methodology — PLAN/EXECUTE/RECOVER/ESCALATE, risk
     tiers, verify-or-die, ship gate, delegation to code-worker +
-    dev-bot-explorer — is unchanged; dcode's tool names already match):
+    coder-explorer — is unchanged; dcode's tool names already match):
 
       * Drop the ``pux_sandbox_python`` bullet (no such tool in dcode; the
         ``execute`` tool covers python one-liners).

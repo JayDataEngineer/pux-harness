@@ -20,7 +20,6 @@ import pytest
 from pux_harness.manifest import (
     DEFAULT_INCLUDE,
     HARD_EXCLUDE,
-    Manifest,
     _is_pruned,
     _match_any,
     collect_pack_files,

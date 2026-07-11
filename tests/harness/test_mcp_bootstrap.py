@@ -21,7 +21,6 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-import pytest
 
 from pux_harness.agent import mcp_bootstrap as mb
 from pux_harness.agent.tool_servers import ToolServerSpec
