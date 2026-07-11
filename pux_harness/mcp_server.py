@@ -1,17 +1,17 @@
-"""Queen-bee MCP server — pure ACP delegation to Pux worker orgs.
+"""MCP server — pure ACP delegation to Pux subagents.
 
-Hermes (the queen) connects via MCP-SSE. This server spawns ``pux acp --org X``
-subprocesses and speaks ACP (Agent Client Protocol) over stdio. The queen
-manages worker bees — she delegates tasks to orgs, answers their questions,
-and manages sessions. She does NOT hold granular tools; she delegates.
+Hermes (the orchestrator) connects via MCP-SSE. This server spawns
+``pux acp --org X`` subprocesses and speaks ACP (Agent Client Protocol) over
+stdio. Hermes delegates tasks to orgs (subagents), answers their questions,
+and manages sessions. It does NOT hold granular tools; it delegates.
 
 Architecture:
-    Hermes (queen) → MCP-SSE :9987 → [this server] → ACP stdio → pux acp --org X
+    Hermes (orchestrator) -> MCP-SSE :9987 -> [this server] -> ACP stdio -> pux acp --org X
 
-Each org gets one cached ACP subprocess (the hive). Sessions within that
-subprocess are individual worker conversations. The ACP ask_user interrupt
-mechanic means a worker asking a question simply ends its turn; the queen's
-next prompt_worker() call IS the resume answer.
+Each org gets one cached ACP subprocess. Sessions within that subprocess are
+individual subagent conversations. The ACP ask_user interrupt mechanic means
+a subagent asking a question simply ends its turn; the orchestrator's next
+prompt_subagent() call IS the resume answer.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ PUX_HARNESS_DIR = os.path.join(PUX_PROJECT_ROOT, "pux-harness")
 PUX_BIN = os.path.join(PUX_HARNESS_DIR, ".venv", "bin", "pux")
 
 MCP = FastMCP(
-    "pux-queen",
+    "pux",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,  # internal Tailscale-only
     ),
@@ -50,10 +50,10 @@ MCP = FastMCP(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# QueenClient — minimal ACP client that collects agent messages
+# SubagentClient — minimal ACP client that collects agent messages
 # ═══════════════════════════════════════════════════════════════════════════
 
-class QueenClient:
+class SubagentClient:
     """Collects agent messages + thoughts per session during prompt() calls."""
 
     def __init__(self) -> None:
@@ -107,7 +107,7 @@ class QueenClient:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# OrgConnection — one ACP subprocess per org (the hive)
+# OrgConnection — one ACP subprocess per org
 # ═══════════════════════════════════════════════════════════════════════════
 
 class OrgConnection:
@@ -117,7 +117,7 @@ class OrgConnection:
         self.org = org
         self.conn: Any = None          # ClientSideConnection (Agent interface)
         self.process: Any = None
-        self.client = QueenClient()
+        self.client = SubagentClient()
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
@@ -159,7 +159,7 @@ class OrgConnection:
                 self.process = process
                 await conn.initialize(
                     protocol_version=1,
-                    client_info={"name": "hermes-queen", "version": "1.0"},
+                    client_info={"name": "hermes", "version": "1.0"},
                 )
                 self._ready.set()
                 await self._stop.wait()  # hold the async with open
@@ -272,15 +272,15 @@ def _find_org_for_session(session_id: str) -> OrgConnection | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MCP Tools — queen-bee worker management (pure ACP)
+# MCP Tools — subagent management (pure ACP)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @MCP.tool()
 async def list_orgs() -> str:
-    """List available worker orgs (specialist agents) the queen can delegate to.
+    """List available subagent orgs (specialist agents) you can delegate to.
 
-    Each org is a specialist worker bee: coder, deep-research-engine,
-    twitter-agent, etc. Delegate with new_session(org).
+    Each org is a specialist subagent: coder, deep-research-engine,
+    twitter-agent, etc. Start a session with new_session(org).
     """
     orgs = sorted(discover_orgs())
     lines = [f"**{len(orgs)} worker orgs available:**"]
@@ -291,7 +291,7 @@ async def list_orgs() -> str:
 
 @MCP.tool()
 async def list_models() -> str:
-    """List available models the worker bees can use.
+    """List available models the subagents can use.
 
     Pass a model name to new_session(org, model) or set_model(session_id, model).
     """
@@ -304,15 +304,15 @@ async def list_models() -> str:
 
 @MCP.tool()
 async def new_session(org: str = "general", model: str | None = None) -> str:
-    """Recruit a new worker bee — creates an ACP session on an org.
+    """Start a new subagent session — creates an ACP session on an org.
 
     Args:
-        org: Worker org to delegate to (e.g. 'coder', 'general',
+        org: Subagent org to delegate to (e.g. 'coder', 'general',
              'deep-research-engine'). Use list_orgs() for all options.
         model: Optional model override (e.g. 'glm-5.2'). See list_models().
 
     Returns:
-        The session_id for the new worker. Use prompt_worker() to delegate.
+        The session_id for the new subagent. Use prompt_subagent() to delegate.
     """
     known = discover_orgs()
     if org not in known:
@@ -323,32 +323,32 @@ async def new_session(org: str = "general", model: str | None = None) -> str:
         _session_org[sid] = org
         tag = f" (model: {model})" if model else ""
         return (
-            f"Worker recruited.\n"
+            f"Subagent session started.\n"
             f"  session: `{sid}`\n"
             f"  org: `{org}`{tag}\n"
-            f"Use prompt_worker() to delegate tasks."
+            f"Use prompt_subagent() to delegate tasks."
         )
     except Exception as exc:
         return f"Error creating session on '{org}': {exc}"
 
 
 @MCP.tool()
-async def prompt_worker(session_id: str, message: str) -> str:
-    """Delegate a task to a worker, or answer a worker's question.
+async def prompt_subagent(session_id: str, message: str) -> str:
+    """Delegate a task to a subagent, or answer a subagent's question.
 
     This is the universal delegation primitive:
-    - Give a task:    prompt_worker(session_id, "build a script that does X")
-    - Answer a question: prompt_worker(session_id, "use Python")
+    - Give a task:    prompt_subagent(session_id, "build a script that does X")
+    - Answer a question: prompt_subagent(session_id, "use Python")
       (After an end_turn, the next message IS the resume answer — ACP-native.
        The ask_user interrupt persists in the checkpoint; your answer unblocks it.)
 
     Args:
-        session_id: Worker session from new_session() or load_session().
+        session_id: Subagent session from new_session() or load_session().
         message: Task, follow-up, or answer to send.
 
     Returns:
-        Worker's response text + stop reason. stop_reason='end_turn' means the
-        worker finished OR is asking a question (the question is in the text).
+        Subagent's response text + stop reason. stop_reason='end_turn' means the
+        subagent finished OR is asking a question (the question is in the text).
     """
     oc = _find_org_for_session(session_id)
     if oc is None:
@@ -362,12 +362,12 @@ async def prompt_worker(session_id: str, message: str) -> str:
         if text:
             parts.append(text)
         else:
-            parts.append("(worker produced no text)")
+            parts.append("(subagent produced no text)")
         parts.append(f"\n*[{stop}]*")
         if stop == "end_turn":
             parts.append(
-                "\n(Worker done or asking a question. "
-                "If it asked something, answer with another prompt_worker() call.)"
+                "\n(Subagent done or asking a question. "
+                "If it asked something, answer with another prompt_subagent() call.)"
             )
         elif stop == "cancelled":
             parts.append("\n(Task cancelled.)")
@@ -378,7 +378,7 @@ async def prompt_worker(session_id: str, message: str) -> str:
 
 @MCP.tool()
 async def list_sessions(org: str | None = None) -> str:
-    """List active worker sessions.
+    """List active subagent sessions.
 
     Args:
         org: Optional org filter. If omitted, lists across all orgs.
@@ -388,7 +388,7 @@ async def list_sessions(org: str | None = None) -> str:
     """
     orgs_to_check = [org] if org else list(_pool.keys())
     if not orgs_to_check:
-        return "No worker sessions. Use new_session(org) to recruit a worker."
+        return "No subagent sessions. Use new_session(org) to start one."
     all_sessions: list[dict] = []
     for o in orgs_to_check:
         if o in _pool and _pool[o].alive:
@@ -397,7 +397,7 @@ async def list_sessions(org: str | None = None) -> str:
             except Exception:
                 pass
     if not all_sessions:
-        return "No active worker sessions."
+        return "No active subagent sessions."
     lines = [f"**{len(all_sessions)} session(s):**"]
     for s in all_sessions:
         title = f" — {s['title']}" if s.get("title") else ""
@@ -408,14 +408,14 @@ async def list_sessions(org: str | None = None) -> str:
 
 @MCP.tool()
 async def load_session(session_id: str, org: str) -> str:
-    """Resume a past worker session.
+    """Resume a past subagent session.
 
     Args:
         session_id: The session to resume.
         org: The org the session belongs to.
 
     Returns:
-        Confirmation. Use prompt_worker() to continue the conversation.
+        Confirmation. Use prompt_subagent() to continue the conversation.
     """
     try:
         conn = await _get_org(org)
@@ -430,10 +430,10 @@ async def load_session(session_id: str, org: str) -> str:
 
 @MCP.tool()
 async def cancel_session(session_id: str) -> str:
-    """Cancel an in-progress task on a worker.
+    """Cancel an in-progress task on a subagent.
 
     Args:
-        session_id: The worker session to cancel.
+        session_id: The subagent session to cancel.
 
     Returns:
         Confirmation of cancellation.
@@ -450,10 +450,10 @@ async def cancel_session(session_id: str) -> str:
 
 @MCP.tool()
 async def set_model(session_id: str, model: str) -> str:
-    """Change the model on a worker session.
+    """Change the model on a subagent session.
 
     Args:
-        session_id: The worker session.
+        session_id: The subagent session.
         model: Model to use (e.g. 'glm-5.2'). See list_models().
 
     Returns:
@@ -478,8 +478,8 @@ def main() -> None:
 
     host = os.environ.get("PUX_MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("PUX_MCP_PORT", "9987"))
-    sys.stderr.write(f"[pux-queen] MCP-SSE on {host}:{port}\n")
-    sys.stderr.write(f"[pux-queen] ACP subprocess root: {PUX_PROJECT_ROOT}\n")
+    sys.stderr.write(f"[pux] MCP-SSE on {host}:{port}\n")
+    sys.stderr.write(f"[pux] ACP subprocess root: {PUX_PROJECT_ROOT}\n")
     app = MCP.sse_app()
     uvicorn.run(app, host=host, port=port)
 
