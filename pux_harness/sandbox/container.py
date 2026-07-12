@@ -392,10 +392,24 @@ class SandboxContainer:
         env = self._build_env(pol)
         binds = self._build_binds(pol)
 
-        # Resource limits (env-overridable defaults).
-        mem_bytes = _env_int("PUX_SANDBOX_MEMORY_MB", DEFAULT_MEMORY_MB) * 1024 * 1024
-        nano_cpus = int(_env_float("PUX_SANDBOX_CPU_CORES", DEFAULT_CPU_CORES) * 1e9)
+        # Resource limits. Precedence: policy (org declares what it needs) >
+        # env (operator escape hatch) > default. Browser orgs declare
+        # ``sandbox.memory_mb`` because Chrome + SeleniumBase cold-start OOMs
+        # under the lean 2 GiB default; coding orgs leave it unset and inherit
+        # the default. See ``policy.resolve_resources``.
+        fb_mem = _env_int("PUX_SANDBOX_MEMORY_MB", DEFAULT_MEMORY_MB)
+        fb_cpu = _env_float("PUX_SANDBOX_CPU_CORES", DEFAULT_CPU_CORES)
+        mem_mb, cpu_cores = policy.resolve_resources(
+            pol, fallback_memory_mb=fb_mem, fallback_cpu_cores=fb_cpu
+        )
+        mem_bytes = mem_mb * 1024 * 1024
+        nano_cpus = int(cpu_cores * 1e9)
         pids = _env_int("PUX_SANDBOX_PIDS", DEFAULT_PIDS)
+        if mem_mb != DEFAULT_MEMORY_MB or cpu_cores != DEFAULT_CPU_CORES:
+            log.info(
+                "sandbox resources: %d MiB / %.1f CPU (default %d MiB / %.1f)",
+                mem_mb, cpu_cores, DEFAULT_MEMORY_MB, DEFAULT_CPU_CORES,
+            )
 
         runtime = resolve_runtime(effective_tier, _is_runsc_available(self.client))
 
@@ -718,19 +732,25 @@ class SandboxContainer:
             )
 
     def destroy(self) -> None:
-        """Stop + remove the sandbox container (save persisted state first).
+        """Stop + remove the sandbox container, ALWAYS saving persisted state.
 
-        The save only runs when the container is still running — a stopped
-        container can't be exec'd into (Go's savePersistedState ignores that
-        exec error silently; we skip explicitly)."""
+        Data-loss fix (2026-07-12, gap 6 of the persistence audit): the previous
+        version skipped ``_save_persisted`` when the container was already
+        stopped — a stopped container can't be exec'd into. That silently
+        dropped Chrome profile changes, new apt installs, and dotfile updates
+        made during the session whenever a caller did ``stop`` then ``destroy``
+        (e.g. ``pux sandbox stop``). The save now starts a stopped container
+        briefly so the exec can run, then stops + removes it. Start failures
+        surface as :class:`ContainerError` (no silent skip — verify or die)."""
         name = self._name or self.name
         try:
             container = self.client.containers.get(name)
         except NotFound:
             self._name = None
             return
-        if container.status == "running":
-            self._save_persisted(container)
+        if container.status != "running":
+            self._start_for_save(container, name)
+        self._save_persisted(container)
         try:
             container.stop(timeout=10)
         except APIError as exc:
@@ -742,9 +762,154 @@ class SandboxContainer:
         log.info("sandbox destroyed: %s", name)
         self._name = None
 
+    # -- pause / unpause (true session preservation without teardown) --------
+
+    def pause(self) -> None:
+        """Freeze the sandbox container's processes in place (cgroup freezer).
+
+        Unlike ``destroy()`` (which ``pux sandbox stop`` calls), pause keeps the
+        container ALIVE — every process (Chrome with its open tabs, the Xvfb
+        display, any long-running agent loop) is frozen at the exact instruction
+        pointer, NOT killed. ``unpause`` resumes them as if nothing happened.
+
+        This is the right answer to "I want to keep my session but free the
+        CPU": the container stays in memory, ready to resume in milliseconds.
+        Stop/start cycles rebuild the container from the image + restore the
+        named volume (slower, and the running-state layer is reset)."""
+        name = self._name or self.name
+        try:
+            container = self.client.containers.get(name)
+        except NotFound as exc:
+            raise ContainerError(
+                f"cannot pause {name!r} — no such container. "
+                f"Use `pux sandbox start` first."
+            ) from exc
+        if container.status != "running":
+            raise ContainerError(
+                f"cannot pause {name!r} — container is {container.status!r}, "
+                f"not 'running'. Only running containers can be paused."
+            )
+        try:
+            container.pause()
+        except APIError as exc:
+            raise ContainerError(f"pause {name}: {exc}") from exc
+        log.info("sandbox paused: %s (processes frozen, memory resident)", name)
+
+    def unpause(self) -> None:
+        """Thaw a paused sandbox — every frozen process resumes in place."""
+        name = self._name or self.name
+        try:
+            container = self.client.containers.get(name)
+        except NotFound as exc:
+            raise ContainerError(
+                f"cannot unpause {name!r} — no such container."
+            ) from exc
+        if container.status != "paused":
+            raise ContainerError(
+                f"cannot unpause {name!r} — container is {container.status!r}, "
+                f"not 'paused'."
+            )
+        try:
+            container.unpause()
+        except APIError as exc:
+            raise ContainerError(f"unpause {name}: {exc}") from exc
+        log.info("sandbox unpaused: %s (processes resumed)", name)
+
+    def _start_for_save(
+        self, container: docker.models.containers.Container, name: str,
+    ) -> None:
+        """Start a stopped container so ``_save_persisted`` can exec into it.
+
+        Polls ``container.status`` for up to 5 s after ``start()`` returns (start
+        is async at the daemon level). Raises :class:`ContainerError` if the
+        container won't run — never silently skips the save."""
+        import time  # noqa: PLC0415
+        try:
+            container.start()
+        except APIError as exc:
+            raise ContainerError(
+                f"cannot start stopped container {name} to save persisted "
+                f"state during destroy (data would be lost): {exc}"
+            ) from exc
+        for _ in range(10):
+            container.reload()
+            if container.status == "running":
+                return
+            time.sleep(0.5)
+        raise ContainerError(
+            f"container {name} did not reach running state after start "
+            f"(status={container.status}); cannot save persisted state."
+        )
+
     def _save_persisted(self, container: docker.models.containers.Container) -> None:
         # Verbatim port of manager.go::savePersistedState.
         self._exec(container, _SAVE_SCRIPT)
+
+    # -- persist volume dump (gap 5: named-volume extraction) ------------------
+
+    def persist_volume_name(self) -> str:
+        """The named Docker volume that backs ``/sandbox/persist``."""
+        return f"sandbox-{self.sandbox_id}-persist"
+
+    def dump_persist(self, output_path: str) -> str:
+        """Stream the named persist volume to a host tarball.
+
+        Uses ``alpine:latest`` as a throwaway container with the volume mounted
+        read-only, tars ``/p``, streams the gzipped bytes to ``output_path``.
+        Works whether the sandbox is running or not — operates on the volume,
+        not the sandbox container. Raises :class:`ContainerError` if the volume
+        is absent (the sandbox never started) or the dump command fails.
+
+        Persists the user-recoverable bits named-volume-side that the
+        bind-mount does NOT cover: the Chrome profile (cookies + sessions),
+        the recorded apt install list (so a rebuild is fast), and dotfiles
+        written under ``/root`` during the session."""
+        persist = self.persist_volume_name()
+        try:
+            self.client.volumes.get(persist)
+        except NotFound as exc:
+            raise ContainerError(
+                f"persist volume {persist!r} does not exist; nothing to dump "
+                f"(the sandbox has never been started)."
+            ) from exc
+        # Pull alpine lazily; it's ~8 MB. If the pull fails AND the image is
+        # absent, containers.run below will raise NotFound — surface it.
+        try:
+            self.client.images.get("alpine:latest")
+        except ImageNotFound:
+            try:
+                self.client.images.pull("alpine:latest")
+            except APIError as exc:
+                raise ContainerError(
+                    f"alpine:latest is absent and pull failed (needed to read "
+                    f"the persist volume): {exc}"
+                ) from exc
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        try:
+            chunks = self.client.containers.run(
+                image="alpine:latest",
+                command=["sh", "-c", "tar czf - -C /p ."],
+                volumes={persist: {"bind": "/p", "mode": "ro"}},
+                remove=True,
+                detach=False,
+                stream=True,
+                stderr=False,
+            )
+        except APIError as exc:
+            raise ContainerError(f"dump-persist run failed: {exc}") from exc
+        with open(output_path, "wb") as f:
+            n = 0
+            for chunk in chunks:
+                if chunk:
+                    f.write(chunk)
+                    n += len(chunk)
+        if n == 0:
+            raise ContainerError(
+                f"dump-persist produced 0 bytes for volume {persist!r} "
+                f"(the volume may be empty or the tar command failed silently)."
+            )
+        log.info("dumped persist volume %s → %s (%d bytes)", persist, output_path, n)
+        return output_path
 
 
 # --- persisted-state scripts (verbatim from manager.go) -----------------------

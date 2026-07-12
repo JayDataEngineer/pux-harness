@@ -179,6 +179,15 @@ class SandboxSpec:
     # ``docs/dynamic-tools-and-packaging.md`` Part 1). Default off: an explicit
     # opt-in, mirroring ``display.watch`` / ``deps``.
     dynamic_tools: bool = False
+    # ``sandbox.memory_mb`` / ``sandbox.cpu_cores`` — per-org resource budget
+    # override. ``0`` / ``0.0`` means "unset" (defer to the env-var/default
+    # chain in container.py). The browser orgs need this: Chrome + SeleniumBase
+    # cold-start blows through the 2 GiB default and gets OOM-reaped (SIGKILL,
+    # exit 137) before sb_server ever binds. A browser org declares
+    # ``memory_mb: 4096``; a coding org leaves it unset and inherits the lean
+    # default. See ``resolve_resources`` for the precedence chain.
+    memory_mb: int = 0
+    cpu_cores: float = 0.0
 
 
 @dataclass
@@ -370,6 +379,8 @@ def _policy_from_dict(d: Mapping) -> Policy:
         deps=deps,
         display=display,
         dynamic_tools=dynamic_tools,
+        memory_mb=int(sb.get("memory_mb", 0) or 0),
+        cpu_cores=float(sb.get("cpu_cores", 0.0) or 0.0),
     )
     br = _section("browser")
     pol.browser = BrowserSpec(
@@ -672,6 +683,38 @@ def resolve_tier(p: Policy | None, fallback: str) -> str:
     if p is None or not p.sandbox.tier:
         return fallback
     return p.sandbox.tier
+
+
+# --- resources ----------------------------------------------------------------
+
+
+def resolve_resources(
+    p: Policy | None,
+    *,
+    fallback_memory_mb: int,
+    fallback_cpu_cores: float,
+) -> tuple[int, float]:
+    """The effective ``(memory_mb, cpu_cores)`` budget for the sandbox container.
+
+    Precedence: **policy > fallback**. The policy's ``sandbox.memory_mb`` /
+    ``sandbox.cpu_cores`` win when set (> 0); otherwise the caller's fallback
+    (which is itself the env-var-then-default chain in container.py) is used.
+
+    The env-var escape hatch (``PUX_SANDBOX_MEMORY_MB`` /
+    ``PUX_SANDBOX_CPU_CORES``) is applied by the CALLER to compute the
+    fallback — so an operator-set env var still wins for orgs that DON'T
+    declare a budget, but an org that DECLARES its need (e.g. browser-agent:
+    ``memory_mb: 4096``) gets what it asked for. This mirrors how
+    ``sandbox.image`` is resolved (policy > env > default).
+    """
+    mem = fallback_memory_mb
+    cpu = fallback_cpu_cores
+    if p is not None:
+        if p.sandbox.memory_mb > 0:
+            mem = p.sandbox.memory_mb
+        if p.sandbox.cpu_cores > 0.0:
+            cpu = p.sandbox.cpu_cores
+    return mem, cpu
 
 
 # --- host setup + image build -------------------------------------------------

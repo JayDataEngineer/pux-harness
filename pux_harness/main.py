@@ -117,6 +117,71 @@ async def _recover_partial(agent, config) -> tuple[list, object]:
     return list(values.get("messages", [])), values.get("todos")
 
 
+# --- Thread provenance + output discovery (persistence-audit gaps 2-3) --------
+#
+# Two small but load-bearing helpers that close the "how do I get my run back?"
+# gap. ``_write_thread_meta`` drops a tiny JSON file at
+# ``<project>/.pux/sessions/<thread_id>.meta.json`` every time ``pux direct``
+# starts + finishes a run — this is the THREAD → FILES MAPPING anchor that was
+# missing (nothing else records "thread X wrote artifacts/Y.md"). ``pux bundle``
+# reads it as a fallback when the server is down. ``_print_output_dirs`` is the
+# CLI-hint counterpart: the dispatch/direct output never told the user where
+# their files landed — now it does.
+
+def _write_thread_meta(
+    thread_id: str, org: str, task: str, status: str,
+) -> None:
+    """Write/update the per-thread provenance file.
+
+    Idempotent on ``thread_id``; later writes (status=finished) merge into the
+    same file. Never raises — provenance is best-effort, not a run-blocking
+    concern."""
+    import json  # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    try:
+        from pux_harness.kit._paths import project_root  # noqa: PLC0415
+
+        meta_path = project_root() / ".pux" / "sessions" / f"{thread_id}.meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if meta_path.exists():
+            try:
+                existing = json.loads(meta_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing.update({
+            "thread_id": thread_id,
+            "org": org,
+            "task": task,
+            "status": status,
+            f"{status}_at": datetime.now(timezone.utc).isoformat(),
+        })
+        meta_path.write_text(json.dumps(existing, indent=2))
+    except OSError:
+        # Best-effort — never block the run on provenance write failure.
+        pass
+
+
+def _print_output_dirs(thread_id: str | None = None, stream=None) -> None:
+    """Print the resume command + where files live.
+
+    Mirrors ``pux_harness.cli._print_output_dirs`` but callable from main.py
+    paths (direct runner, stderr-print) without importing the CLI module
+    (avoids a circular import — cli.py imports main.py for run_* dispatch)."""
+    from pux_harness.kit._paths import project_root  # noqa: PLC0415
+
+    stream = stream or sys.stdout
+    project = project_root()
+    if thread_id:
+        print(f"resume with:   pux direct --thread {thread_id} "
+              f"--task \"<follow-up>\"", file=stream)
+        print(f"               (or: pux run {thread_id} \"<follow-up>\")",
+              file=stream)
+    print(f"files under:   {project}", file=stream)
+    print("  artifacts/  memos/  .pux/sessions/", file=stream)
+
+
 async def _run(
     org: str,
     task: str,
@@ -135,15 +200,17 @@ async def _run(
     # .pux/agent-protocol.sqlite as serve/acp, so a thread created here is
     # visible to `pux show <id>` / `pux resume`. The thread_id is printed to
     # stderr so stdout (the message trace) stays clean.
+    _write_thread_meta(thread_id, org, task, status="running")
     async with open_thread_store() as store:
         agent, backend = _build_agent(org, saver=store.saver, mcp_tools=mcp_tools)
         await store.register_thread(
             thread_id, org, metadata={"source": "direct", "task": task})
         print(
             f"\n[thread] {thread_id}   "
-            f"(resume via: pux show {thread_id} | pux resume)\n",
+            f"(resume via: pux show {thread_id} | pux resume)",
             file=sys.stderr,
         )
+        _print_output_dirs(thread_id, stream=sys.stderr)
         # Run prep jobs after container is up, before the agent loop.
         from pux_harness.sandbox.container import prepare  # noqa: PLC0415
         job_results = prepare(org, exec_client=shared_exec())
@@ -243,6 +310,7 @@ async def _run(
         print(f"  $ {one[:140]}")
     if not backend.execute_log:
         print("  (none — no native fs/shell call was made this run)")
+    _write_thread_meta(thread_id, org, task, status="finished")
 
 
 def _jobs_run(org: str, job: str | None) -> int:
@@ -371,10 +439,14 @@ def _check_policy(org: str) -> int:
     return 1 if missing else 0
 
 
-def _sandbox(cmd: str) -> int:
+def _sandbox(cmd: str, output: str | None = None) -> int:
     """Docker sandbox lifecycle, harness-owned. Replaces the Go
     ``task start/stop/status`` for container boot. ``ensure`` reuses a running
-    container or boots one (the path the exec client takes lazily)."""
+    container or boots one (the path the exec client takes lazily).
+    ``dump-persist`` streams the named persist volume to a host tarball
+    (gap 5 of the persistence audit — the Chrome profile, apt-install list,
+    and ``/root`` dotfiles stored named-volume-side are otherwise invisible
+    to the host filesystem)."""
     from pux_harness.sandbox.container import SandboxContainer, resolve_project_path
 
     sb = SandboxContainer()
@@ -392,6 +464,17 @@ def _sandbox(cmd: str) -> int:
     if cmd == "stop":
         sb.destroy()
         print(f"stopped + removed container for {project}")
+        print("(state preserved: workspace bind-mount, thread sqlite, "
+              "named persist volume — restart with `pux sandbox start`)")
+        return 0
+    if cmd == "pause":
+        sb.pause()
+        print(f"paused container for {project} (processes frozen, memory resident)")
+        print("(resume with: pux sandbox unpause)")
+        return 0
+    if cmd == "unpause":
+        sb.unpause()
+        print(f"resumed container for {project} (processes thawed)")
         return 0
     if cmd == "status":
         from pux_harness.sandbox.docker_exec import _discover  # noqa: PLC0415
@@ -403,8 +486,18 @@ def _sandbox(cmd: str) -> int:
             return 1
         _print_status(sb, name, project, org)
         return 0
+    if cmd == "dump-persist":
+        import time  # noqa: PLC0415
+
+        out = output or f"sandbox-{sb.sandbox_id}-persist-{int(time.time())}.tgz"
+        sb.dump_persist(out)
+        size = os.path.getsize(out)
+        print(f"persist volume → {out} ({size:,} bytes)")
+        print("(Chrome profile, apt-install list, /root dotfiles)")
+        return 0
     raise SystemExit(
-        f"unknown sandbox subcommand {cmd!r}; use: start | stop | status | ensure"
+        f"unknown sandbox subcommand {cmd!r}; "
+        f"use: start | stop | status | ensure | pause | unpause | dump-persist"
     )
 
 
@@ -420,9 +513,53 @@ def _print_status(sb, name: str, project: str, org: str) -> None:
     print(f"  Org policy  {org}")
     print(f"  Network     {','.join(c.attrs['NetworkSettings']['Networks'].keys())}")
     print(f"  Runtime     {c.attrs['HostConfig']['Runtime'] or 'default'}")
+    # Session-preservation surface: sandbox_id (named-volume key) + the volume
+    # itself + thread store location. A user looking at `status` needs to see
+    # whether their session state is actually safe across a stop/start cycle.
+    print(f"  Sandbox ID  {sb.sandbox_id}   (named volume key — "
+          f"DO NOT change PUX_SANDBOX_ID or this volume is orphaned)")
+    persist_name = sb.persist_volume_name()
+    try:
+        vol = docker.from_env(timeout=10).volumes.get(persist_name)
+        # Mountpoint has the on-host path; _vol_size walks it for a byte count.
+        size = _vol_size_bytes(vol.Mountpoint) if hasattr(vol, "Mountpoint") else None
+        size_str = f"  ({_human_bytes(size)})" if size else ""
+        print(f"  Persist     {persist_name}{size_str}")
+    except Exception:  # noqa: BLE001
+        print(f"  Persist     {persist_name} (not yet created — first start populates it)")
+    print(f"  Threads     {project}/.pux/agent-protocol.sqlite  "
+          f"(pux resume to list)")
     watch = sb.watch_url
     if watch:
         print(f"  Watch       {watch}")
+
+
+def _vol_size_bytes(mountpoint: str) -> int:
+    """Walk a Docker volume mountpoint and sum file sizes. Best-effort: any
+    permission error returns 0. The mountpoint is typically
+    ``/var/lib/docker/volumes/<name>/_data`` (root-owned)."""
+    import os  # noqa: PLC0415
+
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(mountpoint):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _human_bytes(n: int) -> str:
+    """Render a byte count as a human-readable string (KB/MB/GB)."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
 
 
 def _check_contract() -> int:
@@ -497,9 +634,9 @@ def run_list_orgs() -> None:
         print(f"  {org}: {', '.join(org_agent_slugs(org)) or '(no agents)'}")
 
 
-def run_sandbox(cmd: str) -> None:
+def run_sandbox(cmd: str, output: str | None = None) -> None:
     """Docker sandbox lifecycle."""
-    raise SystemExit(_sandbox(cmd))
+    raise SystemExit(_sandbox(cmd, output=output))
 
 
 def run_check_smoke(org: str = "general") -> None:

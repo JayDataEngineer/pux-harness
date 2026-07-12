@@ -4,14 +4,16 @@ Usage:
   pux direct                   in-process deepagents runner (no server)
   pux acp [--org X]            ACP stdio server for editor integration
   pux tui [--org X]            launch dcode TUI with org branding + agents
-  pux sandbox <cmd>            Docker sandbox lifecycle (start/stop/status/ensure)
+  pux sandbox <cmd>            Docker sandbox lifecycle (start/stop/status/ensure/pause/unpause/dump-persist)
   pux agents                   list orgs (agents)
   pux dispatch [--org X] ...   ephemeral blocking run
-  pux resume [--org X]         list recent threads
-  pux show <thread_id>         thread state (last message)
+  pux resume [--org X]         list recent threads (+ task snippets; offline-capable)
+  pux show <thread_id>         thread state (last message) + the resume command
   pux history <thread_id>      revision history
+  pux direct --thread <id> ... resume a thread in-process (checkpointer restores every prior turn)
   pux run <thread_id> ...      background run on an existing thread
   pux wait <run_id>            block for a background run's output
+  pux bundle <thread_id>       (optional) bundle transcript + artifacts + memos into a tarball
   pux list                     list discovered orgs
   pux check [--org X]          docker-exec + specialist smoke test (no model)
   pux check-contract           validate the declarative org contract
@@ -148,29 +150,138 @@ def cmd_dispatch(org: str, task: str, recursion_limit: int, rubric: str | None =
     print(f"\n[thread] {res.get('thread_id')}   [agent] {res.get('agent_id')}   "
           f"[status] {status}")
     print("(resume with: pux show <thread_id>)")
+    _print_output_dirs(res.get("thread_id"))
 
 
 def cmd_resume(org: str | None) -> None:
-    body: dict[str, Any] = {}
-    if org:
-        body["agent_id"] = org
-    threads = _post("/threads/search", **body)
+    """List recent threads with their task snippets so you can find the one
+    you want to resume.
+
+    Two paths: live AP server first (rich), then on-disk sqlite fallback so
+    listing works even after the operator has shut everything down — the
+    thread index lives in ``<project>/.pux/agent-protocol.sqlite`` regardless
+    of whether the server is up. Each row shows the thread_id, the org, the
+    creation time, and the task string (the literal thing you asked the agent
+    to do) so you can tell sessions apart."""
+    threads = _list_threads_with_fallback(org)
     if not threads:
         print("(no threads)")
         return
+    # Column-width math: cap thread_id at 30, agent at 18, task at 60.
+    print(f"  {'thread_id':<30} {'agent':<18} {'created':<21} task")
     for t in threads:
-        print(f"  {t['thread_id']}   [agent] {t['agent_id']:<16} {t['created_at']}")
+        meta = t.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:  # noqa: BLE001
+                meta = {}
+        task = (meta.get("task") or "").replace("\n", " ").strip()
+        if len(task) > 60:
+            task = task[:57] + "..."
+        created = (t.get("created_at") or "")[:19]
+        print(f"  {t['thread_id']:<30} {t.get('org') or t.get('agent_id') or '?':<18} "
+              f"{created:<21} {task}")
+    print(f"\n{len(threads)} thread(s). Resume with:")
+    print("  pux direct --org <name> --thread <thread_id> --task \"follow up\"")
+
+
+def _list_threads_with_fallback(org: str | None) -> list[dict[str, Any]]:
+    """Try the AP server for the thread list; fall back to the on-disk sqlite
+    store when the server is unreachable. Never raises — returns [] on total
+    failure (with a one-line note on stderr)."""
+    # Path A: live server.
+    try:
+        body: dict[str, Any] = {}
+        if org:
+            body["agent_id"] = org
+        return _post("/threads/search", **body)
+    except SystemExit:
+        pass  # _die raised; fall through
+    except Exception:  # noqa: BLE001
+        pass
+    # Path B: on-disk sqlite store.
+    try:
+        import asyncio  # noqa: PLC0415
+        from pux_harness.threads import open_thread_store  # noqa: PLC0415
+
+        async def _list() -> list[dict[str, Any]]:
+            async with open_thread_store() as store:
+                return await store.list_threads(org)
+
+        rows = asyncio.run(_list())
+        # The on-disk store uses 'org'; the server returns 'agent_id'. Normalize
+        # so the renderer can handle either.
+        for r in rows:
+            r.setdefault("agent_id", r.get("org"))
+        print("(server unreachable — read from disk)", file=sys.stderr)
+        return rows
+    except Exception as exc:  # noqa: BLE001
+        print(f"(could not list threads: {exc})", file=sys.stderr)
+        return []
 
 
 def cmd_show(thread_id: str) -> None:
-    state = _get(f"/threads/{thread_id}")
+    """Show a thread's last message, agent, status, message count, and the
+    exact command to resume it. Two paths: live server first; on-disk sqlite
+    fallback so `pux show` works even when the server is down."""
+    state = _fetch_thread_state_with_fallback(thread_id)
+    if not state:
+        print(f"thread {thread_id!r} not found "
+              f"(neither server nor disk had it).", file=sys.stderr)
+        raise SystemExit(1)
+    agent_id = state.get("agent_id") or state.get("org")
+    status = state.get("status", "unknown")
     vals = state.get("values") or {}
     msgs = vals.get("messages") or []
+    n_msgs = len(msgs)
     last = msgs[-1] if msgs else {}
     content = last.get("content") if isinstance(last, dict) else last
-    _print_block(f"thread {thread_id} (agent={state.get('agent_id')}, "
-                 f"status={state.get('status')})",
-                 content or "(no messages)")
+    _print_block(
+        f"thread {thread_id} (agent={agent_id}, status={status}, "
+        f"messages={n_msgs})",
+        content or "(no messages)",
+    )
+    # The resume hint — the thing that was missing.
+    print(
+        f"\nresume with:  pux direct --org {agent_id} "
+        f"--thread {thread_id} --task \"<your follow-up>\""
+    )
+    print(f"or via server: pux run {thread_id} \"<your follow-up>\"  "
+          f"(then: pux wait <run_id>)")
+
+
+def _fetch_thread_state_with_fallback(thread_id: str) -> dict[str, Any] | None:
+    """Best-effort thread state fetch. Server first (rich — has messages +
+    status), then on-disk sqlite (returns the pux_threads row without
+    checkpoint state). Returns None if neither path has the thread."""
+    try:
+        return _get(f"/threads/{thread_id}")
+    except SystemExit:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import asyncio  # noqa: PLC0415
+        from pux_harness.threads import open_thread_store  # noqa: PLC0415
+
+        async def _get_row() -> dict[str, Any] | None:
+            async with open_thread_store() as store:
+                return await store.get_thread(thread_id)
+
+        row = asyncio.run(_get_row())
+        if row is None:
+            return None
+        print("(server unreachable — read from disk; no message bodies)",
+              file=sys.stderr)
+        return {
+            "thread_id": row["thread_id"],
+            "agent_id": row["org"],
+            "values": {},  # disk path has no checkpoint state inline
+            "status": "archived",
+        }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def cmd_history(thread_id: str) -> None:
@@ -193,6 +304,248 @@ def cmd_wait(run_id: str) -> None:
         _print_block("ERROR", res.get("error", "(no detail)"))
         raise SystemExit(1)
     _print_block(f"run {run_id} (status={res.get('status')})", res.get("output", "(empty)"))
+
+
+# --- Output discovery + bundle (persistence-audit gaps 1-3, 7-8) -------------
+
+# The workspace convention dirs the agent writes into during a run. Every dir
+# is bind-mounted to the host (so it's on disk the moment the agent writes),
+# but every dir is gitignored (runtime state, not source). ``pux bundle`` is
+# the canonical way to extract one thread's worth of work from these dirs.
+WORKSPACE_DIRS = ("artifacts", "memos", ".pux/memos", ".pux/sessions", "wild-runs")
+
+
+def _project_root() -> Any:
+    """Resolve the project root from the kit's location-independent resolver.
+
+    Used by ``cmd_dispatch`` (to print where files land) and ``cmd_bundle`` (to
+    walk the workspace dirs). Lives in the kit so the client process and the
+    harness server agree on the same path."""
+    from pux_harness.kit._paths import project_root  # noqa: PLC0415
+
+    return project_root()
+
+
+def _print_output_dirs(thread_id: str | None = None) -> None:
+    """Print the resume command + where files live.
+
+    The hint users actually need: how to pick this session back up tomorrow
+    (the resume flow), plus where artifacts land on disk (the workspace
+    bind-mount). Bundle is mentioned only as the export option, not the
+    primary path — resuming is."""
+    project = _project_root()
+    if thread_id:
+        print(f"resume with:   pux direct --thread {thread_id} --task \"<follow-up>\"")
+        print(f"               (or: pux run {thread_id} \"<follow-up>\")")
+    print(f"files under:   {project}")
+    print("  artifacts/  memos/  .pux/sessions/")
+    if thread_id:
+        print(f"bundle (opt):  pux bundle {thread_id}   (one-tarball export)")
+
+
+def _parse_iso8601(ts: str) -> float:
+    """Parse an ISO 8601 timestamp to epoch seconds. Returns 0.0 on failure."""
+    from datetime import datetime  # noqa: PLC0415
+
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def _iso8601(epoch: float) -> str:
+    """Render an epoch seconds float as an ISO 8601 UTC timestamp."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def _now_iso() -> str:
+    return _iso8601(__import__("time").time())
+
+
+def _fetch_thread_transcript(thread_id: str) -> dict[str, Any]:
+    """Best-effort fetch of thread state + history.
+
+    Tries the Agent Protocol server first (full fidelity). On any failure
+    (server down, 404, connection refused), falls back to reading the on-disk
+    thread store directly so the bundle still works after the operator has
+    shut everything down — the typical 'I stopped the server, now archive'
+    case. Records which path was used in the returned dict (``_source``)."""
+    out: dict[str, Any] = {"thread_id": thread_id, "state": None, "history": [], "_source": None}
+    # Path A: live server. Use httpx directly (not the _get helper) so a 404 /
+    # connection-refused falls through silently to the disk path — printing
+    # "pux: server returned 404" via _die would mislead the user into thinking
+    # the bundle failed when it's about to succeed via the disk fallback.
+    try:
+        state_resp = httpx.get(
+            f"{PUX_API_URL}/threads/{thread_id}", timeout=TIMEOUT,
+        )
+        history_resp = httpx.get(
+            f"{PUX_API_URL}/threads/{thread_id}/history", timeout=TIMEOUT,
+        )
+        if state_resp.status_code < 400 and history_resp.status_code < 400:
+            out["state"] = state_resp.json()
+            hist = history_resp.json()
+            out["history"] = hist if isinstance(hist, list) else []
+            out["_source"] = "server"
+            return out
+    except (httpx.ConnectError, httpx.TimeoutException):
+        pass  # server down — fall through to disk
+    # Path B: on-disk sqlite thread store.
+    try:
+        import asyncio  # noqa: PLC0415
+        from pux_harness.threads import open_thread_store  # noqa: PLC0415
+
+        async def _read() -> tuple[Any, Any]:
+            async with open_thread_store() as store:
+                row = await store.get_thread(thread_id)
+                return row, None
+
+        row, _ = asyncio.run(_read())
+        if row is not None:
+            out["state"] = {
+                "thread_id": row["thread_id"],
+                "agent_id": row["org"],
+                "metadata": row["metadata"],
+                "created_at": row["created_at"],
+            }
+            out["_source"] = "disk"
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _add_bytes_to_tar(tar: Any, name: str, data: bytes) -> None:
+    """Add an in-memory bytes payload as a member of a tarfile."""
+    import io  # noqa: PLC0415
+    import tarfile  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mtime = time.time()
+    tar.addfile(info, io.BytesIO(data))
+
+
+def cmd_bundle(
+    thread_id: str,
+    output: str | None = None,
+    all_files: bool = False,
+    since: str | None = None,
+    no_files: bool = False,
+) -> None:
+    """Bundle a thread's transcript + workspace files into a portable tarball.
+
+    The bundle is the answer to "how does a user get their research back":
+    one ``<thread_id>.tgz`` containing the transcript (state + revision
+    history), every file the agent wrote into a convention dir during the
+    run (filtered by mtime > thread.created_at, or ``--all`` / ``--since``
+    overrides), and a ``MANIFEST.json`` describing the contents.
+
+    Works OFFLINE: if the Agent Protocol server is down, the transcript is
+    read from the on-disk thread store + the per-thread ``.meta.json`` that
+    ``pux direct`` writes (gap 2 fix). The MANIFEST records which path was
+    used so a consumer knows whether to trust the transcript as canonical
+    (server) or as a last-known-good snapshot (disk)."""
+    import json as _json  # noqa: PLC0415
+    import tarfile  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    project = _project_root()
+    transcript = _fetch_thread_transcript(thread_id)
+    state = transcript.get("state") or {}
+    history = transcript.get("history") or []
+    created_at = state.get("created_at") if isinstance(state, dict) else None
+    agent_id = state.get("agent_id") if isinstance(state, dict) else None
+
+    # Determine mtime floor for the file scan.
+    if all_files:
+        since_ts = 0.0
+    elif since:
+        since_ts = _parse_iso8601(since)
+    elif created_at:
+        since_ts = _parse_iso8601(created_at)
+    else:
+        # No anchor — last 24 h (avoids accidentally bundling the entire
+        # workspace on a thread we know nothing about).
+        since_ts = __import__("time").time() - 86400.0
+
+    file_records: list[dict[str, Any]] = []
+    files: list[Path] = []
+    if not no_files:
+        for sub in WORKSPACE_DIRS:
+            root = project / sub
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if since_ts and p.stat().st_mtime < since_ts:
+                    continue
+                # Skip the bundle's own output if it's already in the tree
+                # (defensive — keeps `pux bundle X` idempotent).
+                if p.suffix == ".tgz" and thread_id in p.name:
+                    continue
+                files.append(p)
+
+    out_path = Path(output) if output else Path(f"{thread_id}.tgz")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(out_path, "w:gz") as tar:
+        # Workspace files first (preserve paths relative to project root).
+        for p in files:
+            try:
+                arcname = p.relative_to(project)
+            except ValueError:
+                arcname = Path(p.name)
+            tar.add(p, arcname=str(arcname))
+            st = p.stat()
+            file_records.append({
+                "path": str(arcname),
+                "size": st.st_size,
+                "mtime": _iso8601(st.st_mtime),
+            })
+
+        # Transcript (state + revision history, JSON-serialized).
+        transcript_bytes = _json.dumps(
+            {
+                "thread_id": thread_id,
+                "agent_id": agent_id,
+                "created_at": created_at,
+                "state": state,
+                "history_revisions": len(history),
+                "history": history,
+            },
+            indent=2,
+            default=str,
+        ).encode()
+        _add_bytes_to_tar(tar, "transcript.json", transcript_bytes)
+
+        # MANIFEST (written last so it carries the full file list).
+        manifest = {
+            "bundle_schema": "pux-bundle/1",
+            "thread_id": thread_id,
+            "agent_id": agent_id,
+            "created_at": created_at,
+            "bundled_at": _now_iso(),
+            "transcript_source": transcript.get("_source"),
+            "source_server": PUX_API_URL,
+            "project_root": str(project),
+            "since": _iso8601(since_ts) if since_ts else None,
+            "history_revisions": len(history),
+            "file_count": len(file_records),
+            "files": file_records,
+        }
+        _add_bytes_to_tar(tar, "MANIFEST.json", _json.dumps(manifest, indent=2).encode())
+
+    size = out_path.stat().st_size
+    print(f"bundle:  {out_path} ({size:,} bytes)")
+    print(f"  thread:     {thread_id}  agent: {agent_id or '(unknown)'}")
+    print(f"  files:      {len(file_records)}  "
+          f"(filtered by mtime > {_iso8601(since_ts) if since_ts else 'n/a'})")
+    print(f"  transcript: {len(history)} revisions via {transcript.get('_source')}")
+    if transcript.get("_source") != "server":
+        print("  (transcript is from disk — start the AP server for the canonical copy)")
 
 
 def cmd_jobs_run(org: str, job: str | None) -> None:
@@ -310,7 +663,19 @@ def main() -> None:
 
     # Sandbox lifecycle
     p_sb = sub.add_parser("sandbox", help="Docker sandbox lifecycle")
-    p_sb.add_argument("action", choices=["start", "stop", "status", "ensure"], metavar="CMD")
+    p_sb.add_argument(
+        "action",
+        choices=[
+            "start", "stop", "status", "ensure",
+            "pause", "unpause",           # session preservation (no teardown)
+            "dump-persist",
+        ],
+        metavar="CMD",
+    )
+    p_sb.add_argument(
+        "--output", "-o", default=None,
+        help="dump-persist output path (default: ./sandbox-<id>-persist-<ts>.tgz)",
+    )
 
     # Client-mode commands
     sub.add_parser("agents", help="list orgs (agents)")
@@ -337,6 +702,34 @@ def main() -> None:
 
     p_wait = sub.add_parser("wait", help="block for a background run's output")
     p_wait.add_argument("run_id")
+
+    # Bundle — package a thread's transcript + artifacts + memos into one
+    # tarball (gap 1+2+7+8 of the persistence audit: the canonical "give me my
+    # research back" command). Server is tried first for the live transcript;
+    # falls back to the on-disk thread store + per-thread meta.json if the
+    # server is down (the typical "I stopped everything, now archive" case).
+    p_bundle = sub.add_parser(
+        "bundle",
+        help="bundle a thread's transcript + artifacts + memos into a tarball",
+    )
+    p_bundle.add_argument("thread_id")
+    p_bundle.add_argument(
+        "--output", "-o", default=None,
+        help="output path (default: ./<thread_id>.tgz)",
+    )
+    p_bundle.add_argument(
+        "--all", action="store_true",
+        help="include every file in the convention dirs (ignore mtime filter)",
+    )
+    p_bundle.add_argument(
+        "--since",
+        default=None,
+        help="only include files newer than this ISO 8601 timestamp (overrides thread created_at)",
+    )
+    p_bundle.add_argument(
+        "--no-files", action="store_true",
+        help="transcript only — skip the workspace file scan",
+    )
 
     # Diagnostic / offline commands
     sub.add_parser("list", help="list discovered orgs and their agents")
@@ -497,7 +890,7 @@ def main() -> None:
     elif args.cmd == "sandbox":
         from pux_harness.main import run_sandbox
 
-        run_sandbox(args.action)
+        run_sandbox(args.action, output=args.output)
 
     # --- Client mode (requires running server) ---
     elif args.cmd == "agents":
@@ -514,6 +907,14 @@ def main() -> None:
         cmd_run(args.thread_id, args.task, args.recursion_limit)
     elif args.cmd == "wait":
         cmd_wait(args.run_id)
+    elif args.cmd == "bundle":
+        cmd_bundle(
+            args.thread_id,
+            output=args.output,
+            all_files=args.all,
+            since=args.since,
+            no_files=args.no_files,
+        )
 
     # --- Diagnostic / offline ---
     elif args.cmd == "list":
