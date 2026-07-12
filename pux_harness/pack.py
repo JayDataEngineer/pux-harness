@@ -215,7 +215,6 @@ dependencies = [
     "langchain",
     "langchain-openai",
     "langgraph",
-    "langgraph-checkpoint-memory",
     "pyyaml",
     "python-dotenv>=1.0",
 ]
