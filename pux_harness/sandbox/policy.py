@@ -188,6 +188,13 @@ class SandboxSpec:
     # default. See ``resolve_resources`` for the precedence chain.
     memory_mb: int = 0
     cpu_cores: float = 0.0
+    # ``sandbox.env`` — static (non-secret) config values injected into the
+    # container env. This is the right place for service URLs that are NOT
+    # secrets (e.g. ``SURREALDB_URL``, ``MEDIA_MCP_URL``) — values the sandbox
+    # needs to reach host-side infra. Secrets belong in ``credentials`` (which
+    # pulls from the operator's env, not the policy file). Absent/empty -> no
+    # static env (today's behavior).
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -381,6 +388,7 @@ def _policy_from_dict(d: Mapping) -> Policy:
         dynamic_tools=dynamic_tools,
         memory_mb=int(sb.get("memory_mb", 0) or 0),
         cpu_cores=float(sb.get("cpu_cores", 0.0) or 0.0),
+        env={str(k): str(v) for k, v in (sb.get("env") or {}).items()},
     )
     br = _section("browser")
     pol.browser = BrowserSpec(
@@ -545,6 +553,13 @@ def env_vars(p: Policy | None, env: Mapping[str, str] | None = None) -> list[str
             out.append(f"SEED_COOKIES_ENV={p.browser.cookies_env}")
     if p.browser.proxy:
         out.append(f"SB_SERVER_PROXY={p.browser.proxy}")
+    # Static (non-secret) config values from ``sandbox.env``. These are the
+    # service URLs / config knobs the sandbox needs to reach host-side infra
+    # (SurrealDB, media-mcp, etc.). Not credentials — they live in the policy
+    # file, not the operator's env. Appended AFTER creds so a cred with the
+    # same name wins (unlikely, but last-wins is Docker's semantics).
+    for k, v in p.sandbox.env.items():
+        out.append(f"{k}={v}")
     return out
 
 

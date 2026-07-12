@@ -63,6 +63,9 @@ def get_pux_banner(unicode_mode: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 ORG_BRANDING: dict[str, dict[str, str]] = {
+    "browser-agent": {
+        "subheader": "Browser mode. Where should I navigate?",
+    },
     "coder": {
         "subheader": "Engineering mode. What are we building?",
     },
