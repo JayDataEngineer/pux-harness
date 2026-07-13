@@ -34,6 +34,7 @@ from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
+from langgraph.types import Command
 
 from pux_harness.context.events import EventStore, StashResult, shared_event_store
 
@@ -41,6 +42,10 @@ from pux_harness.context.events import EventStore, StashResult, shared_event_sto
 # log tails, and JSON blobs without trimming ordinary tool replies.
 DEFAULT_THRESHOLD = 8000
 DEFAULT_PREVIEW = 1500
+
+# Browser specialist tools all share this prefix (mirrors browser_vision.py).
+# Used by the browser-specific structural offload below.
+_BROWSER_PREFIX = "pux_sandbox_browser_"
 
 # The retrieval + meta surface — ctx_recall/ctx_search exist to bring (a slice
 # of) stashed content back INTO context. Offloading OR preview-logging their
@@ -104,31 +109,148 @@ def _stub(stash: StashResult, content: str, tool: str, *, preview: int) -> str:
     )
 
 
-def _offload(
-    result: Any, store: EventStore, tool_name: str, *,
+def _trim_browser_payload(
+    content: str, store: EventStore, tool_name: str, *,
+    threshold: int, thread_id: str = "",
+) -> str | None:
+    """Stash the heavy fields of a browser page-result and return a slim JSON
+    keeping only the skeleton the agent + vision middleware need inline.
+
+    Browser tools (navigate, click, …) return ``page_data`` with body text, all
+    links, and all image URLs — easily 4K+ chars that the model re-reads EVERY
+    turn (the full message history is resent each turn, so N observations cost
+    O(N²) tokens). This stashes the full payload and returns a skeleton keeping
+    ``ok``, ``page_data.{url,title}``, a 200-char text preview, ``element_map``
+    (the agent clicks by index), and ``screenshot_path`` (the vision middleware
+    reads it). The agent recalls the full content via ``ctx_recall`` only when
+    it actually needs the body text / links / images.
+
+    Returns the slim JSON string, or ``None`` if the content isn't a browser
+    page-result with heavy fields worth trimming (below ``threshold``)."""
+    if len(content) <= threshold:
+        return None  # small enough to keep inline — no stash friction
+    try:
+        payload = json.loads(content)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pd = payload.get("page_data")
+    if not isinstance(pd, dict):
+        return None  # not a browser page-result shape (e.g. /cookies, /evaluate)
+    heavy_keys = [k for k in ("text", "links", "images") if pd.get(k)]
+    if not heavy_keys:
+        return None  # nothing heavy to stash
+    stash = store.stash_blob(content, tool=tool_name, thread_id=thread_id)
+    slim = dict(payload)
+    slim_pd = {k: v for k, v in pd.items() if k not in ("text", "links", "images")}
+    # keep a 200-char text preview so the agent can orient without a recall
+    full_text = pd.get("text") or ""
+    slim_pd["text"] = full_text[:200] + ("…" if len(full_text) > 200 else "")
+    slim["page_data"] = slim_pd
+    heavy_desc = ", ".join(
+        f"{k} ({len(pd[k])} {'chars' if k == 'text' else 'items'})" for k in heavy_keys
+    )
+    slim["context_note"] = (
+        f"Page {heavy_desc} stashed to keep context lean — "
+        f"call ctx_recall({stash.handle!r}) for the full page content."
+    )
+    return json.dumps(slim, ensure_ascii=False, default=str)
+
+
+def _offload_toolmessage(
+    result: ToolMessage, store: EventStore, tool_name: str, *,
     threshold: int, preview: int, thread_id: str = "",
 ) -> Any:
-    """If ``result`` is an oversized text ToolMessage, stash + replace. Else
-    return unchanged. Pure (no I/O beyond the store); called by both the sync
-    and async wrap hooks so behavior is identical either way.
-
-    ``threshold <= 0`` is a kill-switch: offload nothing (handy for tests + a
-    future env-flag to disable the feature without unwiring the middleware).
-
-    Retrieval tools (``ctx_recall``/``ctx_search``) are exempt — see
-    ``_RETRIEVAL_TOOLS``."""
-    if (
-        threshold <= 0
-        or tool_name in _RETRIEVAL_TOOLS
-        or not _is_text_tm(result)
-        or len(result.content) <= threshold
-    ):
+    """Offload a single plain-text ToolMessage. Handles BOTH the browser
+    structural trim (stash page_data heavy fields, keep skeleton) and the
+    generic char-threshold offload (big greps, directory dumps). Returns the
+    original object unchanged if nothing to trim."""
+    if not _is_text_tm(result):
+        return result
+    # Browser structural trim fires FIRST: even a payload that's "only" 9K chars
+    # carries 4K of body text the model doesn't need every turn. Stash the heavy
+    # fields, keep the interaction skeleton inline.
+    if tool_name.startswith(_BROWSER_PREFIX):
+        slim = _trim_browser_payload(
+            result.content, store, tool_name,
+            threshold=threshold, thread_id=thread_id,
+        )
+        if slim is not None:
+            return ToolMessage(
+                content=slim, tool_call_id=result.tool_call_id, name=result.name,
+            )
+    # Generic char-threshold offload.
+    if len(result.content) <= threshold:
         return result
     stash = store.stash_blob(result.content, tool=tool_name, thread_id=thread_id)
     return ToolMessage(
         content=_stub(stash, result.content, tool_name, preview=preview),
         tool_call_id=result.tool_call_id,
         name=result.name,
+    )
+
+
+def _offload_command(
+    command: Command, store: EventStore, tool_name: str, *,
+    threshold: int, preview: int, thread_id: str = "",
+) -> Command:
+    """Reach inside a browser-vision ``Command`` and trim the text ToolMessage,
+    preserving the companion image HumanMessage(s) untouched.
+
+    ``BrowserVisionMiddleware`` (innermost) wraps every browser result as
+    ``Command(update={"messages": [text_tm, image_human]})``. Without this
+    helper the outer ``ContextMiddleware`` sees a Command (not a ToolMessage),
+    ``_is_text_tm`` returns False, and the ENTIRE text payload — 4K of body
+    text + 30 links + 50 images — escapes offload every turn. This trims the
+    text TM in place and rebuilds the Command with the image(s) intact."""
+    msgs = command.update.get("messages", [])
+    if not msgs:
+        return command
+    new_msgs: list = []
+    changed = False
+    for m in msgs:
+        if _is_text_tm(m):
+            trimmed = _offload_toolmessage(
+                m, store, tool_name,
+                threshold=threshold, preview=preview, thread_id=thread_id,
+            )
+            if trimmed is not m:
+                new_msgs.append(trimmed)
+                changed = True
+                continue
+        new_msgs.append(m)
+    if not changed:
+        return command
+    return Command(update={"messages": new_msgs})
+
+
+def _offload(
+    result: Any, store: EventStore, tool_name: str, *,
+    threshold: int, preview: int, thread_id: str = "",
+) -> Any:
+    """If ``result`` is an oversized text ToolMessage (or a browser-vision
+    Command wrapping one), stash + replace. Else return unchanged. Pure (no I/O
+    beyond the store); called by both the sync and async wrap hooks so behavior
+    is identical either way.
+
+    ``threshold <= 0`` is a kill-switch: offload nothing (handy for tests + a
+    future env-flag to disable the feature without unwiring the middleware).
+
+    Retrieval tools (``ctx_recall``/``ctx_search``) are exempt — see
+    ``_RETRIEVAL_TOOLS``."""
+    if threshold <= 0 or tool_name in _RETRIEVAL_TOOLS:
+        return result
+    # Browser-vision middleware (innermost) wraps results as a Command before
+    # we see them — reach inside and trim the text TM, keep the image.
+    if isinstance(result, Command):
+        return _offload_command(
+            result, store, tool_name,
+            threshold=threshold, preview=preview, thread_id=thread_id,
+        )
+    return _offload_toolmessage(
+        result, store, tool_name,
+        threshold=threshold, preview=preview, thread_id=thread_id,
     )
 
 

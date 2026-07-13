@@ -74,6 +74,22 @@ from langgraph.types import Command
 # Every browser specialist tool is named ``pux_sandbox_browser_<slug>``.
 _BROWSER_PREFIX = "pux_sandbox_browser_"
 
+# Per-action screenshot policy. Attaching a screenshot (~1–1.7K vision tokens)
+# after EVERY browser action is the SOTA "look → reason → act" loop, but most
+# actions are deterministic — the agent typed text it already knows, scrolled a
+# known amount, or ran a read query whose RETURN VALUE is the ground truth, not
+# the pixels. Auto-screenshotting those wastes ~60% of the browser's vision
+# tokens. So only tools where the page's visual state may change UNPREDICTABLY
+# (navigation, click-may-navigate, hover-reveals-menu, drag-moved-something)
+# auto-attach. For everything else the agent calls ``browser_screenshot``
+# explicitly when it wants to look. New browser tools default to text-only
+# (add them here iff vision is needed after them).
+_SCREENSHOT_SLUGS = frozenset({
+    "navigate", "search", "go_back", "new_tab", "switch_tab",
+    "click", "click_at", "hover", "drag", "select_dropdown",
+    "accept_cookies", "uc", "screenshot",
+})
+
 # Cap the fetch so a pathological path can't hang the agent — a screenshot over
 # this is dropped (text result still ships).
 _MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024  # 4 MiB
@@ -168,17 +184,24 @@ class BrowserVisionMiddleware(AgentMiddleware):
             return result
         if not self.multimodal_driver:
             # Text-only driver: it cannot read an image block. Point it at the
-            # typed describe_image tool (which routes to the multimodal role) so
-            # vision is DELEGATED, not silently dropped. No base64 fetch — the
-            # image stays in the container; describe_image re-reads it on demand.
-            # The path is the in-container screenshot_path, which is exactly what
-            # describe_image(image_path=...) expects.
+            # screenshot path + steer it toward the RIGHT verification channel.
+            # The SoM element map (numbered labels) is already in the tool
+            # result JSON — the model can read those. For ASSERTING page state
+            # (element exists, text rendered, value correct), browser_evaluate
+            # is exact DOM truth — steer there FIRST. describe_image (the vision
+            # proxy) is for visual-only checks (layout, color, "does it look
+            # right") where a DOM assertion can't capture the property — it's
+            # hallucination-prone on fine detail, so it's the fallback, not the
+            # default. No base64 fetch — the image stays in the container;
+            # describe_image re-reads it on demand.
             human = HumanMessage(content=[{"type": "text", "text": (
-                f"[screenshot captured for {result.name} tool_call "
-                f"{result.tool_call_id} at {path}] You cannot view images "
-                f"directly. To inspect the screenshot, call "
+                f"[screenshot result for {result.name} tool_call "
+                f"{result.tool_call_id} at {path}] You cannot view it directly. "
+                f"Prefer browser_evaluate for assertions (DOM truth: "
+                f"document.querySelector, innerText, pixel counts). "
+                f"For visual-only checks (layout, color), call "
                 f"describe_image(image_path={path!r}, "
-                f"prompt=\"<what to check about the page>\")."
+                f"prompt=\"<what to check>\")."
             )}])
             return Command(update={"messages": [result, human]})
         b64 = _screenshot_b64(self.exec_client, path)
@@ -195,19 +218,21 @@ class BrowserVisionMiddleware(AgentMiddleware):
         # Keep the text ToolMessage (tool_call_id paired) THEN append the image.
         return Command(update={"messages": [result, human]})
 
+    def _should_screenshot(self, request: Any) -> bool:
+        """True iff this browser tool's slug is in the screenshot policy set.
+        Non-browser tools short-circuit before this is called."""
+        name = self._tool_name(request)
+        if not name.startswith(_BROWSER_PREFIX):
+            return False
+        return name[len(_BROWSER_PREFIX):] in _SCREENSHOT_SLUGS
+
     def wrap_tool_call(self, request, handler):  # type: ignore[no-untyped-def]
-        if (
-            not self.enabled
-            or not self._tool_name(request).startswith(_BROWSER_PREFIX)
-        ):
+        if not self.enabled or not self._should_screenshot(request):
             return handler(request)
         return self._enrich(handler(request))
 
     async def awrap_tool_call(self, request, handler):  # type: ignore[no-untyped-def]
-        if (
-            not self.enabled
-            or not self._tool_name(request).startswith(_BROWSER_PREFIX)
-        ):
+        if not self.enabled or not self._should_screenshot(request):
             return await handler(request)
         result = await handler(request)
         return self._enrich(result)
