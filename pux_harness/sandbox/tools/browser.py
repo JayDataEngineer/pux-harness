@@ -8,7 +8,7 @@ import random
 import shlex
 import time
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from langchain_core.tools import StructuredTool
 
@@ -200,12 +200,34 @@ _BROWSER_EVALUATE_DESC = (
     "Evaluate JavaScript on the current page, return the result. Power-tool "
     "escape hatch when navigate/click/type/screenshot don't fit (e.g. read "
     "window.__NEXT_DATA__, scroll to an element, fetch XHR). Runs in the page "
-    "context — same-origin policy applies."
+    "context — same-origin policy applies.\n\n"
+    "GOTCHAS (both cost real debugging time):\n"
+    "1. OBJECT-LITERAL RETURNS NEED PARENS. `return {a: 1}` is a SYNTAX ERROR "
+    "— the JS parser treats `{` as a block statement, not an object literal. "
+    "Wrap object literals: `return ({a: 1, b: 2})`. Primitives/strings/arrays "
+    "are fine unwrapped: `return document.title`, `return [1, 2, 3]`.\n"
+    "2. PERSISTENT REPL STATE. This is a long-lived JS REPL, not a fresh "
+    "context — `let`/`var` declarations, DOM mutations, and global assignments "
+    "from one call PERSIST into the next. A variable you declared in call #1 "
+    "is still there in call #5 (re-declaring it throws `Identifier has already "
+    "been declared`). Wrap one-shot scripts in an IIFE to avoid leaking state: "
+    "`(function(){ ... })()`. Or reuse the persistence deliberately — declare a "
+    "counter once, increment it across calls."
 )
 
 
 class _BrowserEvaluateArgs(BaseModel):
-    code: str = Field(..., description="JavaScript expression to evaluate. Use 'return' for explicit values (e.g. 'return document.title')")
+    code: str = Field(
+        ...,
+        description=(
+            "JavaScript to evaluate. Use `return <value>` for the result. "
+            "CRITICAL: wrap object-literal returns in parens — "
+            "`return ({a: 1})` — `return {a: 1}` is a syntax error "
+            "(parsed as a block statement). The REPL persists across calls "
+            "(variables + mutations leak); wrap one-shot scripts in an IIFE "
+            "to isolate."
+        ),
+    )
 
 
 def _browser_evaluate_tool(exec_client: DockerExecClient) -> StructuredTool:
@@ -984,4 +1006,202 @@ def _browser_iframe_tool(exec_client: DockerExecClient) -> StructuredTool:
     return StructuredTool(
         name=PUX_PREFIX + "browser_iframe", description=_BROWSER_IFRAME_DESC,
         args_schema=_BrowserIframeArgs, func=_run,
+    )
+
+
+# --- UC mode (Cloudflare / Turnstile / hCaptcha bypass) ---------------------
+
+_BROWSER_UC_DESC = (
+    "Bypass Cloudflare Turnstile, hCaptcha, and reCAPTCHA on pages the persistent "
+    "Chrome can't pass. Spawns a dedicated SeleniumBase SB(uc=True) Chrome and calls "
+    "uc_gui_click_captcha — a REAL pyautogui mouse click on the checkbox, the only "
+    "reliable way past cross-origin captcha iframes (CDP/JS clicks are blocked by SOP "
+    "and lack the isTrusted=true signal anti-bot scripts require).\n\n"
+    "WHEN TO USE: after browser_navigate, if the page shows 'Just a moment', 'Checking "
+    "your browser', 'Verify you are human', a Cloudflare/hCaptcha challenge, OR if "
+    "browser_solve_captcha returned captcha_solved=false. Also use pre-emptively on "
+    "sites known to cage job applications behind Turnstile (Workday, some Greenhouse).\n\n"
+    "LIFECYCLE: action=open creates a persistent UC session you can follow with "
+    "action=click / type / read / evaluate on the SAME CF-cleared page, then "
+    "action=close to tear it down. Cookies (including cf_clearance) are auto-handed "
+    "off to the persistent browser so later browser_navigate calls to the same domain "
+    "inherit the cleared state.\n\n"
+    "ACTIONS:\n"
+    "  open    {url, click_captcha=true, handoff=true} — open in UC Chrome, click any "
+    "          captcha, hand cookies to persistent browser. Returns page data + cf_cleared.\n"
+    "  click   {selector?, text?} — click in the UC session.\n"
+    "  type    {selector, text, submit=false, clear=true} — type in the UC session.\n"
+    "  read    {} — re-read the UC page (title, url, text, screenshot).\n"
+    "  evaluate {code} — run JS in the UC session.\n"
+    "  cookies {cookie_action='get'|'inject_persistent'} — cookie management.\n"
+    "  close   {} — tear down the UC session."
+)
+
+
+class _BrowserUcArgs(BaseModel):
+    action: str = Field("open", description="open|click|type|read|evaluate|cookies|close")
+    url: str | None = Field(None, description="URL for action=open")
+    click_captcha: bool | None = Field(True, description="action=open: run uc_gui_click_captcha")
+    handoff: bool | None = Field(True, description="action=open: hand cookies to persistent browser")
+    selector: str | None = Field(None, description="action=click/type: CSS selector")
+    text: str | None = Field(None, description="action=click: link text | action=type: text to type")
+    by: str | None = Field("css", description="action=click: selector strategy (css|text|xpath)")
+    submit: bool | None = Field(False, description="action=type: press Enter after typing")
+    clear: bool | None = Field(True, description="action=type: clear field first")
+    code: str | None = Field(None, description="action=evaluate: JS to run")
+    cookie_action: str | None = Field("get", description="action=cookies: get|inject_persistent")
+
+
+def _browser_uc_tool(exec_client: DockerExecClient) -> StructuredTool:
+    def _run(action: str = "open", url: str | None = None, click_captcha: bool | None = True,
+             handoff: bool | None = True, selector: str | None = None, text: str | None = None,
+             by: str | None = "css", submit: bool | None = False, clear: bool | None = True,
+             code: str | None = None, cookie_action: str | None = "get") -> str:
+        body: dict = {"action": action}
+        if url is not None:
+            body["url"] = url
+        if click_captcha is not None:
+            body["click_captcha"] = click_captcha
+        if handoff is not None:
+            body["handoff"] = handoff
+        if selector is not None:
+            body["selector"] = selector
+        if text is not None:
+            body["text"] = text
+        if by is not None:
+            body["by"] = by
+        if submit is not None:
+            body["submit"] = submit
+        if clear is not None:
+            body["clear"] = clear
+        if code is not None:
+            body["code"] = code
+        if cookie_action is not None:
+            body["cookie_action"] = cookie_action
+        # UC open can take ~30-60s (spawns Chrome + captcha click). read/click
+        # are fast. Scale the curl max-time to the action.
+        timeout = 150 if action == "open" else _BROWSER_TIMEOUT
+        return _sb_post(exec_client, "/uc", body, timeout=timeout)
+    return StructuredTool(
+        name=PUX_PREFIX + "browser_uc", description=_BROWSER_UC_DESC,
+        args_schema=_BrowserUcArgs, func=_run,
+    )
+
+
+# --- accept cookies (GDPR / CCPA banner dismissal) --------------------------
+
+_BROWSER_ACCEPT_COOKIES_DESC = (
+    "Dismiss GDPR/CCPA cookie-consent banners ('We use cookies', 'Accept all', "
+    "'Manage preferences' popups). Call this IMMEDIATELY after browser_navigate lands "
+    "on a site where a cookie banner is visible — before doing anything else on the "
+    "page. Banners block the underlying UI and waste your turns if you try to SoM-click "
+    "around them.\n\n"
+    "Uses a curated selector list covering OneTrust, TrustArc, CookieBot, Quantcast, "
+    "Didomi, SourcePoint, and BBC/legacy banners, plus a text-based fallback (matches "
+    "'Accept all', 'I agree', 'Got it', etc.). More reliable than SoM-guessing: these "
+    "banners often render in containers the SoM labeler skips.\n\n"
+    "Returns cookies_accepted=true with the method/selector that worked, or "
+    "cookies_accepted=false with method='no-banner-found' (which is HONEST — banners "
+    "are geo-targeted; a US-egress browser won't see EU GDPR banners, and that's fine)."
+)
+
+
+class _BrowserAcceptCookiesArgs(BaseModel):
+    pass
+
+
+def _browser_accept_cookies_tool(exec_client: DockerExecClient) -> StructuredTool:
+    def _run() -> str:
+        return _sb_post(exec_client, "/accept_cookies", {})
+    return StructuredTool(
+        name=PUX_PREFIX + "browser_accept_cookies", description=_BROWSER_ACCEPT_COOKIES_DESC,
+        args_schema=_BrowserAcceptCookiesArgs, func=_run,
+    )
+
+
+# --- warmup history (fingerprint legitimacy) --------------------------------
+
+_BROWSER_WARMUP_HISTORY_DESC = (
+    "Build browsing-history legitimacy before a sensitive task (job applications, "
+    "account login). Visits benign high-traffic sites (Wikipedia, Hacker News, GitHub, "
+    "Stack Overflow) with realistic dwell times + scroll, so the browser's history + "
+    "cookie jar + TLS fingerprint look like a real user rather than a fresh automation "
+    "session that went straight about:blank → target-site.\n\n"
+    "WHEN TO USE: ONCE at the start of a session that will touch sensitive targets "
+    "(LinkedIn login, Workday applications, Twitter). Combats 'fresh automation' "
+    "heuristics. Don't overuse — it burns ~15-30s.\n\n"
+    "Optional: pass urls=[...] to customize the site list, dwell=N (seconds per site, "
+    "default 3.0). Returns visited count + per-site status."
+)
+
+
+class _BrowserWarmupHistoryArgs(BaseModel):
+    urls: list[str] | None = Field(None, description="Custom site list (default: 6 benign sites)")
+    dwell: float | None = Field(3.0, description="Seconds per site (randomized ±50%)")
+
+    @field_validator("urls", mode="before")
+    @classmethod
+    def _coerce_urls(cls, v):
+        """Models frequently pass a JSON array as a STRING ('[\"a\",\"b\"]')
+        rather than a real array, and Pydantic's strict list[str] rejects it
+        with "Input should be a valid list" — costing the agent 3-4 retry
+        turns before it gives up. Accept str | list, JSON-decode strings,
+        comma-split fallback, drop blanks. Returns None for empty input so
+        the server uses its default site list."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                v = json.loads(s)
+            except json.JSONDecodeError:
+                v = [u.strip() for u in s.split(",")]
+        if not isinstance(v, list):
+            return None
+        out = [str(u).strip() for u in v if str(u).strip()]
+        return out or None
+
+
+def _browser_warmup_history_tool(exec_client: DockerExecClient) -> StructuredTool:
+    def _run(urls: list[str] | None = None, dwell: float | None = 3.0) -> str:
+        body: dict = {}
+        if urls is not None:
+            body["urls"] = urls
+        if dwell is not None:
+            body["dwell"] = dwell
+        # 6 sites × ~4s dwell = ~30s budget
+        timeout = max(_BROWSER_TIMEOUT, int((len(urls) if urls else 6) * (dwell or 3) + 20))
+        return _sb_post(exec_client, "/warmup_history", body, timeout=timeout)
+    return StructuredTool(
+        name=PUX_PREFIX + "browser_warmup_history", description=_BROWSER_WARMUP_HISTORY_DESC,
+        args_schema=_BrowserWarmupHistoryArgs, func=_run,
+    )
+
+
+# --- solve captcha (honest best-effort on persistent browser) ----------------
+
+_BROWSER_SOLVE_CAPTCHA_DESC = (
+    "Best-effort captcha click on the persistent Chrome via JS. HONEST: verifies "
+    "whether a challenge is still on screen after the attempt and returns "
+    "captcha_solved=false when it can't pass (cross-origin Cloudflare/hCaptcha iframes "
+    "cannot be clicked via CDP — SOP blocks access and the click lacks isTrusted).\n\n"
+    "Use this FIRST for simple in-page captchas (old-style reCAPTCHA checkboxes that "
+    "aren't in a cross-origin iframe). If it returns captcha_solved=false with a hint, "
+    "switch to browser_uc (the SB(uc=True) + uc_gui_click_captcha path) which can pass "
+    "cross-origin Turnstile/hCaptcha via real pyautogui clicks."
+)
+
+
+class _BrowserSolveCaptchaArgs(BaseModel):
+    pass
+
+
+def _browser_solve_captcha_tool(exec_client: DockerExecClient) -> StructuredTool:
+    def _run() -> str:
+        return _sb_post(exec_client, "/solve_captcha", {})
+    return StructuredTool(
+        name=PUX_PREFIX + "browser_solve_captcha", description=_BROWSER_SOLVE_CAPTCHA_DESC,
+        args_schema=_BrowserSolveCaptchaArgs, func=_run,
     )

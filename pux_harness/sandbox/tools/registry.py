@@ -68,6 +68,10 @@ from pux_harness.sandbox.tools.browser import (
     _browser_scroll_into_view_tool,
     _browser_a11y_tool,
     _browser_iframe_tool,
+    _browser_uc_tool,
+    _browser_accept_cookies_tool,
+    _browser_warmup_history_tool,
+    _browser_solve_captcha_tool,
 )
 from pux_harness.sandbox.tools.desktop import (
     _desktop_screenshot_tool,
@@ -199,6 +203,11 @@ REGISTRY: list[ToolSpec] = [
     ToolSpec("browser_scroll_into_view", Category.SPECIALIST, Requirements(exec_client=True), _browser_scroll_into_view_tool, "browser"),
     ToolSpec("browser_a11y", Category.SPECIALIST, Requirements(exec_client=True), _browser_a11y_tool, "browser"),
     ToolSpec("browser_iframe", Category.SPECIALIST, Requirements(exec_client=True), _browser_iframe_tool, "browser"),
+    # Captcha bypass + fingerprint-legitimacy tools (SeleniumBase UC mode + curated consent)
+    ToolSpec("browser_uc", Category.SPECIALIST, Requirements(exec_client=True), _browser_uc_tool, "browser"),
+    ToolSpec("browser_accept_cookies", Category.SPECIALIST, Requirements(exec_client=True), _browser_accept_cookies_tool, "browser"),
+    ToolSpec("browser_warmup_history", Category.SPECIALIST, Requirements(exec_client=True), _browser_warmup_history_tool, "browser"),
+    ToolSpec("browser_solve_captcha", Category.SPECIALIST, Requirements(exec_client=True), _browser_solve_captcha_tool, "browser"),
 
     # desktop (xdotool + Xvfb)
     ToolSpec("desktop_screenshot", Category.SPECIALIST,
@@ -251,21 +260,24 @@ for _spec in REGISTRY:
 SPECIALIST_GROUPS: frozenset[str] = frozenset(TOOL_GROUP_TOOLS)
 
 
-def resolve_tool_allowlist(entries: Sequence[str]) -> frozenset[str] | None:
+def resolve_tool_allowlist(entries: Sequence[str]) -> frozenset[str]:
     """Resolve a ``tool_surface.groups`` list into the set of SPECIALIST slugs
-    the supervisor may carry — or ``None`` meaning "all specialists" (the
-    byte-identical default: an org without a ``tool_surface`` block gets the
-    full surface, exactly as today).
+    the SUPERVISOR may carry. OPT-IN: an org without a ``tool_surface`` block
+    gets ``frozenset()`` — NO specialists on the supervisor (they still reach
+    it via subagents, which resolve their own ``tools:`` against the FULL
+    surface). An org opts in by listing the groups/bare-slugs it wants on the
+    supervisor's own surface.
 
     Each ``entries`` item is EITHER a known group name (``code`` / ``skills`` /
     ``media`` / ``browser`` / ``desktop``) — which expands to every tool in that
     group — OR a bare specialist slug (``python``) — which enables just that one
-    tool. This lets an org say ``groups: [code, skills, media]`` (drop
-    browser/desktop from the supervisor) or ``groups: [python]`` (only python).
-    An unknown entry fails loud (PolicyError) so a typo'd group can't silently
-    ship the full surface. Empty list -> ``None`` (allow all)."""
+    tool. This lets an org say ``groups: [code, skills, media]`` (carry code +
+    skills + media on the supervisor, drop browser/desktop) or ``groups:
+    [python]`` (only python). An unknown entry fails loud (PolicyError) so a
+    typo'd group can't silently ship the wrong surface. Empty list ->
+    ``frozenset()`` (no specialists on the supervisor — the opt-in default)."""
     if not entries:
-        return None
+        return frozenset()
     allowed: set[str] = set()
     for entry in entries:
         if entry in TOOL_GROUP_TOOLS:
