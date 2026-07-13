@@ -210,12 +210,16 @@ def _build_command(spec: DeclaredToolSpec, container_dir: Path, kwargs: dict[str
         if spec.invoke == "positional":
             parts.append(shlex.quote(_stringify(val)))
         else:  # flags (default)
+            # CLI convention: snake_case arg name → kebab-case flag.
+            # Python argparse converts --min-similarity → args.min_similarity
+            # (hyphen to underscore in dest), but the FLAG uses a hyphen.
+            flag = f"--{arg.name.replace('_', '-')}"
             if arg.type == "boolean":
                 if val:
-                    parts.append(f"--{arg.name}")  # store_true convention
+                    parts.append(flag)  # store_true convention
                 # False -> omit
             else:
-                parts.append(f"--{arg.name}")
+                parts.append(flag)
                 parts.append(shlex.quote(_stringify(val)))
     return " ".join(parts)
 
