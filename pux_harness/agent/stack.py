@@ -59,6 +59,8 @@ from langchain.agents.middleware import ModelRetryMiddleware, ToolRetryMiddlewar
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_anthropic.middleware.prompt_caching import (
     AnthropicPromptCachingMiddleware,
+    _tag_system_message,
+    _tag_tools,
 )
 from langchain_core.tools import BaseTool
 
@@ -530,22 +532,96 @@ def _build_tool_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     )
 
 
+class _FullPrefixCachingMiddleware(AnthropicPromptCachingMiddleware):
+    """Caches EVERY resent token — system prompt, tools, AND the rolling
+    conversation history.
+
+    Stock ``AnthropicPromptCachingMiddleware`` tags the system prompt (breakpoint
+    1) and last tool (breakpoint 2), then passes ``cache_control`` in
+    ``model_settings`` expecting the transport to expand it into a third
+    breakpoint on the message tail.  BUT ``ChatAnthropic``'s DIRECT API path
+    (``_llm_type == "anthropic-chat"`` — what we use via ``zai-anthropic``) does
+    NOT expand that kwarg: ``_apply_cache_control_to_last_eligible_block`` is
+    gated behind ``if not _is_direct_anthropic_llm_type(...)`` and never fires.
+    The kwarg stays as a top-level parameter whose effect is undefined.  Result:
+    the growing message history — the BULK of resent tokens — was never cached.
+
+    This subclass overrides ``_apply_caching`` to EXPLICITLY tag the last
+    message's final content block with ``cache_control`` (breakpoint 3),
+    guaranteeing the entire prefix is cached regardless of transport behavior:
+
+    1.  System prompt last content block  — static prefix (~3.7K tokens)
+    2.  Last tool definition              — static tools (~10.3K tokens)
+    3.  Last message last content block   — rolling prefix (all prior turns)
+
+    On turn N+1 the prefix up to turn N's last message is a cache READ (90%
+    discount); only the 2 newest messages (latest AI response + tool result) are
+    at full price.  3 of Anthropic's 4 allowed breakpoints — well within limits.
+
+    No-op for non-``ChatAnthropic`` models (``_should_apply_caching`` returns
+    ``False``); OpenAI-compat path has its own ``prompt_cache_key`` routing hint
+    in ``model.py``.
+    """
+
+    def _apply_caching(self, request: ModelRequest) -> ModelRequest:  # type: ignore[name-defined]  # noqa: F821
+        overrides: dict[str, Any] = {}
+        cc = self._cache_control
+
+        # Breakpoint 1: system message's last content block.
+        system_message = _tag_system_message(request.system_message, cc)
+        if system_message is not request.system_message:
+            overrides["system_message"] = system_message
+
+        # Breakpoint 2: last tool definition.
+        tools = _tag_tools(request.tools, cc)
+        if tools is not request.tools:
+            overrides["tools"] = tools
+
+        # Breakpoint 3: last message's last content block — THE addition that
+        # caches the rolling conversation history.  Without this the message
+        # tail (the bulk of resent tokens) is re-billed at full price every turn.
+        messages = list(request.messages)
+        if messages:
+            last = messages[-1]
+            content = last.content
+            if isinstance(content, str):
+                if content:
+                    messages[-1] = last.model_copy(
+                        update={"content": [{"type": "text", "text": content, "cache_control": cc}]}
+                    )
+                    overrides["messages"] = messages
+            elif isinstance(content, list) and content:
+                new_content = list(content)
+                last_block = new_content[-1]
+                base = last_block if isinstance(last_block, dict) else {}
+                new_content[-1] = {**base, "cache_control": cc}
+                messages[-1] = last.model_copy(update={"content": new_content})
+                overrides["messages"] = messages
+
+        return request.override(**overrides)
+
+
 def _build_prompt_caching(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
-    """``AnthropicPromptCachingMiddleware`` — tags the system prompt's last
-    content block AND the last tool definition with
-    ``cache_control: {"type": "ephemeral", "ttl": "5m"}`` so the static prefix
-    (~25K tokens: assembled system prompt + all tool schemas) is served from
-    Anthropic's prefix cache on every turn after the first, at 90% discount.
+    """``_FullPrefixCachingMiddleware`` — caches EVERY resent token across
+    turns, not just the static prefix.
+
+    Three explicit ``cache_control`` breakpoints on the Anthropic Messages API:
+
+    1.  System prompt's last content block  (static — ~3.7K tokens)
+    2.  Last tool definition                (static — ~10.3K tokens)
+    3.  Last message's last content block   (rolling — all prior turns)
+
+    On turn N+1 the entire prefix through turn N's final message is a cache READ
+    (90% discount).  Only the 2 newest messages (latest AI response + tool
+    result) are at full price.  This is the maximum caching achievable within
+    Anthropic's 4-breakpoint limit.
 
     ``unsupported_model_behavior="ignore"`` makes this a NO-OP for non-Anthropic
-    models (our OpenAI-compat path: mimo-v2.5 via opencode-go). The OpenAI path
+    models (our OpenAI-compat path: mimo-v2.5 via opencode-go).  The OpenAI path
     gets its own caching via ``prompt_cache_key`` in ``model.py``'s
-    ``extra_body``. So this middleware is safely always-on — it activates only
-    when the model is a ``ChatAnthropic`` (e.g. glm-5.2 via ``zai-anthropic``)
-    and silently skips otherwise. The two caching mechanisms are complementary,
-    not redundant: Anthropic uses explicit ``cache_control`` breakpoints; the
-    OpenAI-compat path uses server-side prefix caching with a routing hint."""
-    return AnthropicPromptCachingMiddleware(
+    ``extra_body`` — server-side prefix caching with a routing hint.  The two
+    mechanisms are complementary, not redundant."""
+    return _FullPrefixCachingMiddleware(
         type="ephemeral",
         ttl="5m",
         min_messages_to_cache=0,
