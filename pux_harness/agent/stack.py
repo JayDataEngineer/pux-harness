@@ -57,6 +57,9 @@ import httpx
 from deepagents import RubricMiddleware
 from langchain.agents.middleware import ModelRetryMiddleware, ToolRetryMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_anthropic.middleware.prompt_caching import (
+    AnthropicPromptCachingMiddleware,
+)
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.hitl import (
@@ -79,9 +82,13 @@ from pux_harness.agent.model import (
 from pux_harness.agent.orgs import (
     _GENERAL_PURPOSE_NAME,
     _build_general_purpose_sub,
+    _load_extra_parts_for_scope,
     _org_path,
     _orgs_dir,
+    ask_user_suffix_text,
     build_system_prompt,
+    dynamic_dispatch_suffix_text,
+    harness_addendum_text,
     load_subagents,
 )
 from pux_harness.agent.profile import (
@@ -107,7 +114,7 @@ from pux_harness.context.session_guide import SessionGuideMiddleware
 from pux_harness.context.web_router import WebRouterMiddleware
 from pux_harness.agent.capabilities import CapabilityResolver
 from pux_harness.sandbox.policy import NoPolicy, load as _load_policy, resolve_tool_allowlist as _resolve_tool_allowlist
-from pux_harness.sandbox.tools import build_grader_tools
+from pux_harness.sandbox.tools import build_grader_tools, SPECIALISTS
 from pux_harness.sandbox.tools._shared import PUX_PREFIX
 from pux_harness.sandbox.tools.declared import (
     build_script_redirects,
@@ -245,6 +252,20 @@ class StackCtx:
     # supervisor on-set; ``model_router`` swaps the free heuristic for a worker
     # classifier.
     web_router_cfg: Any = None
+    # Per-agent rubric override (from the agent spec frontmatter ``rubric:`` field).
+    # When set, ``make_subagent_middleware_builder`` prepends a ``_RubricOverride``
+    # to the subagent's middleware list, injecting this rubric into ``state["rubric"]``
+    # at agent start — so the subagent gets its OWN rubric (e.g. web-verification),
+    # not the org-wide one inherited from the supervisor. ``None`` = org-wide rubric.
+    per_agent_rubric: str | None = None
+    # True iff the org's specialist tool surface includes ANY
+    # ``pux_sandbox_browser_*`` tool. Set in ``build_stack`` from the resolved
+    # specialist list. ``_build_browser_vision`` gates on this so orgs without
+    # browser tools (deep-research-engine, twitter-agent) don't mount a vision
+    # middleware that short-circuits on every call — it was previously in
+    # ``DEFAULT_SUBAGENT`` unconditionally, mounting on every subagent whether
+    # or not the org has a browser surface.
+    has_browser_tools: bool = False
 
 
 # --- THE registry ---------------------------------------------------------
@@ -365,6 +386,13 @@ def _build_browser_vision(ctx: StackCtx, scope: Scope) -> AgentMiddleware | None
     priority stack that resolves the driving model resolves its capability."""
     if not browser_vision_enabled():
         return None
+    # Skip orgs with no browser tools — the middleware is a no-op for non-
+    # browser tools, so don't mount it on orgs that don't use the browser
+    # (deep-research-engine, twitter-agent, etc.). Previously this was in
+    # DEFAULT_SUBAGENT unconditionally, costing a short-circuit check on every
+    # tool call for every subagent that never touches a browser.
+    if not ctx.has_browser_tools:
+        return None
     role = "base" if scope is Scope.SUPERVISOR else "worker"
     return BrowserVisionMiddleware(
         ctx.exec_client,
@@ -385,6 +413,30 @@ def _log_rubric_evaluation(ev: dict) -> None:
     result = ev.get("result")
     explanation = str(ev.get("explanation", "") or "").replace("\n", " ")[:240]
     print(f"[grader] iter={ev.get('iteration')} result={result} :: {explanation}")
+
+
+class _RubricOverride(AgentMiddleware):
+    """Inject a per-agent rubric into the graph state at agent start, overriding
+    the org-wide rubric inherited from the supervisor.
+
+    ``RubricMiddleware`` reads ``state["rubric"]`` to decide whether to run and
+    what to grade against. Without this override, a subagent (e.g. coder's
+    ``web-agent``) inherits the SUPERVISOR's rubric (the org-wide code rubric) —
+    wrong for a browser-verification task. This middleware is prepended to the
+    subagent's middleware list so its ``before_agent`` fires before
+    ``RubricMiddleware`` reads the state. The ``rubric`` key is already in the
+    graph state schema (added by ``RubricMiddleware``), so the update persists."""
+
+    def __init__(self, rubric: str) -> None:
+        self._rubric = rubric
+
+    def before_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return {"rubric": self._rubric}
+
+    async def abefore_agent(
+        self, state: Any, runtime: Any,
+    ) -> dict[str, Any] | None:
+        return {"rubric": self._rubric}
 
 
 def _build_rubric(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
@@ -475,6 +527,29 @@ def _build_tool_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
         initial_delay=cfg.initial_delay,
         max_delay=cfg.max_delay,
         jitter=cfg.jitter,
+    )
+
+
+def _build_prompt_caching(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
+    """``AnthropicPromptCachingMiddleware`` — tags the system prompt's last
+    content block AND the last tool definition with
+    ``cache_control: {"type": "ephemeral", "ttl": "5m"}`` so the static prefix
+    (~25K tokens: assembled system prompt + all tool schemas) is served from
+    Anthropic's prefix cache on every turn after the first, at 90% discount.
+
+    ``unsupported_model_behavior="ignore"`` makes this a NO-OP for non-Anthropic
+    models (our OpenAI-compat path: mimo-v2.5 via opencode-go). The OpenAI path
+    gets its own caching via ``prompt_cache_key`` in ``model.py``'s
+    ``extra_body``. So this middleware is safely always-on — it activates only
+    when the model is a ``ChatAnthropic`` (e.g. glm-5.2 via ``zai-anthropic``)
+    and silently skips otherwise. The two caching mechanisms are complementary,
+    not redundant: Anthropic uses explicit ``cache_control`` breakpoints; the
+    OpenAI-compat path uses server-side prefix caching with a routing hint."""
+    return AnthropicPromptCachingMiddleware(
+        type="ephemeral",
+        ttl="5m",
+        min_messages_to_cache=0,
+        unsupported_model_behavior="ignore",
     )
 
 
@@ -599,6 +674,15 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     MiddlewareSpec("model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry),
     MiddlewareSpec("tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry),
     MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
+    # ``prompt_caching`` tags the system prompt + tools with cache_control for
+    # Anthropic models (no-op for OpenAI-compat). Listed AFTER everything else
+    # so it sees the FINAL tools list (after context adds ctx_recall/ctx_search,
+    # interpreter adds eval, etc.) and tags the genuinely-last tool. It only
+    # modifies the ModelRequest (system_message + tools + model_settings) — it
+    # does NOT touch messages, so mount position relative to other wrap_model_call
+    # layers doesn't affect correctness, only which tools are in the list when
+    # the tag is applied.
+    MiddlewareSpec("prompt_caching", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_prompt_caching),
     # ``prepare`` is a ``before_agent``-only hook (no model/tool wrapping), so
     # its registry position does not affect the wrap pipeline — appended LAST to
     # avoid shifting any existing mount positions. Runs ``prepare()`` once at
@@ -635,12 +719,12 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
 # (default-on, removable via ``middleware.supervisor.remove``) — the user's
 # "selectively remove/add middleware" request, applied uniformly to the
 # formerly-non-toggleable layers too.
-DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "prompt_capture", "model_retry", "browser_vision", "prepare"]
+DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "prompt_capture", "model_retry", "browser_vision", "prompt_caching", "prepare"]
 
 # Subagents get the context layer + browser_vision by default; routing /
 # session_guide / rubric are supervisor concerns. An org MAY add a subagent
 # middleware via ``middleware.subagent.add``.
-DEFAULT_SUBAGENT: list[str] = ["context", "browser_vision"]
+DEFAULT_SUBAGENT: list[str] = ["context", "browser_vision", "prompt_caching"]
 
 
 def middleware_names() -> list[str]:
@@ -745,7 +829,7 @@ def _resolve_toggles(
 
 def make_subagent_middleware_builder(
     ctx: StackCtx, sub_add: list[str], sub_remove: set[str],
-) -> Callable[[list[str]], list[AgentMiddleware]]:
+) -> Callable[..., list[AgentMiddleware]]:
     """A per-subagent middleware resolver for ``load_subagents``.
 
     A subagent's frontmatter may carry ``middleware: [name, ...]`` — names of
@@ -765,36 +849,67 @@ def make_subagent_middleware_builder(
     subagent that DOES declare ``middleware:`` gets its OWN freshly-resolved
     list (a new ``context``/``browser_vision`` instance for that agent only) —
     the shared EventStore is passed by reference, so separate instances still
-    write to the one store."""
-    def build(extra: list[str]) -> list[AgentMiddleware]:
-        return _resolve_toggles(
+    write to the one store.
+
+    **Per-agent rubric** (``rubric_text`` kwarg): when the agent's frontmatter
+    carries a ``rubric:`` block AND the resolved list includes
+    ``RubricMiddleware``, a ``_RubricOverride`` is PREPENDED to the list. Its
+    ``before_agent`` injects the per-agent rubric into ``state["rubric"]``, so
+    the grader uses the agent's OWN rubric (e.g. web-verification for coder's
+    web-agent) instead of the org-wide one inherited from the supervisor."""
+    def build(
+        extra: list[str], *, rubric_text: str | None = None,
+    ) -> list[AgentMiddleware]:
+        resolved = _resolve_toggles(
             ctx, Scope.SUBAGENT, DEFAULT_SUBAGENT,
             list(sub_add) + list(extra), sub_remove,
         )
+        # Per-agent rubric override: when the agent's frontmatter carries a
+        # ``rubric:`` text AND ``rubric`` is in the resolved middleware set,
+        # prepend a ``_RubricOverride`` that injects the text into
+        # ``state["rubric"]`` before RubricMiddleware reads it. The gate must be
+        # armed (``_build_rubric`` returns None without it → no RubricMiddleware
+        # to consume the override). The name-based check (not isinstance) is
+        # robust under test stubs that replace the RubricMiddleware class.
+        gate_armed = (
+            ctx.rubric_gate is not None and ctx.rubric_gate.enabled
+        )
+        if (
+            rubric_text and gate_armed
+            and "rubric" in (set(sub_add) | set(extra)) - sub_remove
+        ):
+            resolved = [_RubricOverride(rubric_text), *resolved]
+        return resolved
 
     return build
 
 
 def _scope_supervisor_tools(
-    tools: list[BaseTool], allowed: frozenset[str] | None,
+    tools: list[BaseTool], allowed: frozenset[str],
 ) -> list[BaseTool]:
-    """Drop specialist tools the org's ``tool_surface.groups`` policy excluded
-    from the SUPERVISOR's own surface. ``allowed`` is the set of permitted
-    specialist slugs (``None`` => keep everything, byte-identical to today).
+    """Drop REGISTRY specialists the org's ``tool_surface.groups`` policy did
+    NOT opt into from the SUPERVISOR's own surface. OPT-IN: ``allowed`` is the
+    set of specialist slugs the org declared (``frozenset()`` => the supervisor
+    carries NO specialists — the default; they still reach them via subagents).
 
-    Only ``pux_sandbox_*`` specialists are scoped — native fs/shell (no prefix,
-    injected by ``FilesystemMiddleware``), MCP tools (``mcp__``), the context
-    retrieval tools, ``ask_user`` (appended after), and every SUBAGENT (which
-    resolves its own ``tools:`` allowlist against the FULL ``tools_surface``)
-    are untouched. So a coding org can keep browser/desktop out of the CTO prompt
-    while still delegating to a browser subagent that carries them."""
-    if not allowed:
-        return tools
+    Only REGISTRY specialists (``slug in SPECIALISTS``) are scoped — org-declared
+    tools (``tools.yaml``, also ``pux_sandbox_*``-prefixed but NOT in the
+    registry) pass through untouched, as do native fs/shell (no prefix, injected
+    by ``FilesystemMiddleware``), MCP tools (``mcp__``), the context retrieval
+    tools, ``ask_user`` (appended after), and every SUBAGENT (which resolves its
+    own ``tools:`` allowlist against the FULL ``tools_surface``). So a coding org
+    keeps browser/desktop out of the CTO prompt while still delegating to a
+    browser subagent that carries them."""
     out: list[BaseTool] = []
     for t in tools:
         name = getattr(t, "name", "")
-        if name.startswith(PUX_PREFIX) and name[len(PUX_PREFIX):] not in allowed:
-            continue
+        if name.startswith(PUX_PREFIX):
+            slug = name[len(PUX_PREFIX):]
+            # Only scope REGISTRY specialists. Declared tools (tools.yaml) share
+            # the pux_sandbox_ prefix but are already opt-in by declaration —
+            # never strip them here.
+            if slug in SPECIALISTS and slug not in allowed:
+                continue
         out.append(t)
     return out
 
@@ -867,6 +982,10 @@ def build_stack(
         tool_retry_cfg=load_tool_retry(org),
         mcp_tools=mcp_tools,
         web_router_cfg=load_web_router_config(org),
+        has_browser_tools=any(
+            getattr(t, "name", "").startswith(PUX_PREFIX + "browser_")
+            for t in specialists
+        ),
     )
     overrides = load_middleware_overrides(org)
     scoped = _normalize_overrides(profile, overrides)
@@ -931,12 +1050,16 @@ def build_stack(
         ]
 
     # Per-org SUPERVISOR tool-surface scoping (``policy.yaml``
-    # ``tool_surface.groups``). An org without a policy or without a
-    # ``tool_surface`` block keeps the FULL specialist surface (byte-identical to
-    # today). A coding org sets ``groups: [code, skills, media]`` to drop the
-    # browser/desktop specialists from the CTO prompt — the big prompt-bloat
-    # win — while subagents still resolve their own tools against the full
-    # surface. ``NoPolicy`` (no policy.yaml) is the "all tools" path.
+    # ``tool_surface.groups``). OPT-IN: an org without a policy or without a
+    # ``tool_surface`` block carries NO specialist tools on its supervisor
+    # surface — the anti-flood default (specialists still reach it via
+    # subagents, which resolve their own ``tools:`` against the FULL surface).
+    # An org opts its supervisor INTO specialists by listing groups/bare-slugs:
+    # a browser org sets ``groups: [browser, media]``; a coding org sets
+    # ``groups: [code]`` (python on the CTO, browser work delegated to web-agent).
+    # ``NoPolicy`` (no policy.yaml) is the "no specialists on the supervisor"
+    # path. Only REGISTRY specialists are scoped — declared tools (tools.yaml)
+    # pass through.
     try:
         _pol = _load_policy(org, _orgs_dir().parent)
     except NoPolicy:
@@ -963,14 +1086,17 @@ def build_stack(
     # instruction would be stale by the time the tool returns.
     ask_user_suffix_active = ask_user_active and ask_user_turn_based(facts.transport)
     prompt = assemble_prompt(
-        SUPERVISOR_PROMPT_PARTS,
+        (*SUPERVISOR_PROMPT_PARTS, *_load_extra_parts_for_scope(org, PromptScope.SUPERVISOR)),
         PromptCtx(
             agents_md_base=build_system_prompt(org),
+            harness_addendum=harness_addendum_text(),
             system_prompt_suffix=(
                 profile.system_prompt_suffix if profile is not None else None
             ),
             ask_user_active=ask_user_suffix_active,
+            ask_user_text=ask_user_suffix_text(),
             interpreter_mounted=_interpreter_mounted(supervisor_middleware),
+            dynamic_dispatch_text=dynamic_dispatch_suffix_text(),
         ),
         PromptScope.SUPERVISOR,
     )

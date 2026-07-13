@@ -628,9 +628,19 @@ def _instantiate(
     # Reasoning-depth knob (OpenAI `reasoning_effort`): honored by reasoning-
     # capable OpenAI-kind models (e.g. glm-5.2 on ZAI's coding endpoint).
     # Sent as OpenAI `extra_body` only when the id declares/overrides a value.
+    #
+    # ``prompt_cache_key``: routing hint for OpenAI-compatible prefix caching.
+    # On providers that support it (real OpenAI: automatic; some vLLM/TGI
+    # gateways), requests sharing the same key are routed to the same cache
+    # bucket so the static prefix (system prompt + tool schemas ≈ 25K tokens)
+    # is served from KV-cache instead of recomputed. Silently ignored by
+    # gateways that don't support it — zero risk. See the full cache audit in
+    # the CACHE branch for why billing-level savings depend on the gateway.
+    extra: dict[str, Any] = {"prompt_cache_key": f"pux-{model_id}"}
     effort = reasoning_effort_for(model_id)
     if effort:
-        kwargs["extra_body"] = {"reasoning_effort": effort}
+        extra["reasoning_effort"] = effort
+    kwargs["extra_body"] = extra
     if fallback_models:
         m = _FallbackReasoningChatOpenAI(**kwargs)
         m._fallback_models = list(fallback_models)
