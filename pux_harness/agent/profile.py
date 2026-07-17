@@ -81,6 +81,12 @@ def _profile_path(org: str) -> Path:
     return base / "specialists" / org / "profile.yaml"
 
 
+def _local_profile_path(org: str) -> Path:
+    """Resolve the optional ``profile.local.yaml`` path (same directory as the
+    main profile). Always returns a path; callers check ``is_file()``."""
+    return _profile_path(org).with_suffix("").with_suffix(".local.yaml")  # profile.local.yaml
+
+
 @dataclass(frozen=True)
 class RubricGate:
     """Per-org ``RubricMiddleware`` verify-gate config.
@@ -224,7 +230,12 @@ def _validate_models_block(org: str, data: dict) -> None:
 def _read_profile_yaml(org: str) -> dict | None:
     """Read + parse THIS org's OWN ``profile.yaml`` -> mapping; ``None`` if absent.
 
-    The RAW single-hop reader — no inheritance. Shared by the contract's raw
+    Also reads ``profile.local.yaml`` (same directory, automatically gitignored)
+    and deep-merges it on top — local overrides win. The local file is OPTIONAL;
+    absent is the common case and yields byte-identical results to the original
+    single-file reader.
+
+    The RAW reader — no inheritance. Shared by the contract's raw
     per-file checks (``_no_legacy_subagents_block``) and as the building block
     for ``_resolved_profile_yaml`` (the inheritance-aware reader the runtime
     loaders use). Validates the top-level ``models:`` map
@@ -232,15 +243,29 @@ def _read_profile_yaml(org: str) -> dict | None:
     the model one. A non-mapping top level (e.g. a bare list) raises
     ``TypeError`` — no silent skip; a malformed profile is a real bug."""
     path = _profile_path(org)
-    if not path.is_file():
+    local_path = _local_profile_path(org)
+    if not path.is_file() and not local_path.is_file():
         return None
-    data = yaml.safe_load(path.read_text()) or {}
-    if not isinstance(data, dict):
-        msg = (
-            f"{org}/profile.yaml: top level must be a mapping, "
-            f"got {type(data).__name__}"
-        )
-        raise TypeError(msg)
+    data: dict | None = None
+    if path.is_file():
+        data = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(data, dict):
+            msg = (
+                f"{org}/profile.yaml: top level must be a mapping, "
+                f"got {type(data).__name__}"
+            )
+            raise TypeError(msg)
+    if local_path.is_file():
+        local_data = yaml.safe_load(local_path.read_text()) or {}
+        if not isinstance(local_data, dict):
+            msg = (
+                f"{org}/profile.local.yaml: top level must be a mapping, "
+                f"got {type(local_data).__name__}"
+            )
+            raise TypeError(msg)
+        data = local_data if data is None else _deep_merge_profile(data, local_data)
+    if data is None:
+        return None
     _validate_models_block(org, data)
     return data
 

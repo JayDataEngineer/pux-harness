@@ -26,7 +26,7 @@ inspect of ``orchestrator-sandbox-mcp-default`` 2026-07-03: runc, shared-infra,
                ``pux-cache-<sha16>`` (per-project, sha256 of the abs path) →
                ``/root/.cache`` (``PUX_CACHE_VOLUME=off`` disables).
   env          ``SANDBOX_POLICY``/``DOCKER_HOST``/``HOST_GATEWAY`` + policy creds.
-  resources    mem 2048MB / cpu 2.0 cores / pids 512 (``PUX_SANDBOX_MEMORY_MB``/
+  resources    mem 2048MB / cpu 2.0 cores / pids 2048 (``PUX_SANDBOX_MEMORY_MB``/
                ``PUX_SANDBOX_CPU_CORES``/``PUX_SANDBOX_PIDS`` env knobs).
   runtime      ``runsc`` when TierIsolated + installed; ``PUX_SANDBOX_RUNTIME``
                overrides (``none`` opts out). Bridged tier never overrides.
@@ -74,6 +74,8 @@ import hashlib
 import logging
 import os
 import shlex
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -112,11 +114,57 @@ DEFAULT_IMAGE = "pux-sandbox:latest"
 DEFAULT_NETWORK = "shared-infra"
 DEFAULT_POLICIES_DIR = "/etc/openshell/policies"
 DEFAULT_POLICY = "developer"
+# Legacy fixed default. Kept as the fallback ONLY when no project path can be
+# hashed (should never happen post-``resolve_project_path``). Normal path:
+# ``_derive_sandbox_id(project_path)`` makes every project auto-isolate.
 DEFAULT_SANDBOX_ID = "mcp-default"
+
+
+def _derive_sandbox_id(project_path: str) -> str:
+    """Deterministic per-project sandbox id: ``p`` + first 8 hex of sha256(abspath).
+
+    The container name (``orchestrator-sandbox-<id>``) and the persist volume
+    (``sandbox-<id>-persist``) both key on ``sandbox_id``. With the old fixed
+    default (``mcp-default``), launching pux from a SECOND project reused the
+    same name → ``create()`` force-removed the first project's RUNNING
+    container (silent session murder). Deriving the id from the project path
+    means: different projects → different ids → different containers + volumes
+    (zero collision, zero guessing); resuming the same project → same hash →
+    reuses its container (the desired single-tenant-per-project behavior).
+
+    8 hex chars = 32 bits → ~4 billion ids; collision probability is negligible
+    for any realistic project count, and a genuine collision merely falls back
+    to the refuse-to-kill-running guard in ``create()`` (no data loss)."""
+    h = hashlib.sha256(os.path.abspath(project_path).encode()).hexdigest()[:8]
+    return f"p{h}"
+
+
+def _is_running_name_conflict(exc: Exception) -> bool:
+    """True iff ``exc`` is the ``ContainerError`` raised by :meth:`create`'s
+    collision handler when the conflicting container is RUNNING (the
+    refuse-to-kill path) — the one case :meth:`ensure` can auto-recover from
+    by re-checking for a now-registered container (the race where a parallel
+    ``ensure()`` in the same project just won ``create()``).
+
+    Narrow on purpose: a STOPPED-stale conflict is already reaped + retried
+    inside ``create()`` itself (never reaches here), and any other
+    ``ContainerError`` (start failure, egress-cap mismatch, unrelated docker
+    error) must propagate unchanged so we don't mask real failures."""
+    msg = str(exc)
+    return "RUNNING" in msg and ("held by" in msg or "already in use" in msg)
+
 
 DEFAULT_MEMORY_MB = 2048
 DEFAULT_CPU_CORES = 2.0
-DEFAULT_PIDS = 512
+# Headroom for a full desktop sandbox: Chrome alone spawns 15-30 procs
+# (--no-sandbox disables the zygote so every tab/site is a fork), a Vite dev
+# server with HMR + esbuild + node workers is another 5-10, and each dispatched
+# subagent / Python helper is more. 512 (the old default) EAGAIN'd on fork
+# ("Resource temporarily unavailable" / gVisor "procReady not received") once a
+# browser org also ran a dev server + subagents — forcing the agent to restart
+# the sandbox mid-task. 2048 is 4x headroom while still bounded; operators who
+# need tighter/looser bounds override via PUX_SANDBOX_PIDS.
+DEFAULT_PIDS = 2048
 
 CACHE_MOUNT_TARGET = "/root/.cache"
 CACHE_DISABLED_ENV = "PUX_CACHE_VOLUME"
@@ -165,8 +213,26 @@ def resolve_project_path() -> str:
     filters on it). URL schemes are rejected: their colons corrupt Docker's
     ``host:container[:mode]`` parsing (``ssh://host/path`` lands the container
     path in the mode slot → "invalid mode").
+
+    **Foot-gun warning:** the fallback to ``project_root()`` (the harness repo)
+    is what binds the sandbox workspace to the ORCHESTRATOR's own files when a
+    launcher forgets to set ``PUX_PROJECT_PATH``. That is the cross-project
+    isolation failure — the agent edits the harness repo instead of the user's
+    project. When the fallback is taken we emit a loud one-time stderr line so
+    the wrong bind is VISIBLE, not silent. ``run_acp`` (the editor-serving
+    chokepoint) goes further and derives the path from CWD rather than falling
+    back; this guard covers ``direct`` / ``serve`` / tests too.
     """
-    p = os.environ.get("PUX_PROJECT_PATH") or str(project_root())
+    p = os.environ.get("PUX_PROJECT_PATH")
+    if not p:
+        _harness = str(project_root())
+        sys.stderr.write(
+            "pux sandbox: WARNING — PUX_PROJECT_PATH unset; binding /sandbox/workspace "
+            f"to the harness repo fallback ({_harness}). If you spawned this agent "
+            "against a DIFFERENT project, it will now edit the orchestrator's own "
+            "files. Export PUX_PROJECT_PATH=<your project> to fix.\n"
+        )
+        p = _harness
     if "://" in p:  # any URL scheme — ssh://, file://, http://, ...
         raise ContainerError(f"sandboxes require a local filesystem path; received a URL: {p!r}")
     return os.path.abspath(p)
@@ -246,9 +312,18 @@ class SandboxContainer:
         client: docker.DockerClient | None = None,
     ):
         self.project_path = project_path or resolve_project_path()
-        self.sandbox_id = (
-            _env_str("PUX_SANDBOX_ID", DEFAULT_SANDBOX_ID) if sandbox_id is None else sandbox_id
-        )
+        # sandbox_id precedence: explicit kwarg > $PUX_SANDBOX_ID env >
+        # _derive_sandbox_id(project_path). The derive is the default so that
+        # two DIFFERENT projects never collide on the fixed ``mcp-default``
+        # name (which previously caused ``create()`` to force-remove a running
+        # session). Override via env/flag only when running two sessions against
+        # the SAME project (an explicit, deliberate collision).
+        if sandbox_id is not None:
+            self.sandbox_id = sandbox_id
+        elif os.environ.get("PUX_SANDBOX_ID"):
+            self.sandbox_id = os.environ["PUX_SANDBOX_ID"]
+        else:
+            self.sandbox_id = _derive_sandbox_id(self.project_path)
         self.org = org if org is not None else os.environ.get("PUX_ORG", "")
         self._client = client
         self._name: str | None = None
@@ -288,6 +363,60 @@ class SandboxContainer:
             )
         return cs[0].name
 
+    def _safe_remove(
+        self,
+        container: docker.models.containers.Container,
+        *,
+        name: str | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        """Force-remove ``container``, tolerating a concurrent in-flight removal.
+
+        Docker returns ``409 Conflict ("removal of container X is already in
+        progress")`` when two callers force-remove the same container at once —
+        the exact race two ``pux acp`` sessions sharing the deterministic name
+        ``orchestrator-sandbox-<id>`` hit when one tears down while another
+        recreates. The removal the OTHER caller initiated achieves what WE
+        wanted (the container gone), so we poll ``containers.get(name)`` until
+        it raises :class:`NotFound` and return cleanly instead of surfacing the
+        409 as a hard :class:`ContainerError` (the "manual yegsting" failure
+        the user hit). Any other :class:`APIError` (auth, daemon down) re-raises
+        unchanged so real failures still surface.
+        """
+        label = name or self.name
+        try:
+            container.remove(force=True)
+            return
+        except NotFound:
+            return  # already gone — exactly what we wanted
+        except APIError as exc:
+            if "already in progress" not in str(exc):
+                raise  # not the race — let real docker errors surface
+        # 409 race: a concurrent removal is doing our job. Wait for it to land
+        # (container → NotFound) instead of erroring in the user's face.
+        log.info(
+            "removal of %s already in progress (concurrent teardown) — waiting it out",
+            label,
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                self.client.containers.get(label)
+            except NotFound:
+                return  # the concurrent removal finished; container is gone
+        log.warning(
+            "concurrent removal of %s did not finish in %.1fs; one more attempt",
+            label, timeout,
+        )
+        try:
+            self.client.containers.get(label).remove(force=True)
+        except NotFound:
+            return
+        raise ContainerError(
+            f"remove {label}: concurrent removal stalled past {timeout:.1f}s"
+        )
+
     def _remove_stale(self) -> None:
         """Remove a STOPPED container with our deterministic name if one lingers
         from a prior crash. Mirrors Go's "already in use" → force-remove retry,
@@ -299,10 +428,7 @@ class SandboxContainer:
         if c.status == "running":
             return  # not ours to touch — discovery should have found it
         log.info("removing stale stopped container %s", self.name)
-        try:
-            c.remove(force=True)
-        except APIError as exc:
-            raise ContainerError(f"remove stale {self.name}: {exc}") from exc
+        self._safe_remove(c, name=self.name)
 
     # -- create -----------------------------------------------------------------
 
@@ -498,14 +624,39 @@ class SandboxContainer:
         try:
             container = self.client.containers.create(**create_kwargs)
         except APIError as exc:
-            # Name conflict on a stopped stale container we couldn't see → retry once.
+            # Name conflict. Distinguish a STOPPED stale container (safe to
+            # reap — the original intent of this branch: a stopped leftover
+            # that ``_remove_stale`` raced on) from a RUNNING one. A running
+            # container under this name is a LIVE session — force-removing it
+            # would silently murder another agent's browser mid-task. Refuse
+            # loud so the operator picks: reuse it, isolate via a different
+            # sandbox_id, or take it over explicitly with ``docker rm -f``.
             msg = str(exc)
             if "already in use" in msg or "Conflict" in msg:
-                log.info("name conflict on %s — force-removing stale + retry", self.name)
                 try:
-                    self.client.containers.get(self.name).remove(force=True)
+                    existing = self.client.containers.get(self.name)
                 except NotFound:
-                    pass
+                    existing = None
+                if existing is not None and existing.status == "running":
+                    raise ContainerError(
+                        f"sandbox name {self.name!r} is held by a RUNNING container "
+                        f"(id {existing.id[:12]}). pux refuses to force-remove a live "
+                        f"session. Options:\n"
+                        f"  • resume it: it is already up — re-run from the same "
+                        f"project dir.\n"
+                        f"  • isolate: launch a second concurrent session with a "
+                        f"different id — `pux acp --sandbox-id <name>` or export "
+                        f"PUX_SANDBOX_ID=<name>.\n"
+                        f"  • take over explicitly: `docker rm -f {self.name}` then "
+                        f"re-run (the previous session's workspace is safe — it is a "
+                        f"host bind-mount, not container-internal storage)."
+                    ) from exc
+                if existing is not None:
+                    log.info(
+                        "name conflict on %s — removing STOPPED stale + retry",
+                        self.name,
+                    )
+                    self._safe_remove(existing, name=self.name)
                 container = self.client.containers.create(**create_kwargs)
             else:
                 raise ContainerError(f"create {self.name}: {exc}") from exc
@@ -513,7 +664,7 @@ class SandboxContainer:
         try:
             container.start()
         except APIError as exc:
-            container.remove(force=True)
+            self._safe_remove(container, name=self.name)
             raise ContainerError(f"start {self.name}: {exc}") from exc
 
         # Resolve the watch URL now that the container is up (isolated: read the
@@ -693,16 +844,59 @@ class SandboxContainer:
         policy was added (or created by a path that skipped the cap) is REJECTED
         here rather than silently reused — the operator destroys it and a fresh
         one is created with the right caps.
+
+        Cross-session wayfinding: on entry we emit a project-switch banner if
+        this session is binding a DIFFERENT host path than the last session
+        (``projects.warn_if_switched``). ``/sandbox/workspace`` is a bind-mount
+        window onto a host dir, not storage — launching from a different CWD
+        silently points that window at a different project, which has caused
+        users to believe prior work was lost (it wasn't; the window moved).
+        After a successful boot/reuse we record the project so the next switch
+        is detectable. Both calls are best-effort and never block boot.
         """
+        # Lazy import — keeps the module-load graph acyclic and matches the
+        # inline-import style used elsewhere in the harness.
+        from pux_harness.sandbox import projects as _projects  # noqa: PLC0415
+
         if self._name:
             return self._name
+        _projects.warn_if_switched(self.project_path)
         running = self._running_for_project()
         if running:
             self._validate_reused_container(running)
             self._name = running
             log.info("reusing running container %s", running)
+            _projects.record(self.project_path, self.sandbox_id, self.org)
             return running
-        return self.create()
+        try:
+            name = self.create()
+        except ContainerError as exc:
+            # Auto-recovery for the name-conflict race: two ensure() calls in
+            # the SAME project booted simultaneously — one won create(), the
+            # other hit the refuse-to-kill guard (the winner's container is
+            # RUNNING under this project's name). Re-check: if the winner has
+            # now registered, reuse it; else retry create() once (the winner
+            # may have died). Escalate on a second failure so we never loop.
+            # Scoped by construction: the container name is derived from THIS
+            # project's path (_derive_sandbox_id), so this can NEVER reach
+            # across to a sibling project's container — the refuse-to-kill
+            # guard's safety property is preserved.
+            if not _is_running_name_conflict(exc):
+                raise
+            log.warning(
+                "name conflict on create() (race?) — re-checking for a now-"
+                "running container, then one retry: %s", exc,
+            )
+            running = self._running_for_project()
+            if running:
+                self._validate_reused_container(running)
+                self._name = running
+                log.info("recovered via reuse after create() race: %s", running)
+                _projects.record(self.project_path, self.sandbox_id, self.org)
+                return running
+            name = self.create()  # exactly one retry
+        _projects.record(self.project_path, self.sandbox_id, self.org)
+        return name
 
     def _validate_reused_container(self, name: str) -> None:
         """Reject a reused container whose security posture doesn't match the
@@ -755,11 +949,30 @@ class SandboxContainer:
             container.stop(timeout=10)
         except APIError as exc:
             log.warning("stop %s failed (non-fatal): %s", name, exc)
-        try:
-            container.remove(force=True)
-        except APIError as exc:
-            raise ContainerError(f"remove {name}: {exc}") from exc
+        self._safe_remove(container, name=name)
         log.info("sandbox destroyed: %s", name)
+        self._name = None
+
+    def reset(self) -> None:
+        """Force-remove the sandbox container WITHOUT saving persisted state —
+        a fast, unconditional teardown for a stuck/broken sandbox.
+
+        Unlike ``destroy()`` (which execs into the container to save the Chrome
+        profile + installed packages and can therefore HANG on a container that
+        isn't responding), ``reset()`` skips the save and force-removes directly
+        via the hardened ``_safe_remove`` (tolerant of a concurrent 409 removal
+        race). The next ``ensure()`` recreates a fresh container from scratch.
+        Use for recovery when a sandbox is wedged; prefer ``destroy()`` for a
+        clean, state-preserving shutdown.
+        """
+        name = self.name
+        try:
+            container = self.client.containers.get(name)
+        except NotFound:
+            self._name = None
+            return  # already gone — nothing to reset
+        self._safe_remove(container, name=name)
+        log.info("sandbox reset (force-removed, no save): %s", name)
         self._name = None
 
     # -- pause / unpause (true session preservation without teardown) --------
@@ -950,7 +1163,8 @@ if [ -d /root ]; then
 fi
 # Save list of installed packages (for reinstallation on next start)
 dpkg-query -W -f='${Package}\n' 2>/dev/null | sort > /sandbox/persist/installed-packages.txt
-echo "Saved $(wc -l < /sandbox/persist/installed-packages.txt) packages list"""
+echo "Saved $(wc -l < /sandbox/persist/installed-packages.txt) packages list"
+"""
 
 
 # --- prepare (post-create, pre-agent jobs) ----------------------------------

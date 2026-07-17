@@ -16,16 +16,21 @@ prompt() call IS the resume answer.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
+import re
 import sys
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ImageContent as MCPImageContent
+from mcp.types import TextContent as MCPTextContent
 
 from acp import spawn_agent_process
 from acp.interfaces import Agent
-from acp.schema import TextContentBlock
+from acp.schema import ImageContentBlock, TextContentBlock
 
 from pux_harness.agent.orgs import discover_orgs
 from pux_harness.agent.model import available_model_ids
@@ -57,16 +62,20 @@ class SubagentClient:
     """Collects agent messages + thoughts per session during prompt() calls."""
 
     def __init__(self) -> None:
-        self._buffers: dict[str, dict[str, list[str]]] = {}
+        self._buffers: dict[str, dict[str, list]] = {}
 
     def reset(self, session_id: str) -> None:
-        self._buffers[session_id] = {"messages": [], "thoughts": []}
+        self._buffers[session_id] = {"messages": [], "thoughts": [], "images": []}
 
     def messages(self, session_id: str) -> list[str]:
         return self._buffers.get(session_id, {}).get("messages", [])
 
     def thoughts(self, session_id: str) -> list[str]:
         return self._buffers.get(session_id, {}).get("thoughts", [])
+
+    def images(self, session_id: str) -> list[dict]:
+        """Return captured image content blocks as ``{"data": b64, "mime_type": str}``."""
+        return self._buffers.get(session_id, {}).get("images", [])
 
     @staticmethod
     def _text(content: Any) -> str:
@@ -79,17 +88,35 @@ class SubagentClient:
 
     async def session_update(self, session_id: str, update: Any, **kw: Any) -> None:
         buf = self._buffers.setdefault(
-            session_id, {"messages": [], "thoughts": []}
+            session_id, {"messages": [], "thoughts": [], "images": []}
         )
         kind = getattr(update, "session_update", "")
         if kind in ("agent_message_chunk", "agent_thought_chunk"):
-            text = self._text(update.content)
+            content = update.content
+            text = self._text(content)
             if text:
                 key = "messages" if kind == "agent_message_chunk" else "thoughts"
                 # Streaming chunks arrive fragmented; concatenate into one string.
                 if not buf[key]:
                     buf[key].append("")
                 buf[key][-1] += text
+            # Capture image content blocks emitted by the agent (screenshots,
+            # generated charts, downloaded images returned inline). The ACP
+            # spec allows ImageContentBlock in agent_message_chunk — see the
+            # ContentBlock symmetry doc. Without this capture the images are
+            # silently dropped and never reach Hermes.
+            ctype = getattr(content, "type", None) or ""
+            if ctype == "image" or (
+                hasattr(content, "data")
+                and hasattr(content, "mime_type")
+                and not text
+            ):
+                data = getattr(content, "data", None)
+                mime = getattr(content, "mime_type", None) or getattr(
+                    content, "mimeType", None
+                )
+                if data and mime:
+                    buf["images"].append({"data": data, "mime_type": mime})
 
     # Stubs — Pux workers use their own Docker sandbox; editor fs/terminal
     # callbacks are never invoked in transport="acp" mode.
@@ -199,18 +226,30 @@ class OrgConnection:
                 await self._set_model(sid, model)
             return sid
 
-    async def prompt(self, session_id: str, message: str) -> tuple[str, str, str]:
+    async def prompt(self, session_id: str, message: str,
+                     images: list[ImageContentBlock] | None = None,
+                     ) -> tuple[str, str, str, list[dict]]:
+        """Send a prompt and collect the agent's response.
+
+        Returns ``(text, thoughts, stop_reason, agent_images)`` where
+        ``agent_images`` is a list of ``{"data": b64, "mime_type": str}`` dicts
+        for any ImageContentBlock the agent emitted (screenshots, generated
+        charts, downloaded images). Previously these were silently dropped —
+        only text was captured. Now they flow back to the MCP caller so Hermes
+        sees org-produced assets natively.
+        """
         async with self._lock:
             await self.ensure()
             self.client.reset(session_id)
-            resp = await self.conn.prompt(
-                session_id,
-                [TextContentBlock(type="text", text=message)],
-            )
+            blocks: list[Any] = [TextContentBlock(type="text", text=message)]
+            if images:
+                blocks.extend(images)
+            resp = await self.conn.prompt(session_id, blocks)
             msgs = self.client.messages(session_id)
             text = "\n".join(msgs) if msgs else ""
             thoughts = "\n".join(self.client.thoughts(session_id))
-            return text, thoughts, resp.stop_reason
+            agent_images = list(self.client.images(session_id))
+            return text, thoughts, resp.stop_reason, agent_images
 
     async def list_sessions_raw(self) -> list[dict]:
         async with self._lock:
@@ -332,9 +371,10 @@ async def new_session(org: str = "general", model: str | None = None,
 
 
 @MCP.tool()
-async def prompt(session_id: str, message: str) -> str:
+async def prompt(session_id: str, message: str,
+                 images: list[dict] | None = None):
     """Send a message to a subagent session — delegate a task, ask a follow-up,
-    or answer a question.
+    or answer a question. Optionally attach images.
 
     After an end_turn, the next prompt() IS the resume answer (ACP-native:
     the ask_user interrupt persists in the checkpoint; your answer unblocks it).
@@ -342,9 +382,22 @@ async def prompt(session_id: str, message: str) -> str:
     Args:
         session_id: From new_session() or load_session().
         message: Task, follow-up, or answer.
+        images: Optional image attachments (ACP ImageContentBlock). Each item:
+          ``{"data": "<base64-encoded>", "mime_type": "image/png"}``.
+          The image is forwarded natively to the agent — the deepagents-acp
+          adapter converts it to the model's multimodal format so the agent
+          SEES the image. Requires an org whose base model is multimodal
+          (the agent declares ``promptCapabilities.image`` at initialize).
+          Use this for VISION tasks ("describe this", "what's on this screen").
+          For FILE-UPLOAD tasks ("post this image to Twitter" via
+          browser_upload), use stage_file() instead — a vision model that
+          sees an image content block cannot extract its bytes to disk.
 
     Returns:
-        Response text + stop reason. end_turn = done or asking a question
+        Response text + stop reason. When the agent returns images (screenshots,
+        generated charts, downloaded visuals), they are included as native MCP
+        image content blocks AND persisted to ``data/staged/agent_output_*``
+        so they survive across calls. end_turn = done or asking a question
         (the question is in the text).
     """
     oc = _find_org_for_session(session_id)
@@ -353,8 +406,24 @@ async def prompt(session_id: str, message: str) -> str:
             f"Error: no active connection for session '{session_id}'.\n"
             f"Create one with new_session(org)."
         )
+    image_blocks: list[ImageContentBlock] | None = None
+    if images:
+        image_blocks = []
+        for img in images:
+            data = img.get("data")
+            mime = img.get("mime_type") or img.get("mimeType")
+            if not data or not mime:
+                return (
+                    "Error: each image needs 'data' (base64) and "
+                    "'mime_type' (e.g. 'image/png')."
+                )
+            image_blocks.append(
+                ImageContentBlock(type="image", data=data, mime_type=mime)
+            )
     try:
-        text, thoughts, stop = await oc.prompt(session_id, message)
+        text, thoughts, stop, agent_images = await oc.prompt(
+            session_id, message, images=image_blocks,
+        )
         parts = []
         if text:
             parts.append(text)
@@ -368,6 +437,40 @@ async def prompt(session_id: str, message: str) -> str:
             )
         elif stop == "cancelled":
             parts.append("\n(Task cancelled.)")
+
+        # ── Asset passthrough ───────────────────────────────────────────
+        # If the agent produced images (screenshots, generated charts, etc.),
+        # persist them to staged/ AND return them as native MCP ImageContent
+        # blocks so the orchestrator (Hermes) sees them inline — no manual
+        # read_file() needed. The files are the durable copy; the MCP image
+        # blocks are the zero-friction display path.
+        if agent_images:
+            _STAGED_HOST_DIR.mkdir(parents=True, exist_ok=True)
+            import time
+            ts = int(time.time())
+            saved_paths = []
+            for i, img in enumerate(agent_images):
+                ext = "png" if "png" in img["mime_type"] else "jpg"
+                fname = f"agent_output_{ts}_{i}.{ext}"
+                try:
+                    raw = base64.b64decode(img["data"])
+                    (_STAGED_HOST_DIR / fname).write_bytes(raw)
+                    saved_paths.append(f"{_STAGED_CONTAINER_DIR}/{fname}")
+                except Exception:
+                    pass  # persist is best-effort; inline display still works
+            if saved_paths:
+                parts.append("\n📸 Agent images saved:")
+                for p in saved_paths:
+                    parts.append(f"  `{p}`")
+            # Return native MCP content blocks: text + each image inline.
+            content: list = [MCPTextContent(type="text", text="\n".join(parts))]
+            for img in agent_images:
+                content.append(MCPImageContent(
+                    type="image",
+                    data=img["data"],
+                    mimeType=img["mime_type"],
+                ))
+            return content
         return "\n".join(parts)
     except Exception as exc:
         return f"Error: {exc}"
@@ -446,6 +549,114 @@ async def cancel_session(session_id: str) -> str:
 
 
 @MCP.tool()
+async def reset_session(session_id: str) -> str:
+    """Reset the sandbox backing a session — force-remove its container so the
+    next prompt() recreates a fresh one. Use when the sandbox is stuck or broken
+    (a tool is hanging, the container is wedged, files got corrupt).
+
+    This is a RECOVERY primitive: it does NOT save the sandbox's current state
+    (installed packages, Chrome profile) — the point is a clean slate. The
+    session's conversation history is preserved (durable checkpoint); only the
+    container is replaced. Any in-flight task on the session is cancelled first.
+    Scoped to the session's org — it resets the one sandbox container that org
+    runs in.
+
+    Args:
+        session_id: The session whose sandbox should be reset.
+
+    Returns:
+        Confirmation that the sandbox was reset (or was already absent).
+    """
+    oc = _find_org_for_session(session_id)
+    if oc is None:
+        return f"Error: no active connection for session '{session_id}'."
+    org = oc.org
+    # Cancel any in-flight task first so we don't force-remove the container out
+    # from under a running tool call (best-effort; harmless if the session is
+    # idle). The exec layer re-ensures on NotFound, so a tool mid-flight when
+    # the reset lands auto-recovers onto the fresh container.
+    try:
+        await oc.cancel(session_id)
+    except Exception:  # noqa: BLE001 — cancel must never block the reset
+        pass
+    try:
+        from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
+
+        SandboxContainer(org=org).reset()
+        return (
+            f"Sandbox reset for org `{org}` (session `{session_id}`).\n"
+            f"A fresh container is recreated automatically on the next prompt()."
+        )
+    except Exception as exc:
+        return f"Error resetting sandbox for '{org}': {exc}"
+
+
+@MCP.tool()
+async def reload_profiles(org: str | None = None) -> str:
+    """Hot-reload agent profiles (``profile.yaml`` / ``profile.local.yaml``)
+    by bouncing the cached ACP subprocess for an org — or every active org
+    when ``org`` is omitted.
+
+    Use this AFTER editing an org's profile so the NEXT ``new_session()``
+    picks up the change. Without it, the harness reuses the already-running
+    ACP subprocess (which holds the OLD profile in memory for the whole
+    server lifetime), forcing a full ``pux`` server restart from a host
+    terminal — the round-trip this tool eliminates.
+
+    What it does NOT do:
+      • It does NOT touch the sandbox container (installed packages, browser
+        profile, running browser) — only the ACP agent process. Use
+        ``reset_session`` for a stuck sandbox.
+      • Existing live sessions on the bounced org are interrupted (their ACP
+        process is gone); their conversation history is durable in the
+        checkpointer, so ``load_session`` resurrects them on the fresh
+        process with the NEW profile.
+
+    Args:
+        org: The org whose profiles should be reloaded. ``None`` (default)
+        reloads ALL currently-active orgs. Unknown / inactive orgs are
+        reported, not treated as errors.
+
+    Returns:
+        A per-org report of what was bounced + the instruction to call
+        ``new_session`` (or ``load_session``) to use the refreshed profile.
+    """
+    if org is not None:
+        targets = [org]
+    else:
+        targets = list(_pool.keys())
+
+    bounced: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    for o in targets:
+        oc = _pool.get(o)
+        if oc is None:
+            skipped.append(f"{o} (not active)")
+            continue
+        try:
+            await oc.stop()  # kills the cached ACP subprocess
+            bounced.append(o)
+        except Exception as exc:  # noqa: BLE001 — one org's failure must not abort the rest
+            errors.append(f"{o}: {exc}")
+
+    parts = []
+    if bounced:
+        parts.append(
+            "Reloaded profiles for: " + ", ".join(bounced) + ". "
+            "The next new_session() (or load_session()) on these orgs spawns a "
+            "fresh ACP process that re-reads profile.yaml + profile.local.yaml."
+        )
+    if skipped:
+        parts.append("Skipped (no active subprocess): " + "; ".join(skipped))
+    if errors:
+        parts.append("Errors: " + "; ".join(errors))
+    if not parts:
+        parts.append("No active orgs to reload.")
+    return " ".join(parts)
+
+
+@MCP.tool()
 async def set_model(session_id: str, model: str) -> str:
     """Change the model on a session. See new_session for available models."""
     oc = _find_org_for_session(session_id)
@@ -456,6 +667,144 @@ async def set_model(session_id: str, model: str) -> str:
         return f"Model set to `{model}` on `{session_id}`."
     except Exception as exc:
         return f"Error: {exc}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File staging — for UPLOAD tasks (complementary to ACP ImageContentBlock)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# prompt(images=...) uses ACP ImageContentBlock — the agent SEES the image
+# (vision). But for UPLOAD tasks ("post this image to Twitter" via
+# browser_upload), the agent needs the image as a FILE it can pass to
+# <input type="file">. A vision model that sees an image block cannot extract
+# its bytes to disk. stage_file() bridges that gap: write the bytes here
+# (host-side), the agent reads them at the container path (workspace bind mount).
+
+_STAGED_HOST_DIR = Path(PUX_PROJECT_ROOT) / "data" / "staged"
+_STAGED_CONTAINER_DIR = "/sandbox/workspace/data/staged"
+_SAFE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+_MAX_STAGE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+@MCP.tool()
+async def stage_file(filename: str, content_b64: str) -> str:
+    """Stage a file (base64-encoded) for an agent to upload or process.
+
+    Use this when the agent needs the file BYTES on disk — e.g. posting an
+    image to Twitter (browser_upload needs a file path, not a vision block).
+    For VISION tasks (the agent just needs to SEE an image), use
+    prompt(images=...) instead — that's the native ACP path with no disk I/O.
+
+    The project root is bind-mounted into the sandbox container at
+    /sandbox/workspace, so a file written here is instantly visible at the
+    returned container path. data/staged/ is gitignored (runtime, not source).
+
+    Args:
+        filename: Filename only (no path separators). Alphanumeric + ._-
+        content_b64: Base64-encoded file content.
+
+    Returns:
+        Container-absolute path the agent uses in browser_upload, etc.
+    """
+    if not _SAFE_NAME.match(filename):
+        return (
+            f"Error: unsafe filename {filename!r}. "
+            "Use alphanumeric + dot/underscore/hyphen only."
+        )
+    try:
+        raw = base64.b64decode(content_b64, validate=True)
+    except Exception as exc:
+        return f"Error: invalid base64 ({exc})"
+    if not raw:
+        return "Error: decoded content is empty"
+    if len(raw) > _MAX_STAGE_BYTES:
+        return (
+            f"Error: file too large ({len(raw):,} bytes; "
+            f"cap {_MAX_STAGE_BYTES // (1024 * 1024)} MB)"
+        )
+    _STAGED_HOST_DIR.mkdir(parents=True, exist_ok=True)
+    (_STAGED_HOST_DIR / filename).write_bytes(raw)
+    container_path = f"{_STAGED_CONTAINER_DIR}/{filename}"
+    return (
+        f"Staged {len(raw):,} bytes.\n"
+        f"  container_path: `{container_path}`\n"
+        f"  Pass this path in prompt() so the agent knows where to find the file."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File retrieval — read back files agents saved to the workspace
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# stage_file() is write-only (host → container). But agents also WRITE files:
+# deep-research-engine downloads images to data/images/, browser-agent saves
+# screenshots, etc. The workspace bind mount means those files exist on the
+# host too — read_file() lets Hermes pull them back to show the user, forward
+# to another org, or re-stage for a different agent.
+#
+# Scoped to data/ (the runtime area, gitignored). No source code, no configs.
+
+_DATA_HOST_DIR = Path(PUX_PROJECT_ROOT) / "data"
+
+
+@MCP.tool()
+async def read_file(path: str) -> str:
+    """Read a file from the workspace data/ directory, returning base64 content.
+
+    Use this to retrieve files that an agent saved during a task — e.g.
+    images downloaded by deep-research-engine, screenshots captured by
+    browser-agent, transcripts generated by media analysis. The content
+    comes back as base64 so you can display it, forward it, or re-stage it
+    for another agent via stage_file().
+
+    Only files under data/ are readable (runtime area — images, downloads,
+    session state). Source code, configs, and everything outside data/ is
+    off-limits.
+
+    Args:
+        path: Relative path within data/ (e.g. "images/news1.jpg",
+              "staged/tweet.jpg"). No .. or absolute paths.
+
+    Returns:
+        Base64-encoded content + byte size + detected mime type, or an error.
+    """
+    # Reject path traversal and absolute paths.
+    if path.startswith("/") or ".." in Path(path).parts:
+        return (
+            f"Error: unsafe path {path!r}. "
+            "Use a relative path within data/ (no .. or leading /)."
+        )
+    target = (_DATA_HOST_DIR / path).resolve()
+    try:
+        target.relative_to(_DATA_HOST_DIR.resolve())
+    except ValueError:
+        return f"Error: path {path!r} escapes data/"
+    if not target.is_file():
+        return f"Error: not found — {path!r} (resolved: {target})"
+    if target.is_symlink():
+        return f"Error: symlinks are not readable (security)"
+    raw = target.read_bytes()
+    if len(raw) > _MAX_STAGE_BYTES:
+        return (
+            f"Error: file too large ({len(raw):,} bytes; "
+            f"cap {_MAX_STAGE_BYTES // (1024 * 1024)} MB)"
+        )
+    b64 = base64.b64encode(raw).decode("ascii")
+    # Lightweight mime sniff from extension.
+    ext = target.suffix.lower()
+    _MIME = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+        ".pdf": "application/pdf", ".mp4": "video/mp4", ".mp3": "audio/mpeg",
+        ".wav": "audio/wav", ".json": "application/json",
+        ".txt": "text/plain", ".csv": "text/csv",
+    }
+    mime = _MIME.get(ext, "application/octet-stream")
+    return (
+        f"Read {len(raw):,} bytes ({mime}).\n"
+        f"  path: data/{path}\n"
+        f"  base64:\n{b64}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

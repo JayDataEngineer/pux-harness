@@ -439,17 +439,23 @@ def _check_policy(org: str) -> int:
     return 1 if missing else 0
 
 
-def _sandbox(cmd: str, output: str | None = None) -> int:
+def _sandbox(cmd: str, output: str | None = None, sandbox_id: str | None = None,
+             prune_days: int = 14, dry_run: bool = False) -> int:
     """Docker sandbox lifecycle, harness-owned. Replaces the Go
     ``task start/stop/status`` for container boot. ``ensure`` reuses a running
     container or boots one (the path the exec client takes lazily).
     ``dump-persist`` streams the named persist volume to a host tarball
     (gap 5 of the persistence audit — the Chrome profile, apt-install list,
     and ``/root`` dotfiles stored named-volume-side are otherwise invisible
-    to the host filesystem)."""
+    to the host filesystem).
+
+    ``sandbox_id`` overrides the per-project default (container name + persist
+    volume key). Pass None to use the derived default — different projects
+    auto-isolate, so you only need this for two concurrent sessions on ONE
+    project."""
     from pux_harness.sandbox.container import SandboxContainer, resolve_project_path
 
-    sb = SandboxContainer()
+    sb = SandboxContainer(sandbox_id=sandbox_id)
     project = resolve_project_path()
     org = sb.org or "(none)"
 
@@ -495,9 +501,59 @@ def _sandbox(cmd: str, output: str | None = None) -> int:
         print(f"persist volume → {out} ({size:,} bytes)")
         print("(Chrome profile, apt-install list, /root dotfiles)")
         return 0
+    if cmd == "projects":
+        # The wayfinding command: list every project path the harness has ever
+        # bound, newest-first, so a user who launched from the "wrong" dir can
+        # find the previous project's host path + the resume command. Closes the
+        # "I lost all my work" panic — the work is on disk, this names where.
+        from pux_harness.sandbox import projects as _projects  # noqa: PLC0415
+
+        rows = _projects.list_projects()
+        if not rows:
+            print("(no projects recorded yet)")
+            print("the registry is populated on the next `pux acp` / "
+                  "`pux sandbox ensure` — re-run from your project dir.")
+            return 0
+        print(f"  {'last_used (UTC)':<21} {'org':<14} {'sandbox':<14} path")
+        for r in rows:
+            mark = " " if r["exists"] else "!"
+            ts = (r["last_used"] or "")[:19]
+            org = (r["org"] or "-")[:14]
+            sid = (r["sandbox_id"] or "-")[:14]
+            print(f"{mark} {ts:<21} {org:<14} {sid:<14} {r['path']}")
+        print(f"\n{len(rows)} project(s).  (! = host path no longer exists)")
+        # Highlight the most recent project that ISN'T the current bind.
+        prev = _projects.previous_project(project)
+        if prev:
+            print("\nmost recent OTHER project:")
+            print(f"  {prev['path']}")
+            print("  resume with:")
+            print(f"    cd {prev['path']} && pux acp")
+        return 0
+    if cmd == "prune-sessions":
+        # Bound the inert session history under <project>/.pux/: finished-thread
+        # .meta.json files, the append-only run_events.jsonl, and wild-run logs.
+        # None of these are a leak (no live process holds them) but months of
+        # heavy use produces thousands of tiny files / one large JSONL. Default
+        # retention 14d; --dry-run previews; --prune-days N sets the window.
+        # Deliberately does NOT touch agent-protocol.sqlite (live thread store).
+        from pux_harness.sandbox.prune import prune_pux_dir, summarize  # noqa: PLC0415
+        from pux_harness.kit._paths import project_root  # noqa: PLC0415
+
+        # ``_write_thread_meta`` writes to ``project_root()/.pux/sessions`` (the
+        # harness app root, NOT ``$PUX_PROJECT_PATH``), so all session metadata
+        # accumulates here regardless of which project is edited. Prune the same
+        # dir so we actually hit the accumulation.
+        pux_dir = project_root() / ".pux"
+        report = prune_pux_dir(pux_dir, days=prune_days, dry_run=dry_run)
+        print(summarize(report))
+        if dry_run:
+            print("\n(re-run without --dry-run to apply)")
+        return 0
     raise SystemExit(
         f"unknown sandbox subcommand {cmd!r}; "
-        f"use: start | stop | status | ensure | pause | unpause | dump-persist"
+        f"use: start | stop | status | ensure | pause | unpause | "
+        f"dump-persist | projects | prune-sessions"
     )
 
 
@@ -634,9 +690,11 @@ def run_list_orgs() -> None:
         print(f"  {org}: {', '.join(org_agent_slugs(org)) or '(no agents)'}")
 
 
-def run_sandbox(cmd: str, output: str | None = None) -> None:
+def run_sandbox(cmd: str, output: str | None = None, sandbox_id: str | None = None,
+                prune_days: int = 14, dry_run: bool = False) -> None:
     """Docker sandbox lifecycle."""
-    raise SystemExit(_sandbox(cmd, output=output))
+    raise SystemExit(_sandbox(cmd, output=output, sandbox_id=sandbox_id,
+                              prune_days=prune_days, dry_run=dry_run))
 
 
 def run_check_smoke(org: str = "general") -> None:
@@ -692,8 +750,21 @@ def main() -> None:
                     help="resolve + report this org's policy (mounts/creds/egress/tier); "
                          "exit 1 if required creds are missing. No model call.")
     ap.add_argument("--sandbox", metavar="CMD",
-                    help="Docker sandbox lifecycle: start | stop | status | ensure "
-                         "(harness-owned; replaces `task start/stop/status`)")
+                    help="Docker sandbox lifecycle: start | stop | status | ensure | "
+                         "projects (harness-owned; replaces `task start/stop/status`). "
+                         "Default sandbox_id is now derived from the project path — "
+                         "use --sandbox-id only to override (e.g. two sessions on one project).")
+    ap.add_argument("--sandbox-id", default=None,
+                    help="override the per-project sandbox id (container name + persist "
+                         "volume key). Default: derived from PUX_PROJECT_PATH so different "
+                         "projects never collide. Set this ONLY when running two concurrent "
+                         "sessions against the SAME project.")
+    ap.add_argument("--prune-days", type=int, default=14, metavar="N",
+                    help="with --sandbox prune-sessions: retention window in days "
+                         "(default 14). Entries older than N days are swept. 0 = all.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --sandbox prune-sessions: preview what would be swept "
+                         "without deleting anything.")
     ap.add_argument("--jobs-run", action="store_true",
                     help="run prep jobs for this org inside the sandbox")
     ap.add_argument("--jobs-status", action="store_true",
@@ -703,7 +774,8 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.sandbox is not None:
-        run_sandbox(args.sandbox)
+        run_sandbox(args.sandbox, sandbox_id=args.sandbox_id,
+                    prune_days=args.prune_days, dry_run=args.dry_run)
 
     if args.jobs_run:
         run_jobs(args.org, args.job)
