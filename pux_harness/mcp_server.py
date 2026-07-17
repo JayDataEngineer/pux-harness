@@ -808,16 +808,125 @@ async def read_file(path: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# deploy_browser_agent — the one-function browser/multimedia entry point.
+# No session management: Claude Code (or any MCP client) calls this with a
+# natural-language task; a fresh browser-agent session runs it to completion
+# and returns text + inline screenshots. This is the "deploy_browser_agent as
+# a function" surface — simpler than the two-step new_session/prompt dance,
+# intentionally coarser than driving individual browser tools.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@MCP.tool()
+async def deploy_browser_agent(task: str):  # noqa: ANN201
+    """Deploy a one-shot browser/multimedia task to the browser-agent.
+
+    The browser-agent drives a persistent SeleniumBase Chrome session inside
+    an isolated sandbox — it can navigate, click, type, scroll, screenshot,
+    fill forms, download files, and describe images (vision). Hand it a goal
+    in natural language; it browses the live web to complete it and returns
+    the result text plus any screenshots it captured (as inline image content
+    you can SEE, not just paths).
+
+    This is the single-function browser entry point — no ``new_session`` /
+    ``prompt`` / session-id bookkeeping. Each call spins a fresh agent
+    session on the ``browser-agent`` org, runs to completion, and returns.
+    The underlying Chrome + sandbox container persist across calls (warm
+    boot), so repeated calls are fast.
+
+    Examples of good tasks:
+      - "Go to https://example.com and tell me what the page offers."
+      - "Screenshot https://news.ycombinator.com and list the top 5 stories."
+      - "Download the PDF linked at <url> and confirm it saved."
+      - "Fill the contact form at <url> with name=Jane, email=j@x.com."
+
+    Args:
+        task: The browsing task in natural language. Be specific about the URL
+            and the desired outcome.
+
+    Returns:
+        The agent's text response, plus any images it produced (returned as
+        native MCP image content blocks AND persisted to data/staged/ so they
+        survive across calls). On an infrastructure error, returns an
+        ``Error: ...`` string.
+    """
+    try:
+        oc = await _get_org("browser-agent")
+        sid = await oc.new_session()
+        text, _thoughts, stop, agent_images = await oc.prompt(sid, task)
+    except Exception as exc:  # noqa: BLE001 — surface infra failures to the caller
+        return f"Error deploying browser-agent: {exc}"
+
+    parts: list[str] = [text or "(no response)", f"\n*[{stop}]*"]
+
+    # Persist + inline images (mirrors the prompt() tool's asset passthrough:
+    # files are the durable copy, MCP image blocks are the zero-friction
+    # display path so the client sees screenshots without a read_file round-trip).
+    if agent_images:
+        _STAGED_HOST_DIR.mkdir(parents=True, exist_ok=True)
+        import time  # noqa: PLC0415
+        ts = int(time.time())
+        saved_paths: list[str] = []
+        for i, img in enumerate(agent_images):
+            ext = "png" if "png" in img["mime_type"] else "jpg"
+            fname = f"browser_agent_{ts}_{i}.{ext}"
+            try:
+                raw = base64.b64decode(img["data"])
+                (_STAGED_HOST_DIR / fname).write_bytes(raw)
+                saved_paths.append(f"{_STAGED_CONTAINER_DIR}/{fname}")
+            except Exception:  # noqa: BLE001 — persist is best-effort
+                pass
+        if saved_paths:
+            parts.append("\n📸 Browser-agent images saved:")
+            for p in saved_paths:
+                parts.append(f"  `{p}`")
+        content: list = [MCPTextContent(type="text", text="\n".join(parts))]
+        for img in agent_images:
+            content.append(MCPImageContent(
+                type="image",
+                data=img["data"],
+                mimeType=img["mime_type"],
+            ))
+        return content
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    import uvicorn  # noqa: PLC0415
+    # Transport: ``stdio`` (editor-spawned, no daemon) or ``sse`` (default;
+    # network clients like Hermes connect to :9987). ``pux mcp --transport
+    # stdio`` runs the SAME MCP object + tool surface over stdio so Zed /
+    # Claude Code spawn it on demand — no long-running daemon to babysit,
+    # matching how ``pux acp`` (ACP stdio) already works for agent_servers.
+    transport = os.environ.get("PUX_MCP_TRANSPORT", "")
+    if not transport:
+        # Parse --transport from argv by hand (keep it dependency-free; the
+        # bin/pux shim forwards args verbatim: `pux mcp --transport stdio`).
+        for i, a in enumerate(sys.argv[1:], start=1):
+            if a == "--transport" and i + 1 < len(sys.argv) + 1:
+                transport = sys.argv[i + 1]
+                break
+            if a.startswith("--transport="):
+                transport = a.split("=", 1)[1]
+                break
+    transport = transport or "sse"
+    if transport not in ("stdio", "sse"):
+        sys.stderr.write(f"[pux] unknown transport {transport!r}; use stdio|sse\n")
+        sys.exit(2)
 
+    sys.stderr.write(f"[pux] ACP subprocess root: {PUX_PROJECT_ROOT}\n")
+    if transport == "stdio":
+        sys.stderr.write("[pux] MCP-stdio (editor-spawned, no daemon)\n")
+        MCP.run(transport="stdio")
+        return
+
+    import uvicorn  # noqa: PLC0415
     host = os.environ.get("PUX_MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("PUX_MCP_PORT", "9987"))
     sys.stderr.write(f"[pux] MCP-SSE on {host}:{port}\n")
-    sys.stderr.write(f"[pux] ACP subprocess root: {PUX_PROJECT_ROOT}\n")
     app = MCP.sse_app()
     uvicorn.run(app, host=host, port=port)
 
