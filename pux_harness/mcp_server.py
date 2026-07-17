@@ -892,6 +892,146 @@ async def deploy_browser_agent(task: str):  # noqa: ANN201
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# web-research proxy — search / fetch / research as pux MCP tools.
+#
+# Why a proxy instead of pointing the client at web-research-mcp directly:
+# Claude Code's `.mcp.json` has NO per-server tool allowlist, so a direct
+# connection floods the client with all 17 of research-mcp's tools (context
+# cost on every turn). Proxying the 3 read-only research tools here means the
+# client sees EXACTLY deploy_browser_agent + web_search + web_fetch +
+# web_research + the file tools — the proxy IS the allowlist. Signatures
+# mirror the live server (probed 2026-07-17 at $PUX_MCP_WEB_RESEARCH_URL).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _web_research_url() -> str:
+    return os.environ.get("PUX_MCP_WEB_RESEARCH_URL", "http://127.0.0.1:41827/mcp")
+
+
+async def _forward_to_research_mcp(url: str, tool: str, args: dict):
+    """The actual MCP client call to web-research-mcp.
+
+    Per-call connect (stateless streamable HTTP) — no long-lived session to
+    manage. Separated from :func:`_web_research_call` so tests can monkeypatch
+    this one seam instead of standing up the real server. Returns the raw
+    MCP ``CallToolResult`` (raises on transport/protocol failure so the caller
+    can shape it into an error string)."""
+    from mcp import ClientSession  # noqa: PLC0415
+    from mcp.client.streamable_http import streamablehttp_client  # noqa: PLC0415
+
+    async with streamablehttp_client(url) as (read, write, _get_session_id):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return await session.call_tool(tool, args)
+
+
+def _coerce_proxy_content(blocks: list) -> list:
+    """Normalize a web-research-mcp CallToolResult.content list into MCP
+    content blocks this server can return. Text + Image pass through (so
+    ``fetch`` on an image-bearing page returns the images inline — the
+    multimedia payoff); anything else is stringified to text."""
+    out: list = []
+    for b in blocks or []:
+        btype = getattr(b, "type", None)
+        if btype == "text":
+            out.append(MCPTextContent(type="text", text=getattr(b, "text", str(b))))
+        elif btype == "image":
+            out.append(MCPImageContent(
+                type="image",
+                data=getattr(b, "data", ""),
+                mimeType=getattr(b, "mimeType", "image/png"),
+            ))
+        else:
+            out.append(MCPTextContent(type="text", text=str(b)))
+    return out or [MCPTextContent(type="text", text="(no content)")]
+
+
+async def _web_research_call(tool: str, args: dict):
+    """Forward ``tool(args)`` to web-research-mcp and return MCP content blocks
+    (or an ``Error:`` string if the server is unreachable)."""
+    url = _web_research_url()
+    try:
+        result = await _forward_to_research_mcp(url, tool, args)
+    except Exception as exc:  # noqa: BLE001 — unreachable server is a normal ops condition
+        return (
+            f"Error: web-research-mcp unreachable at {url} ({exc}). "
+            f"Start it (docker compose up in the research-mcp repo) and retry."
+        )
+    if getattr(result, "is_error", False):
+        # Surface the upstream error text so the client sees why it failed.
+        err_text = "\n".join(
+            getattr(b, "text", str(b)) for b in (result.content or [])
+            if getattr(b, "type", None) == "text"
+        ) or f"upstream tool {tool!r} returned an error"
+        return f"Error from web-research-mcp {tool}: {err_text}"
+    return _coerce_proxy_content(getattr(result, "content", []))
+
+
+@MCP.tool()
+async def web_search(query: str, top_k: int | None = None,
+                     pages: int | None = None):  # noqa: ANN201
+    """Search the web via multiple engines. Returns titles, URLs, and short
+    snippets. This is a proxy to web-research-mcp's ``search`` tool.
+
+    Use this when you want a list of candidate results to evaluate. When you
+    want the actual CONTENT (page bodies scraped to markdown), use
+    ``web_research`` (search + scrape in one call) or ``web_fetch`` (one URL).
+
+    Args:
+        query: The search query.
+        top_k: Optional max results to return.
+        pages: Optional number of search-engine result pages to pull.
+    """
+    args: dict = {"query": query}
+    if top_k is not None:
+        args["top_k"] = top_k
+    if pages is not None:
+        args["pages"] = pages
+    return await _web_research_call("search", args)
+
+
+@MCP.tool()
+async def web_fetch(url: str, text_only: bool = False,
+                    css_selector: str | None = None):  # noqa: ANN201
+    """Scrape a single URL and extract clean markdown content. Proxy to
+    web-research-mcp's ``fetch`` tool.
+
+    JS-heavy pages render via crawl4ai/selenium; PDFs extract to text. By
+    default IMAGES come back too (as inline image content you can see) — pass
+    ``text_only=True`` to drop them for speed when only the text matters.
+
+    Args:
+        url: The URL to fetch.
+        text_only: If True, drop images and return markdown text only.
+        css_selector: Optional CSS selector for targeted content extraction.
+    """
+    args: dict = {"url": url, "text_only": text_only}
+    if css_selector is not None:
+        args["css_selector"] = css_selector
+    return await _web_research_call("fetch", args)
+
+
+@MCP.tool()
+async def web_research(query: str, max_results: int = 3,
+                       depth: str = "quick"):  # noqa: ANN201
+    """Search + scrape the top results in one call — the fastest path to
+    actual content on a topic. Proxy to web-research-mcp's ``research`` tool.
+
+    Returns the scraped markdown (and any images) from the top results. Use
+    this instead of ``web_search`` when you want to READ the pages, not just
+    see URLs/snippets.
+
+    Args:
+        query: The research query.
+        max_results: How many top results to scrape (default 3).
+        depth: ``"quick"`` (default) or a deeper mode if the server supports it.
+    """
+    return await _web_research_call(
+        "research", {"query": query, "max_results": max_results, "depth": depth},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
