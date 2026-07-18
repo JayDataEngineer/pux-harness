@@ -244,7 +244,13 @@ class OrgConnection:
             blocks: list[Any] = [TextContentBlock(type="text", text=message)]
             if images:
                 blocks.extend(images)
-            resp = await self.conn.prompt(session_id, blocks)
+            # acp.py:prompt(self, prompt, session_id) — prompt (content blocks)
+            # is the FIRST positional arg, session_id is SECOND. These were
+            # transposed, which produced a deterministic PromptRequest
+            # validation error on every call (prompt got the session_id str,
+            # session_id got the content-block list) — the "hard-broken,
+            # won't fix on retry" failure.
+            resp = await self.conn.prompt(blocks, session_id)
             msgs = self.client.messages(session_id)
             text = "\n".join(msgs) if msgs else ""
             thoughts = "\n".join(self.client.thoughts(session_id))
