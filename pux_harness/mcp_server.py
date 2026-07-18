@@ -137,6 +137,43 @@ class SubagentClient:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Transient-error classification (for prompt retry)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    """Should this exception be retried inside ``OrgConnection.prompt``?
+
+    True for model-provider / network hiccups (stream stalls, 5xx, rate
+    limits, connection drops) — the LangGraph checkpointer resumes from the
+    last persisted step, so re-running ``conn.prompt`` is safe and the caller
+    never sees the hiccup. False for deterministic code bugs (ValidationError,
+    TypeError, AttributeError, KeyError) — surfacing those immediately is more
+    useful than burning retries on a failure that cannot change shape.
+
+    Note on ``BadRequestError``: normally a 400 (do NOT retry), but some
+    providers raise it for mid-stream stalls ("model stream stalled"). We
+    retry it ONLY when the message indicates a stream/timeout, never for a
+    genuine bad-request payload.
+    """
+    name = (type(exc).__name__ or "").lower()
+    msg = str(exc).lower()
+    transient_classes = {
+        "apiconnectionerror", "apitimeouterror", "internalservererror",
+        "ratelimiterror", "apierror", "timeouterror", "connectionerror",
+        "readtimeouterror", "readerror", "remoteprotocolerror", "protocolerror",
+    }
+    if name in transient_classes:
+        return True
+    if "badrequest" in name:
+        return any(t in msg for t in ("stream", "stall", "timeout", "connection"))
+    return any(t in msg for t in (
+        "stream stalled", "connection reset", "timed out", "timeout",
+        "temporarily", "overloaded", "rate limit", " too many requests",
+        "503", "502", "500",
+    ))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # OrgConnection — one ACP subprocess per org
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -240,22 +277,32 @@ class OrgConnection:
         """
         async with self._lock:
             await self.ensure()
-            self.client.reset(session_id)
             blocks: list[Any] = [TextContentBlock(type="text", text=message)]
             if images:
                 blocks.extend(images)
-            # acp.py:prompt(self, prompt, session_id) — prompt (content blocks)
-            # is the FIRST positional arg, session_id is SECOND. These were
-            # transposed, which produced a deterministic PromptRequest
-            # validation error on every call (prompt got the session_id str,
-            # session_id got the content-block list) — the "hard-broken,
-            # won't fix on retry" failure.
-            resp = await self.conn.prompt(blocks, session_id)
-            msgs = self.client.messages(session_id)
-            text = "\n".join(msgs) if msgs else ""
-            thoughts = "\n".join(self.client.thoughts(session_id))
-            agent_images = list(self.client.images(session_id))
-            return text, thoughts, resp.stop_reason, agent_images
+            # Retry transient provider/network errors (model-stream stalls,
+            # 5xx, rate limits, connection drops) so a flaky model API never
+            # surfaces to the caller as a hard failure. The LangGraph
+            # checkpointer resumes from the last persisted step on re-entry,
+            # so re-running conn.prompt is safe and non-duplicating.
+            # Deterministic errors (ValidationError, TypeError, etc.) surface
+            # immediately — no wasted retries on real bugs.
+            for attempt in range(3):
+                try:
+                    self.client.reset(session_id)
+                    # acp.py:prompt(self, prompt, session_id) — prompt (content
+                    # blocks) FIRST, session_id SECOND (see commit d897336).
+                    resp = await self.conn.prompt(blocks, session_id)
+                    msgs = self.client.messages(session_id)
+                    text = "\n".join(msgs) if msgs else ""
+                    thoughts = "\n".join(self.client.thoughts(session_id))
+                    agent_images = list(self.client.images(session_id))
+                    return text, thoughts, resp.stop_reason, agent_images
+                except Exception as exc:
+                    if not _is_transient_provider_error(exc) or attempt == 2:
+                        raise
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+            raise RuntimeError("unreachable")  # type: ignore[unreachable]
 
     async def list_sessions_raw(self) -> list[dict]:
         async with self._lock:
@@ -856,12 +903,27 @@ async def deploy_browser_agent(task: str):  # noqa: ANN201
         survive across calls). On an infrastructure error, returns an
         ``Error: ...`` string.
     """
+    # Capture sid BEFORE the call that can raise, so a transient mid-turn
+    # failure (model stream stall, provider 5xx, sandbox hiccup) NEVER costs
+    # the whole subagent conversation. The session and its prior checkpoints
+    # persist in the agent-protocol store regardless of whether THIS turn
+    # completed; surfacing the id lets the caller resume instead of losing
+    # everything. This is the fix for "it breaks the subagent, then I lose
+    # the entire conversation."
+    sid: str | None = None
     try:
         oc = await _get_org("browser-agent")
         sid = await oc.new_session()
         text, _thoughts, stop, agent_images = await oc.prompt(sid, task)
-    except Exception as exc:  # noqa: BLE001 — surface infra failures to the caller
-        return f"Error deploying browser-agent: {exc}"
+    except Exception as exc:  # noqa: BLE001 — surface infra failures, KEEP the session recoverable
+        if sid:
+            return (
+                f"Error deploying browser-agent (session {sid} — RECOVERABLE): {exc}\n\n"
+                f"The subagent turn failed mid-flight but the conversation still exists. "
+                f"Resume it with load_session(session_id={sid!r}) then "
+                f"prompt(session_id={sid!r}, message=\"...\")."
+            )
+        return f"Error deploying browser-agent (no session was created): {exc}"
 
     parts: list[str] = [text or "(no response)", f"\n*[{stop}]*"]
 
