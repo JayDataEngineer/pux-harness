@@ -530,32 +530,57 @@ async def prompt(session_id: str, message: str,
 
 
 @MCP.tool()
-async def list_sessions(org: str | None = None) -> str:
-    """List active subagent sessions.
+async def list_sessions(org: str | None = None, limit: int = 50) -> str:
+    """List subagent sessions from the persistent thread store.
+
+    Reads ``.pux/agent-protocol.sqlite`` directly so sessions are visible on
+    ANY server — fresh or long-running — not only when an OrgConnection
+    happens to be active in the in-memory pool. This is the fix for the silent
+    "No subagent sessions" lie: sessions were always persisted on disk, but
+    the old implementation only walked ``_pool``, and a fresh server has an
+    empty pool, so 1,000+ threads on disk were reported as "no sessions" and
+    the operator reasonably concluded the work was lost. It was never lost —
+    it was unreachable. Now list_sessions reads the store itself.
 
     Args:
         org: Optional org filter. If omitted, lists across all orgs.
+        limit: Max sessions to return, newest first. Default 50.
 
     Returns:
-        Active sessions with org, title, and last update time.
+        Sessions (id, org, title, created_at) with the total count on disk,
+        and the resume recipe.
     """
-    orgs_to_check = [org] if org else list(_pool.keys())
-    if not orgs_to_check:
+    import json as _json
+    from pux_harness.threads import open_thread_store
+    try:
+        async with open_thread_store() as store:
+            rows = await store.list_threads(org=org)
+    except Exception as exc:
+        return f"Error reading session store: {exc}"
+    if not rows:
         return "No subagent sessions. Use new_session(org) to start one."
-    all_sessions: list[dict] = []
-    for o in orgs_to_check:
-        if o in _pool and _pool[o].alive:
+    total = len(rows)
+    shown = rows[:limit] if (limit and limit > 0) else rows
+    header = f"**{len(shown)} of {total} session(s)** on disk"
+    if org:
+        header += f" (org={org})"
+    lines = [header,
+             "Resume any with load_session(session_id=<id>, org=<org>) "
+             "then prompt(session_id=<id>, message=...)."]
+    for r in shown:
+        sid = r.get("thread_id", "?")
+        o = r.get("org") or "?"
+        meta = r.get("metadata")
+        if isinstance(meta, str):
             try:
-                all_sessions.extend(await _pool[o].list_sessions_raw())
+                meta = _json.loads(meta)
             except Exception:
-                pass
-    if not all_sessions:
-        return "No active subagent sessions."
-    lines = [f"**{len(all_sessions)} session(s):**"]
-    for s in all_sessions:
-        title = f" — {s['title']}" if s.get("title") else ""
-        ts = f" ({s['updated_at']})" if s.get("updated_at") else ""
-        lines.append(f"- `{s['session_id']}` org=`{s['org']}`{title}{ts}")
+                meta = {}
+        title = ""
+        if isinstance(meta, dict) and meta.get("title"):
+            title = f" — {meta['title']}"
+        ts = f" ({r.get('created_at')})" if r.get("created_at") else ""
+        lines.append(f"- `{sid}` org=`{o}`{title}{ts}")
     return "\n".join(lines)
 
 
