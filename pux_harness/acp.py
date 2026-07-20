@@ -126,6 +126,59 @@ DEFAULT_ORG = "general"
 # in ``run_acp`` so library tracebacks never corrupt the stdout JSON-RPC stream.
 _log = logging.getLogger("pux.acp")
 
+# How many times ``PuxAgentServer.prompt()`` re-enters ``super().prompt()`` on a
+# transient model-stream stall before giving up and surfacing the end_turn +
+# resume notice. Re-entering is SAFE: LangGraph's checkpointer resumes from the
+# last completed node, so a retry never duplicates work — it picks up exactly
+# where the stall killed the prior attempt. Tuned so that 4 × 120s
+# (stream_chunk_timeout) + 14s of backoff ≈ 8 min of patience before we hand
+# control back to the user with a "your work is checkpointed — re-send to
+# resume" notice.
+_PROMPT_MAX_ATTEMPTS = 4
+_PROMPT_BACKOFF_BASE = 2.0  # seconds; doubled each retry → 2s, 4s, 8s
+
+
+def _is_stream_stall_recoverable(exc: BaseException) -> bool:
+    """True iff ``exc`` is a transient stream stall worth retrying.
+
+    A stall = the upstream model stream went silent (TCP alive, provider not
+    sending tokens) OR a transient connection/rate-limit blip. Re-entering
+    ``super().prompt()`` resumes from the last LangGraph checkpoint, so the
+    retry is both safe and productive — partial work from prior nodes is
+    already persisted.
+
+    Deterministic errors (``ValidationError``, ``TypeError``,
+    ``AttributeError``, auth failures, schema mismatches) return ``False``:
+    they will not change shape across attempts, and retrying only delays the
+    inevitable ``end_turn``.
+    """
+    # ``StreamChunkTimeoutError`` (langchain-openai) subclasses
+    # ``asyncio.TimeoutError`` per the upstream source — the most common
+    # concrete trigger for the "⚠️ This turn ended early" symptom.
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(exc, (ConnectionError, asyncio.IncompleteReadError)):
+        return True
+    name = (type(exc).__name__ or "").lower()
+    msg = str(exc).lower()
+    recoverable_classes = {
+        "apiconnectionerror", "apitimeouterror", "internalservererror",
+        "ratelimiterror", "apierror", "readtimeouterror", "readerror",
+        "remoteprotocolerror", "protocolerror", "streamchunktimeouterror",
+    }
+    if name in recoverable_classes:
+        return True
+    # ``BadRequest`` is normally deterministic — but provider streams sometimes
+    # surface ``bad_request: stream stalled`` / ``... timeout`` which ARE
+    # transient. Only retry those narrow messages.
+    if "badrequest" in name:
+        return any(t in msg for t in ("stream", "stall", "timeout", "connection"))
+    return any(t in msg for t in (
+        "stream stalled", "connection reset", "timed out", "timeout",
+        "temporarily", "overloaded", "rate limit", "too many requests",
+        "503", "502", "500",
+    ))
+
 # Traffic log — writes every JSON-RPC method call to a file so we can see
 # EXACTLY what the editor (Zed) calls and what it ignores. Written to
 # ``.pux/acp-traffic.log`` (one line per call, JSON format).
@@ -606,102 +659,128 @@ class _RegisteringAgentServerACP(AgentServerACP):
             if self._cancelled:
                 self._cancelled = False
                 return PromptResponse(stop_reason="cancelled")
+            # RETRY LOOP around the turn body. A transient model-stream stall
+            # (TCP alive, provider silent → ``StreamChunkTimeoutError`` after
+            # ``stream_chunk_timeout`` seconds) MUST NOT end the turn — re-enter
+            # ``super().prompt()``; LangGraph's checkpointer resumes from the
+            # last completed node, so the retry picks up exactly where the stall
+            # killed the prior attempt. Only deterministic errors or
+            # exhausted retries fall through to the end_turn + notice path.
+            #
+            # Why we still guarantee a ``PromptResponse`` even on final failure:
+            # the ACP dispatcher runs each ``session/prompt`` on a detached
+            # supervisor task, and the IncomingMessage store only records
+            # status (``fail_incoming``) — it holds no Future to reject and
+            # writes nothing to the wire. An unhandled exception is swallowed
+            # by the supervisor's error log and the JSON-RPC ``session/prompt``
+            # RESPONSE is never sent. The editor (Zed) spins forever — the
+            # "response just freezes" symptom. So we always end the turn
+            # cleanly, but only AFTER retrying, not instead of retrying.
+            #
+            # ``asyncio.CancelledError`` / ``KeyboardInterrupt`` /
+            # ``SystemExit`` are ``BaseException`` and are intentionally NOT
+            # caught — the cancel path returns ``stop_reason="cancelled"``
+            # inside the base loop, and a genuine cancellation must keep
+            # propagating.
+            last_exc: Exception | None = None
+            attempts_made = 0
+            for attempt in range(_PROMPT_MAX_ATTEMPTS):
+                attempts_made = attempt + 1
+                try:
+                    if self._agent is None:
+                        self._reset_agent(session_id)
+                        # Kick off background browser warmup NOW (not on the
+                        # first browser tool call inside a subagent). Chrome
+                        # cold-starts in ~15-20s; starting it at first-prompt
+                        # time means the CTO can think + dispatch to web-agent
+                        # while Chrome warms in parallel. By the time web-agent
+                        # calls browser_navigate, it's ready. Fire-and-forget.
+                        self._maybe_warmup_browser()
+                    agent = self._agent
+                    if agent is not None:
+                        config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
+                        try:
+                            state = await agent.aget_state(config)
+                        except Exception:  # noqa: BLE001 — fresh/empty thread has no snapshot yet
+                            state = None
+                        if state is not None and self._has_ask_user_interrupt(state):
+                            return await self._resume_ask_user(session_id, prompt, config)
+                    return await super().prompt(
+                        prompt=prompt, session_id=session_id, message_id=message_id, **kwargs
+                    )
+                except _AskUserPause:
+                    # The turn ended on an ask_user: question was presented in
+                    # ``_handle_interrupts``; the interrupt persists. ``end_turn``
+                    # so the editor hands control back to the user.
+                    return PromptResponse(stop_reason="end_turn")
+                except Exception as exc:
+                    last_exc = exc
+                    recoverable = _is_stream_stall_recoverable(exc)
+                    more_attempts = attempt < _PROMPT_MAX_ATTEMPTS - 1
+                    if recoverable and more_attempts:
+                        backoff = _PROMPT_BACKOFF_BASE * (2 ** attempt)
+                        _log.warning(
+                            "prompt() stream stall for session %s (attempt %d/%d): "
+                            "%s: %s — re-entering super().prompt() in %.1fs "
+                            "(LangGraph resumes from last checkpoint, no work lost)",
+                            session_id, attempts_made, _PROMPT_MAX_ATTEMPTS,
+                            type(exc).__name__, exc, backoff,
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+                    # Unrecoverable OR exhausted retries → fall through to the
+                    # end_turn + notice path below.
+                    break
+
+            # FINAL-ATTEMPT FAILURE (or deterministic error). Surface end_turn
+            # with a resume-aware notice so the user knows their work IS
+            # checkpointed — re-sending the same message resumes from the last
+            # completed step, it does NOT restart the turn.
+            assert last_exc is not None, "retry loop exited without an exception"
+            exc = last_exc
+            _log.exception(
+                "prompt() raised for session %s after %d/%d attempts; surfacing "
+                "end_turn with resume notice: %s: %s",
+                session_id, attempts_made, _PROMPT_MAX_ATTEMPTS,
+                type(exc).__name__, exc,
+            )
+            # Durable evidence dump. stderr is pinned to Zed's stdio pipe
+            # (pin_stderr=True) so the traceback above is LOST to the editor
+            # and never reaches a file — leaving us to guess. Write the full
+            # traceback to .pux/stall.log so the operator can see EXACTLY
+            # which layer raised (supervisor astream vs a middleware vs a
+            # subagent vs a grader). Best-effort: never break the turn end.
             try:
-                if self._agent is None:
-                    self._reset_agent(session_id)
-                    # Kick off background browser warmup NOW (not on the first
-                    # browser tool call inside a subagent). Chrome cold-starts in
-                    # ~15-20s; starting it at first-prompt time means the CTO can
-                    # think + dispatch to web-agent while Chrome warms in parallel.
-                    # By the time web-agent calls browser_navigate, it's ready.
-                    # Fire-and-forget — no exception escapes, no blocking.
-                    self._maybe_warmup_browser()
-                agent = self._agent
-                if agent is not None:
-                    config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
-                    try:
-                        state = await agent.aget_state(config)
-                    except Exception:  # noqa: BLE001 — fresh/empty thread has no snapshot yet
-                        state = None
-                    if state is not None and self._has_ask_user_interrupt(state):
-                        return await self._resume_ask_user(session_id, prompt, config)
-                return await super().prompt(
-                    prompt=prompt, session_id=session_id, message_id=message_id, **kwargs
+                import traceback as _tb
+                from datetime import datetime as _dt
+                _stall = project_root() / ".pux" / "stall.log"
+                _stall.parent.mkdir(parents=True, exist_ok=True)
+                with _stall.open("a") as _f:
+                    _f.write(f"\n{'=' * 72}\n")
+                    _f.write(f"[{_dt.now().isoformat()}] session={session_id} "
+                             f"org={getattr(self, '_org', '?')} "
+                             f"attempts={attempts_made}/{_PROMPT_MAX_ATTEMPTS}\n")
+                    _f.write(f"exception={type(exc).__name__}: {exc}\n\n")
+                    _f.write("".join(_tb.format_exception(exc)))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await self._log_text(
+                    session_id=session_id,
+                    text=(
+                        f"⚠️ This turn ended early — the model stream stalled "
+                        f"({type(exc).__name__}) and didn't recover after "
+                        f"{attempts_made} attempt(s). Your work up to this point "
+                        f"is checkpointed: re-send the same message and the "
+                        f"subagent will resume from the last completed step, "
+                        f"not start over."
+                    ),
                 )
-            except _AskUserPause:
-                # The turn ended on an ask_user: question was presented in
-                # ``_handle_interrupts``; the interrupt persists. ``end_turn`` so the
-                # editor hands control back to the user (mechanically a normal turn end).
-                return PromptResponse(stop_reason="end_turn")
-            except Exception as exc:
-                # LAST-RESORT TURN TERMINATION. Any exception that escapes the
-                # base ``prompt`` loop (the ``async for stream_chunk in
-                # agent.astream(...)`` block has NO try/except of its own) must
-                # NOT propagate further: the ACP dispatcher runs each
-                # ``session/prompt`` on a detached supervisor task, and the
-                # IncomingMessage store only records status (``fail_incoming``)
-                # — it holds no Future to reject and writes nothing to the wire.
-                # So an unhandled exception here is swallowed by the
-                # supervisor's error log and the JSON-RPC ``session/prompt``
-                # RESPONSE is never sent. The editor (Zed) spins forever — the
-                # "response just freezes" symptom.
-                #
-                # The concrete trigger: a stalled upstream model stream.
-                # langchain-openai raises ``StreamChunkTimeoutError`` (subclass
-                # of ``asyncio.TimeoutError``) after ``stream_chunk_timeout``
-                # seconds (default 120) with zero SSE chunks — TCP alive,
-                # provider silent. That class is NOT an ``openai.APITimeoutError``,
-                # so it is NOT in ``_TRANSIENT_EXCEPTIONS`` and the declared
-                # glm-5.2 → glm-5.1 fallback chain does NOT absorb it; it walks
-                # straight out of ``agent.astream``. Surface a short notice via
-                # ``_log_text`` (a real assistant ``session/message`` update the
-                # editor renders) so the user sees WHY the turn ended, then end
-                # the turn cleanly.
-                #
-                # ``asyncio.CancelledError`` / ``KeyboardInterrupt`` /
-                # ``SystemExit`` are ``BaseException`` and are intentionally NOT
-                # caught — the cancel path returns ``stop_reason="cancelled"``
-                # inside the base loop, and a genuine cancellation must keep
-                # propagating. Logged at error level with a full traceback so a
-                # real bug is visible to the operator instead of masked.
-                _log.exception(
-                    "prompt() raised for session %s; surfacing end_turn to avoid "
-                    "an editor freeze: %s: %s",
-                    session_id, type(exc).__name__, exc,
+            except Exception:  # noqa: BLE001 — surfacing is best-effort
+                _log.debug(
+                    "could not surface stall notice via _log_text", exc_info=True,
                 )
-                # Durable evidence dump. stderr is pinned to Zed's stdio pipe
-                # (pin_stderr=True) so the traceback above is LOST to the editor
-                # and never reaches a file — leaving us to guess. Write the full
-                # traceback to .pux/stall.log so the operator can see EXACTLY
-                # which layer raised (supervisor astream vs a middleware vs a
-                # subagent vs a grader). Best-effort: never break the turn end.
-                try:
-                    import traceback as _tb
-                    from datetime import datetime as _dt
-                    _stall = project_root() / ".pux" / "stall.log"
-                    _stall.parent.mkdir(parents=True, exist_ok=True)
-                    with _stall.open("a") as _f:
-                        _f.write(f"\n{'=' * 72}\n")
-                        _f.write(f"[{_dt.now().isoformat()}] session={session_id} "
-                                 f"org={getattr(self, '_org', '?')}\n")
-                        _f.write(f"exception={type(exc).__name__}: {exc}\n\n")
-                        _f.write("".join(_tb.format_exception(exc)))
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    await self._log_text(
-                        session_id=session_id,
-                        text=(
-                            f"⚠️ This turn ended early — the model stream stalled "
-                            f"({type(exc).__name__}). The connection stayed open "
-                            f"but no tokens arrived. Re-send your message to retry."
-                        ),
-                    )
-                except Exception:  # noqa: BLE001 — surfacing is best-effort
-                    _log.debug(
-                        "could not surface stall notice via _log_text", exc_info=True,
-                    )
-                return PromptResponse(stop_reason="end_turn")
+            return PromptResponse(stop_reason="end_turn")
 
     @staticmethod
     def _has_ask_user_interrupt(state: Any) -> bool:
