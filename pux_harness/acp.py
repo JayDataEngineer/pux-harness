@@ -126,58 +126,33 @@ DEFAULT_ORG = "general"
 # in ``run_acp`` so library tracebacks never corrupt the stdout JSON-RPC stream.
 _log = logging.getLogger("pux.acp")
 
+# Stream-stall classifier + policy live in ``pux_harness.agent.retry`` (shared
+# with ``agent.graph``, which wires the policy onto the deepagents ``model``
+# node — the LangGraph-native layer that retried a stall in-place without
+# losing in-flight work). The prompt-boundary retry loop below is the
+# DEFENSE-IN-DEPTH outer layer: it catches stalls that escape the node-level
+# retry (e.g. a stall inside a middleware that runs OUTSIDE the model node, or
+# a stall in a node we didn't attach the policy to).
+from pux_harness.agent.retry import retry_on_stream_stall as _is_stream_stall_recoverable
+
 # How many times ``PuxAgentServer.prompt()`` re-enters ``super().prompt()`` on a
 # transient model-stream stall before giving up and surfacing the end_turn +
-# resume notice. Re-entering is SAFE: LangGraph's checkpointer resumes from the
-# last completed node, so a retry never duplicates work — it picks up exactly
-# where the stall killed the prior attempt. Tuned so that 4 × 120s
-# (stream_chunk_timeout) + 14s of backoff ≈ 8 min of patience before we hand
-# control back to the user with a "your work is checkpointed — re-send to
-# resume" notice.
+# resume notice. This is the FALLBACK path — the primary retry happens at the
+# model-node level via RetryPolicy (see ``agent.graph.build_graph`` and
+# ``agent.retry.attach_stream_stall_retry``). The wrapper-level retry catches
+# stalls that escape the node-level policy.
+#
+# NOTE on resume semantics: re-entering ``super().prompt()`` re-passes the
+# user prompt as NEW input, which causes LangGraph to APPEND the message and
+# re-run the turn from the start. Prior TURNS are preserved (conversation
+# history is checkpointed); the in-flight TURN's partial work is re-done.
+# This is acceptable as a fallback because the primary node-level retry
+# handles the common case (stall inside the model node) WITHOUT losing
+# in-flight work. Tuned so 4 × 120s (``stream_chunk_timeout``) + 14s of
+# backoff ≈ 8 min of patience before handing control back with the resume
+# notice.
 _PROMPT_MAX_ATTEMPTS = 4
 _PROMPT_BACKOFF_BASE = 2.0  # seconds; doubled each retry → 2s, 4s, 8s
-
-
-def _is_stream_stall_recoverable(exc: BaseException) -> bool:
-    """True iff ``exc`` is a transient stream stall worth retrying.
-
-    A stall = the upstream model stream went silent (TCP alive, provider not
-    sending tokens) OR a transient connection/rate-limit blip. Re-entering
-    ``super().prompt()`` resumes from the last LangGraph checkpoint, so the
-    retry is both safe and productive — partial work from prior nodes is
-    already persisted.
-
-    Deterministic errors (``ValidationError``, ``TypeError``,
-    ``AttributeError``, auth failures, schema mismatches) return ``False``:
-    they will not change shape across attempts, and retrying only delays the
-    inevitable ``end_turn``.
-    """
-    # ``StreamChunkTimeoutError`` (langchain-openai) subclasses
-    # ``asyncio.TimeoutError`` per the upstream source — the most common
-    # concrete trigger for the "⚠️ This turn ended early" symptom.
-    if isinstance(exc, asyncio.TimeoutError):
-        return True
-    if isinstance(exc, (ConnectionError, asyncio.IncompleteReadError)):
-        return True
-    name = (type(exc).__name__ or "").lower()
-    msg = str(exc).lower()
-    recoverable_classes = {
-        "apiconnectionerror", "apitimeouterror", "internalservererror",
-        "ratelimiterror", "apierror", "readtimeouterror", "readerror",
-        "remoteprotocolerror", "protocolerror", "streamchunktimeouterror",
-    }
-    if name in recoverable_classes:
-        return True
-    # ``BadRequest`` is normally deterministic — but provider streams sometimes
-    # surface ``bad_request: stream stalled`` / ``... timeout`` which ARE
-    # transient. Only retry those narrow messages.
-    if "badrequest" in name:
-        return any(t in msg for t in ("stream", "stall", "timeout", "connection"))
-    return any(t in msg for t in (
-        "stream stalled", "connection reset", "timed out", "timeout",
-        "temporarily", "overloaded", "rate limit", "too many requests",
-        "503", "502", "500",
-    ))
 
 # Traffic log — writes every JSON-RPC method call to a file so we can see
 # EXACTLY what the editor (Zed) calls and what it ignores. Written to

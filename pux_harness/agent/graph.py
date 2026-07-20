@@ -23,6 +23,7 @@ contract tripwire enforces that (this module imports NEITHER
 from __future__ import annotations
 
 from typing import Any, Sequence
+import os
 
 from deepagents import create_deep_agent
 from langchain_core.tools import BaseTool
@@ -132,7 +133,8 @@ def build_graph(
         store=store,
     )
 
-    return create_deep_agent(
+    transport = (facts.transport if facts else "serve")
+    graph = create_deep_agent(
         model=base_model,
         system_prompt=plan.supervisor_prompt,
         tools=plan.supervisor_tools,
@@ -148,3 +150,90 @@ def build_graph(
         store=memory_store,
         checkpointer=checkpointer,
     )
+    # LangGraph-native stream-stall retry. Attaches a RetryPolicy to the
+    # ``model`` node so a stalled upstream model stream (TCP alive, provider
+    # silent → StreamChunkTimeoutError, a subclass of asyncio.TimeoutError,
+    # after stream_chunk_timeout seconds) is retried IN-PLACE — the
+    # checkpointer preserves every node that completed before the stall,
+    # the stalled model node picks up from its own beginning, and the rest
+    # of the turn continues normally. No work re-done. No exception
+    # propagated to the caller. No '⚠️ This turn ended early' notice.
+    #
+    # This is the PRIMARY retry layer. ``pux_harness.acp.PuxAgentServer.prompt``
+    # has a SECONDARY wrapper-level retry as defense-in-depth for stalls that
+    # escape the model node (e.g. a stall inside a middleware running in a
+    # different node). See ``agent/retry.py`` for the full rationale and the
+    # shared classifier.
+    from pux_harness.agent.retry import attach_stream_stall_retry
+    attach_stream_stall_retry(graph)
+    return _with_langfuse_tracing(graph, org, transport=transport)
+
+
+def _with_langfuse_tracing(
+    graph: CompiledStateGraph, org: str, *, transport: str = "serve"
+) -> CompiledStateGraph:
+    """Wrap a compiled graph's ``astream`` to inject the Langfuse CallbackHandler.
+
+    Uses LangChain's standard callback system — the handler automatically traces
+    every LLM call, tool use, subagent spawn, and reasoning step in the
+    deepagents graph. Each ``astream`` call = one Langfuse trace; the
+    ``thread_id`` from the config becomes the ``langfuse_session_id`` (groups
+    all prompts in a thread into one session in the UI); org/transport become
+    tags (UI filter axes).
+
+    Applied centrally in ``build_graph`` so EVERY entry point (direct, acp,
+    serve, mcp, tui) produces traces — not just ACP. The ``org`` parameter
+    tags the trace with the originating org for UI filtering.
+
+    No-op when langfuse is not installed or credentials are absent — the graph
+    runs identically with or without. A down/unreachable Langfuse host never
+    blocks a run: the handler queues locally and flushes best-effort.
+    """
+    try:
+        from langfuse.langchain import CallbackHandler as _LangfuseHandler
+    except ImportError:
+        return graph
+
+    if not (
+        os.environ.get("LANGFUSE_PUBLIC_KEY")
+        and os.environ.get("LANGFUSE_SECRET_KEY")
+    ):
+        return graph
+
+    _orig_astream = graph.astream
+
+    def _traced_astream(input, config=None, **kwargs):
+        """Synchronous wrapper that injects Langfuse callbacks into config,
+        then delegates to the original ``astream``.
+
+        MUST be a regular function (NOT ``async def``) because ``astream``
+        returns an async ITERATOR (you ``async for chunk in graph.astream(...)``),
+        not a coroutine. An ``async def`` wrapper returns a coroutine, which
+        breaks ``async for`` with ``TypeError: __aiter__``.
+
+        ``config`` is explicitly the 2nd positional arg (matching
+        ``Pregel.astream(input, config=None, *, ...)``).  Using ``*args``
+        + ``config=config`` caused "got multiple values for argument 'config'"
+        because ``ainvoke`` passes config positionally: ``astream(input, config)``
+        — our ``*args`` captured it AND we re-passed it as keyword.
+        """
+        if config is None:
+            config = {}
+        # Only inject if not already present (avoid double-tracing on re-entry)
+        if not config.get("callbacks"):
+            thread_id = (
+                config.get("configurable", {}).get("thread_id", "unknown")
+                if isinstance(config.get("configurable"), dict)
+                else "unknown"
+            )
+            handler = _LangfuseHandler()
+            config["callbacks"] = [handler]
+            config["metadata"] = config.get("metadata") or {}
+            config["metadata"].setdefault("langfuse_session_id", thread_id)
+            config["metadata"].setdefault(
+                "langfuse_tags", [f"org:{org}", f"transport:{transport}"]
+            )
+        return _orig_astream(input, config, **kwargs)
+
+    graph.astream = _traced_astream
+    return graph
