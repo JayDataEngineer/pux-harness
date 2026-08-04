@@ -736,6 +736,21 @@ def _build_interpreter(ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
     return CodeInterpreterMiddleware(
         subagents=True,
         ptc=["glob", "grep", "ls", "read_file"],
+        # ``mode="turn"`` — the REPL persists WITHIN a turn (so ``eval`` can
+        # do multi-tool dispatch: explorer → ``Promise.all`` workers →
+        # synthesize) but snapshots are NOT stored across turns.
+        #
+        # WHY: ``mode="thread"`` (the default) stores a QuickJS heap snapshot
+        # as raw ``bytes`` in ``_quickjs_snapshot_payload``. The snapshot
+        # starts ``b'QFGS\xe8…'`` — byte index 8 is an invalid standalone
+        # UTF-8 byte, so Aegra's Pydantic serializer throws
+        # ``PydanticSerializationError: invalid utf-8 sequence of 1 bytes from
+        # index 8`` whenever the state is streamed (SSE events, state GET/POST,
+        # checkpoint). This crashes every CopilotKit run. With ``"turn"`` mode
+        # ``after_agent`` returns ``None`` — no bytes in the state, ever.
+        # The dynamic-dispatch happy path (the whole point of the interpreter)
+        # is unaffected: it all happens within one turn.
+        mode="turn",
     )
 
 
