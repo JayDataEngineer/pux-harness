@@ -24,8 +24,10 @@ work"):
 4. **Single owner / no test regression** — ``_build_prepare`` returns ``None``
    unless ``facts.prepare_warmup``, so the ``direct``/``server.py`` lanes (which
    call ``prepare()`` themselves) and tests (default ``RuntimeFacts()``) never
-   double-fire or touch Docker. ``prepare`` is in ``DEFAULT_SUPERVISOR`` and the
-   registry, scoped SUPERVISOR-only.
+   double-fire or touch Docker. ``prepare`` is NOT in ``DEFAULT_SUPERVISOR`` —
+   it is armed SOLELY by its gate (``_gate_prepare_warmup`` reads
+   ``facts.prepare_warmup``), which is the single source of truth for when it
+   mounts. Scoped SUPERVISOR-only.
 
 No docker: ``prepare`` is monkeypatched to a recording stub.
 """
@@ -87,10 +89,17 @@ def record_prepare(monkeypatch):
 # 0. registry / defaults contract
 # ------------------------------------------------------------------------------------
 
-def test_prepare_registered_default_on_supervisor_only():
+def test_prepare_registered_gate_driven_supervisor_only():
     assert "prepare" in middleware_names()
-    assert "prepare" in DEFAULT_SUPERVISOR
+    # prepare is GATE-DRIVEN (not in DEFAULT_SUPERVISOR) — armed solely by its
+    # gate (``_gate_prepare_warmup`` reads ``facts.prepare_warmup``). The gate
+    # is the single source of truth for when this middleware mounts.
+    assert "prepare" not in DEFAULT_SUPERVISOR, (
+        "prepare is gate-driven (facts.prepare_warmup), not a default — "
+        "a spec with a gate does not also appear in the default list"
+    )
     spec = _specs_by_name()["prepare"]
+    assert spec.gate is not None, "prepare must declare its gate"
     assert spec.scope == frozenset({Scope.SUPERVISOR}), (
         "prepare is a supervisor agent-start hook, not a per-subagent concern"
     )

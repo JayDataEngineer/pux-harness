@@ -556,9 +556,9 @@ def _agent_profile_from_spec(spec: dict[str, Any]) -> HarnessProfileConfig | Non
 # ``_HARNESS_PROFILES`` registry (two orgs on one model would merge-collide; the
 # long-lived server builds many orgs per process; and there is no
 # ``unregister``). So without an explicit spec the auto-add fires for EVERY pux
-# org — including coder, the Claude-Code-equivalent coding org whose roster
-# rule (``coder-no-general-subagent``) checks ``org.yaml`` and so NEVER sees
-# the auto-added slot.
+# org — including coder, the Claude-Code-equivalent coding org whose
+# ``roster_deny: [general-purpose, ...]`` declaration (checked by the
+# ``roster-deny-enforced`` contract rule) so NEVER sees the auto-added slot.
 #
 # The fix honors the NATIVE field (no parallel grammar): when an org's
 # ``profile.yaml`` carries a ``general_purpose_subagent:`` block — surfaced
@@ -578,27 +578,50 @@ def _agent_profile_from_spec(spec: dict[str, Any]) -> HarnessProfileConfig | Non
 
 _GENERAL_PURPOSE_NAME = "general-purpose"
 
-# The pux-default description/system_prompt for a customized GP the org enables
-# without supplying its own (the native field's description/system_prompt are
-# both optional). Mirrors deepagents' GENERAL_PURPOSE_SUBAGENT intent: a
-# generalist fallback for tasks no specialist covers.
-_DEFAULT_GP_DESCRIPTION = (
-    "General-purpose worker for tasks no specialist covers. Has the full "
-    "specialist + retrieval tool surface."
-)
-_DEFAULT_GP_PROMPT = (
-    "You are a general-purpose subagent. Complete the delegated task directly "
-    "using the tools available; do not delegate further. Return the result, not "
-    "a log of how you got there."
-)
+# The default + disabled GP description/prompt live in ``orgs/_shared/
+# general_purpose.md`` — loaded once, cached. The file is the single source
+# (no English constants in Python); the harness reads it when an org enables
+# the GP subagent without supplying its own text. See
+# ``_load_general_purpose_text``.
+_GP_TEXT: dict[str, str] | None = None
 
-# Safeguard S1: the disabled slot must say so honestly + carry NO tools, so even
-# a stray delegation returns immediately rather than silently doing generic work.
-_DISABLED_GP_DESCRIPTION = "Disabled for this org — do not delegate here."
-_DISABLED_GP_PROMPT = (
-    "This subagent is disabled for this org. Do not attempt the task; return "
-    "immediately with a one-line notice that this slot is disabled."
-)
+
+def _load_general_purpose_text() -> dict[str, str]:
+    """Load the 4 GP text fields from ``orgs/_shared/general_purpose.md``.
+
+    Returns ``{default_description, default_prompt, disabled_description,
+    disabled_prompt}``. Cached module-level (``_GP_TEXT``); the file is read
+    once per process. Fails LOUD if the file is absent — the file is the
+    single source of truth (no embedded fallback constant to drift from)."""
+    global _GP_TEXT
+    if _GP_TEXT is not None:
+        return _GP_TEXT
+    import yaml as _yaml
+    from pux_harness.kit.loaders import load_shared_prompt_body
+
+    # Load the frontmatter (the 4 fields) — body is documentation, unused here.
+    path = _orgs_dir().parent / "_shared" / "general_purpose.md"
+    raw = path.read_text(encoding="utf-8")
+    # frontmatter split (same convention as every other _shared/*.md)
+    if raw.startswith("---"):
+        _, fm, _body = raw.split("---", 2)
+        data = _yaml.safe_load(fm) or {}
+    else:
+        data = {}
+    _GP_TEXT = {
+        "default_description": data.get("default_description", ""),
+        "default_prompt": data.get("default_prompt", ""),
+        "disabled_description": data.get("disabled_description", ""),
+        "disabled_prompt": data.get("disabled_prompt", ""),
+    }
+    # Fail loud if any field is empty — the file is the single source.
+    missing = [k for k, v in _GP_TEXT.items() if not v]
+    if missing:
+        raise ValueError(
+            f"orgs/_shared/general_purpose.md: missing frontmatter field(s) "
+            f"{missing}; the file must supply all 4 GP text variants"
+        )
+    return _GP_TEXT
 
 
 def _build_general_purpose_sub(
@@ -623,24 +646,30 @@ def _build_general_purpose_sub(
     — imported lazily because ``profile.py`` imports ``_orgs_dir`` from THIS
     module → a cycle), so an org-wide override reaches the GP too. The org-wide
     ``system_prompt_suffix`` layers on top of the GP prompt (custom or default),
-    matching the precedence every other subagent follows in ``load_subagents``."""
+    matching the precedence every other subagent follows in ``load_subagents``.
+    Both applications route through the ``profile_apply`` seam (single owner of
+    the three upstream-gap applications)."""
     # Lazy import: profile.py imports ``_orgs_dir`` from THIS module → cycle.
-    from pux_harness.agent.profile import apply_profile_to_tools
+    from pux_harness.agent.profile_apply import (
+        apply_profile_to_prompt,
+        apply_profile_to_tools,
+    )
 
     model = get_model(role="worker", org=org)
+    gp_text = _load_general_purpose_text()
     if gp.enabled is False:
         return {
             "name": _GENERAL_PURPOSE_NAME,
-            "description": _DISABLED_GP_DESCRIPTION,
-            "system_prompt": _DISABLED_GP_PROMPT,
+            "description": gp_text["disabled_description"],
+            "system_prompt": gp_text["disabled_prompt"],
             "tools": [],
             "model": model,
             "middleware": [],
         }
-    description = gp.description or _DEFAULT_GP_DESCRIPTION
-    prompt = gp.system_prompt or _DEFAULT_GP_PROMPT
-    if profile is not None and profile.system_prompt_suffix:
-        prompt = f"{prompt}\n\n{profile.system_prompt_suffix}"
+    description = gp.description or gp_text["default_description"]
+    prompt = apply_profile_to_prompt(
+        gp.system_prompt or gp_text["default_prompt"], profile
+    )
     tools = list(tool_surface)
     if profile is not None:
         tools = apply_profile_to_tools(tools, profile)
@@ -722,7 +751,9 @@ def load_subagents(
     apply_profile_to_tools = None
     if profile is not None:
         # Lazy: profile.py imports ``_orgs_dir`` from THIS module at load time.
-        from pux_harness.agent.profile import apply_profile_to_tools as _aptt
+        # profile_apply.py imports profile.py at load time → same cycle. The seam
+        # owns the application; route through it.
+        from pux_harness.agent.profile_apply import apply_profile_to_tools as _aptt
         apply_profile_to_tools = _aptt
     subs: list[dict[str, Any]] = []
     # Level-1 of the two-level grant gate: the servers this org DECLARES in its
@@ -803,7 +834,7 @@ def load_subagents(
             if agent_cfg is not None and (
                 agent_cfg.excluded_tools or agent_cfg.tool_description_overrides
             ):
-                from pux_harness.agent.profile import apply_profile_to_tools as _aptt_per
+                from pux_harness.agent.profile_apply import apply_profile_to_tools as _aptt_per
                 sub["tools"] = _aptt_per(sub["tools"], agent_cfg)
         # Retrieval surface, appended AFTER profile filtering so an org-wide
         # ``excluded_tools`` can't strip it. Guarded by ``sub.get("tools")``: a

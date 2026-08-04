@@ -78,7 +78,6 @@ from pux_harness.agent.prompt_parts import (
 from pux_harness.agent.model import (
     _TRANSIENT_EXCEPTIONS,
     driver_multimodal,
-    driver_strong_orchestrator,
     get_model,
 )
 from pux_harness.agent.orgs import (
@@ -96,12 +95,15 @@ from pux_harness.agent.orgs import (
 from pux_harness.agent.profile import (
     HarnessProfileConfig,
     MiddlewareOverrides,
-    apply_profile_to_tools,
     load_ask_user_enabled,
     load_middleware_overrides,
     load_model_retry,
     load_tool_retry,
     load_web_router_config,
+)
+from pux_harness.agent.profile_apply import (
+    apply_profile_to_tools,
+    merge_profile_excluded_middleware,
 )
 from pux_harness.context.audit import AuditMiddleware
 from pux_harness.context.browser_vision import (
@@ -163,7 +165,9 @@ class RuntimeFacts:
     example (the user's): "if we call over MCP, remove the ``ask_user`` tool from
     supervisor agents." ``ask_user`` is now wired (opt-in via ``profile.yaml``
     ``ask_user: true``); the construction gate — opt-in AND NOT mcp/autonomous —
-    lives in ``build_stack``. ``_apply_rules`` stays the middleware-level seam.
+    lives in ``build_stack``. Middleware-level runtime rules live on each
+    ``MiddlewareSpec.gate`` (e.g. ``prepare`` reads ``facts.prepare_warmup``);
+    there is no separate rules layer.
 
     ``build_graph`` threads ``facts`` through; the default ``RuntimeFacts()`` is
     used only by callers (tests) that don't care about a rule. The entrypoints
@@ -208,16 +212,36 @@ class MiddlewareSpec:
 
     ``build`` receives the ``StackCtx`` AND the ``Scope`` it's being resolved
     for, and returns the instance, a list of instances, or ``None`` (``None``
-    => skip — used by ``rubric`` when no gate is armed and ``browser_vision``
-    when the driver is text-only, so the name can stay in the default list
-    without forcing construction). The scope arg lets one spec build differently
-    per tier (``context`` emits retrieval tools on the supervisor, not the
-    subagent).
+    => skip — kept as defense in depth for specs whose ``gate`` already filters
+    construction; a spec listed in ``DEFAULT_SUPERVISOR`` / ``DEFAULT_SUBAGENT``
+    with ``gate=None`` always builds). The scope arg lets one spec build
+    differently per tier (``context`` emits retrieval tools on the supervisor,
+    not the subagent).
+
+    ``gate`` is the AUTO-MOUNT predicate — the only thing that decides whether
+    a spec is armed BESIDES the default lists and explicit ``add``/``remove``.
+    It reads the ``StackCtx`` (facts / rubric_gate / model_retry_cfg / etc.) +
+    the partial on-set (``frozenset[str]`` of names already asserted by
+    defaults + explicit adds + earlier-evaluated gates) and returns ``True`` to
+    arm. ``None`` means "no auto-mount condition" — the spec is armed only by
+    being in a default list or via explicit ``add``. There are NO hard-coded
+    ``if`` branches in ``_resolve_toggles`` anymore: every conditional mount is
+    a ``gate`` declared here, in data, next to the spec it belongs to. Adding
+    new conditional behavior = adding a gate predicate (one function + one line
+    in the registry), nothing in the resolver itself.
     """
 
     name: str
     scope: frozenset[Scope]
     build: Callable[["StackCtx", Scope], AgentMiddleware | list[AgentMiddleware] | None]
+    gate: "Gate | None" = None
+
+
+# A gate sees the StackCtx + the partial on-set asserted so far (defaults +
+# explicit adds + earlier-evaluated gates). The on-set arg is for PAIRING gates
+# (e.g. ``interpreter_hints`` arms iff ``interpreter`` is armed); unconditional
+# gates ignore it. See ``_resolve_toggles`` for the evaluation contract.
+Gate = Callable[["StackCtx", frozenset[str]], bool]
 
 
 @dataclass(frozen=True)
@@ -792,6 +816,62 @@ def _build_web_router(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     )
 
 
+# --- gates (data, not branches) -------------------------------------------
+# Each gate is a pure predicate over (StackCtx, partial on-set). The resolver
+# evaluates them in registry order, passing the partial on-set so PAIRING gates
+# (interpreter_hints) can inspect what's already armed. Add a new conditional
+# mount = add a gate here + reference it on the spec; nothing in the resolver
+# changes. This is the "data, not code" seam the user asked for.
+
+
+def _gate_rubric_armed(ctx: "StackCtx", _on: frozenset[str]) -> bool:
+    """``rubric`` mounts iff the org's rubric gate is present + enabled."""
+    return ctx.rubric_gate is not None and bool(getattr(ctx.rubric_gate, "enabled", False))
+
+
+def _gate_model_retry_enabled(ctx: "StackCtx", _on: frozenset[str]) -> bool:
+    """``model_retry`` mounts iff the config is present + enabled (default-on
+    via the shipped config — disable per-org via ``model_retry: {enabled: false}``)."""
+    return ctx.model_retry_cfg is not None and bool(getattr(ctx.model_retry_cfg, "enabled", False))
+
+
+def _gate_tool_retry_configured(ctx: "StackCtx", _on: frozenset[str]) -> bool:
+    """``tool_retry`` mounts iff the org ships a ``tool_retry:`` block."""
+    return ctx.tool_retry_cfg is not None
+
+
+def _gate_browser_vision(ctx: "StackCtx", _on: frozenset[str]) -> bool:
+    """``browser_vision`` mounts iff the env flag is on AND the org arms any
+    ``pux_sandbox_browser_*`` specialist. Text-only drivers / browser-less orgs
+    pay nothing."""
+    return browser_vision_enabled() and ctx.has_browser_tools
+
+
+def _gate_prepare_warmup(ctx: "StackCtx", _on: frozenset[str]) -> bool:
+    """``prepare`` mounts iff the runtime lacks its own entry-point prepare hook
+    (Aegra's langgraph-api run loop). See ``RuntimeFacts.prepare_warmup``."""
+    return bool(ctx.facts.prepare_warmup)
+
+
+def _gate_interpreter_hints(_ctx: "StackCtx", on: frozenset[str]) -> bool:
+    """PAIRING gate: ``interpreter_hints`` mounts iff ``interpreter`` is armed.
+    ``interpreter`` is opt-in only (no gate, not in defaults), so this is
+    equivalent to "the org declared ``add: [interpreter]``." Reads the partial
+    on-set, NOT ctx."""
+    return "interpreter" in on
+
+
+def _gate_web_router(ctx: "StackCtx", _on: frozenset[str]) -> bool:
+    """``web-router`` gates on web_research MCP tools being armed — the round
+    reuses them and is never synthesized from nothing. The spec is NOT in
+    ``DEFAULT_SUPERVISOR``, so the org still opts in via ``add: [web-router]``;
+    this gate just filters the add (no web tools → the add is a no-op)."""
+    return any(
+        getattr(t, "name", "").startswith("mcp__web_research__")
+        for t in ctx.mcp_tools
+    )
+
+
 MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # Canonical mount ORDER — ``_resolve_toggles`` emits in this order, so a
     # spec's registry position IS its mount position. ``audit`` (opt-in) is FIRST
@@ -799,38 +879,76 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # outermost of the default-on layers; ``model_retry`` + ``tool_retry`` sit
     # AFTER ``rubric`` so model-retry wraps the raw model invocation and
     # ``browser_vision`` stays innermost-of-the-visual-layers (still LAST).
-    MiddlewareSpec("audit", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_audit),
-    MiddlewareSpec("context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context),
-    MiddlewareSpec("routing", frozenset({Scope.SUPERVISOR}), _build_routing),
-    MiddlewareSpec("session_guide", frozenset({Scope.SUPERVISOR}), _build_session_guide),
+    #
+    # GATES (data, not branches): every conditional mount is a ``gate`` on the
+    # spec. ``None`` means "default-on or add-only" — no auto-mount predicate.
+    # ``_resolve_toggles`` is a pure data merge over (defaults + gates + adds −
+    # removes); there are no hard-coded ``if`` branches for any spec.
+    MiddlewareSpec(
+        "audit", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_audit,
+        gate=None,  # opt-in only (``middleware.{supervisor,subagent}.add: [audit]``)
+    ),
+    MiddlewareSpec(
+        "context", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_context,
+        gate=None,  # default-on in both lists; selectable like every other spec
+    ),
+    MiddlewareSpec(
+        "routing", frozenset({Scope.SUPERVISOR}), _build_routing,
+        gate=None,
+    ),
+    MiddlewareSpec(
+        "session_guide", frozenset({Scope.SUPERVISOR}), _build_session_guide,
+        gate=None,
+    ),
     # prompt_capture mounts AFTER session_guide so its before_model/after_agent
     # hooks fire inside the session-guide wrap (a snapshot built on compaction
     # sees the latest user_message + turn_end). Supervisor-only.
-    MiddlewareSpec("prompt_capture", frozenset({Scope.SUPERVISOR}), _build_prompt_capture),
+    MiddlewareSpec(
+        "prompt_capture", frozenset({Scope.SUPERVISOR}), _build_prompt_capture,
+        gate=None,
+    ),
     # ``rubric`` is dual-scope: a worker (e.g. coder's code-worker) can opt into
     # the same non-skippable grader gate the supervisor has via frontmatter
-    # ``middleware: [rubric]`` — the grader runs in the worker's own graph with
-    # the ``pux_grader_*`` tools, so a dumb editor gets tool-enforced
-    # verification instead of a prompt plea. Construction stays gate-driven
-    # (``_build_rubric`` -> None without an armed ``rubric_gate``), so the scope
-    # only LIFTS the opt-in — read-only agents still pay nothing by default.
-    MiddlewareSpec("rubric", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_rubric),
-    MiddlewareSpec("model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry),
-    MiddlewareSpec("tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry),
+    # ``middleware: [rubric]``. The GATE arms it iff the org's ``rubric_gate``
+    # is present + enabled — so the scope only LIFTS the opt-in, and read-only
+    # agents still pay nothing by default. ``_build_rubric``'s own None-return
+    # stays as defense in depth (gate already filters; belt-and-suspenders).
+    MiddlewareSpec(
+        "rubric", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_rubric,
+        gate=_gate_rubric_armed,
+    ),
+    MiddlewareSpec(
+        "model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry,
+        gate=_gate_model_retry_enabled,
+    ),
+    MiddlewareSpec(
+        "tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry,
+        gate=_gate_tool_retry_configured,
+    ),
     # read_file_vision mounts BEFORE browser_vision so it wraps just outside the
     # browser-vision layer. They handle DIFFERENT tools (read_file vs browser_*),
     # so ordering between them doesn't affect correctness — but read_file_vision
     # is the more general layer (covers ALL agents, not just browser orgs), so it
     # sits just outside. Covers ANY ToolMessage with image/binary content blocks.
-    MiddlewareSpec("read_file_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_read_file_vision),
-    MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
+    MiddlewareSpec(
+        "read_file_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_read_file_vision,
+        gate=None,
+    ),
+    MiddlewareSpec(
+        "browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision,
+        gate=_gate_browser_vision,
+    ),
     # ``interpreter_hints`` wraps eval tool results to append a classified-
-    # failure hint + fallback. Paired with ``interpreter`` (armed iff the
-    # interpreter is armed — see ``_resolve_toggles``). Acts ONLY on eval
+    # failure hint + fallback. PAIRED with ``interpreter``: its gate reads the
+    # partial on-set and arms iff ``interpreter`` is armed (only ever via
+    # explicit ``add`` — see the ``interpreter`` spec below). Acts ONLY on eval
     # results (regex scan for ``<error type=``); every other tool name
     # short-circuits, so it costs nothing on the rest of the surface. Mounted
     # next to browser_vision — both use the Command([text_tm, human]) pattern.
-    MiddlewareSpec("interpreter_hints", frozenset({Scope.SUPERVISOR}), _build_interpreter_hints),
+    MiddlewareSpec(
+        "interpreter_hints", frozenset({Scope.SUPERVISOR}), _build_interpreter_hints,
+        gate=_gate_interpreter_hints,
+    ),
     # ``prompt_caching`` tags the system prompt + tools with cache_control for
     # Anthropic models (no-op for OpenAI-compat). Listed AFTER everything else
     # so it sees the FINAL tools list (after context adds ctx_recall/ctx_search,
@@ -839,49 +957,73 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     # does NOT touch messages, so mount position relative to other wrap_model_call
     # layers doesn't affect correctness, only which tools are in the list when
     # the tag is applied.
-    MiddlewareSpec("prompt_caching", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_prompt_caching),
+    MiddlewareSpec(
+        "prompt_caching", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_prompt_caching,
+        gate=None,
+    ),
     # ``prepare`` is a ``before_agent``-only hook (no model/tool wrapping), so
     # its registry position does not affect the wrap pipeline — appended LAST to
     # avoid shifting any existing mount positions. Runs ``prepare()`` once at
-    # agent start; skipped (returns None) unless ``facts.prepare_warmup``.
-    MiddlewareSpec("prepare", frozenset({Scope.SUPERVISOR}), _build_prepare),
+    # agent start; the GATE restricts it to runtimes that lack their own
+    # entry-point prepare hook (Aegra; see ``RuntimeFacts.prepare_warmup``).
+    MiddlewareSpec(
+        "prepare", frozenset({Scope.SUPERVISOR}), _build_prepare,
+        gate=_gate_prepare_warmup,
+    ),
     # ``interpreter`` (CodeInterpreterMiddleware) is a tool-injector (adds the
     # ``eval`` JS-REPL tool + the ``task(...)`` global), not a model/tool-call
-    # wrapper — so its registry position does not affect the wrap pipeline.
-    # Appended LAST to avoid shifting any existing mount positions. NOT in
-    # ``DEFAULT_SUPERVISOR``: strength-gated (armed in ``_resolve_toggles`` iff
-    # the base model is ``strength: pro``); ``add/remove`` overrides per-org.
-    MiddlewareSpec("interpreter", frozenset({Scope.SUPERVISOR}), _build_interpreter),
+    # wrapper. ORG OPT-IN ONLY (``middleware.supervisor.add: [interpreter]``):
+    # no gate, not in ``DEFAULT_SUPERVISOR``. The strength-auto-arm that used to
+    # live in ``_resolve_toggles`` was deleted — every default-tier org silently
+    # inherited it because the shipped base is strength:pro, and no org prompt
+    # references the eval tool (see docs/org-declarative-surface.md). Fan-out
+    # orgs (coder / orchestrator / deep-research-engine / game-studio) declare
+    # ``add: [interpreter]`` explicitly.
+    MiddlewareSpec(
+        "interpreter", frozenset({Scope.SUPERVISOR}), _build_interpreter,
+        gate=None,
+    ),
     # ``web-router`` (WebRouterMiddleware) is a ``wrap_model_call`` injector that
     # fires a worker-model web round + prepends a brief. Appended LAST so it is
     # the INNERMOST wrap (runs right before the model, after the other wrap
     # layers assembled the message list — the injected brief lands intact).
     # ``prepare`` / ``interpreter`` above are non-``wrap_model_call``, so this is
-    # the genuine innermost wrapper. NOT in ``DEFAULT_SUPERVISOR``: opt-in
-    # (``middleware.supervisor.add: [web-router]``) AND returns None when no
-    # ``web_research`` tool is armed (never synthesizes a round from nothing).
-    MiddlewareSpec("web-router", frozenset({Scope.SUPERVISOR}), _build_web_router),
+    # the genuine innermost wrapper. GATE-DRIVEN: arms iff the org has armed
+    # ``mcp__web_research__*`` tools AND opts in via ``add: [web-router]`` (the
+    # gate checks tools-armed; the add is still required because the spec is not
+    # in ``DEFAULT_SUPERVISOR``). Never synthesizes a round from nothing.
+    MiddlewareSpec(
+        "web-router", frozenset({Scope.SUPERVISOR}), _build_web_router,
+        gate=_gate_web_router,
+    ),
 ]
 
 
 # --- defaults (the "one place") -------------------------------------------
 
-# The default-on supervisor baseline. ``rubric`` + ``tool_retry`` are
-# gate-driven (added to the on-set iff the org arms them) so they're NOT in the
-# default list but still land at their registry position when armed.
-# ``model_retry`` IS default-on (the user's "configurable retry middleware,
-# default conservative" — every supervisor gets a transient-scoped backoff'd
-# re-pass of the model call; disable per-org via ``model_retry:
-# {enabled: false}``). ``context`` + ``browser_vision`` are selectable specs
-# (default-on, removable via ``middleware.supervisor.remove``) — the user's
-# "selectively remove/add middleware" request, applied uniformly to the
-# formerly-non-toggleable layers too.
-DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "prompt_capture", "model_retry", "read_file_vision", "browser_vision", "prompt_caching", "prepare"]
+# The default-on supervisor baseline — ONLY specs whose gate is ``None`` (i.e.
+# no auto-mount condition). Specs with a gate (``rubric`` / ``model_retry`` /
+# ``tool_retry`` / ``browser_vision`` / ``prepare`` / ``web-router`` /
+# ``interpreter_hints``) are armed SOLELY by their gate (when it fires) or by
+# explicit ``add:``, never by appearing here. This makes the gate the single
+# source of truth: a spec's mount condition lives in ONE place (its registry
+# entry), not duplicated across the default list AND a gate.
+#
+# ``model_retry`` is effectively default-on because its gate fires on the
+# SHIPPED config (``enabled: true``); an org disables it via ``model_retry:
+# {enabled: false}``. ``browser_vision`` is effectively default-on for browser
+# orgs (gate: env on + has_browser_tools). ``prepare`` is opt-in per runtime
+# (gate: ``facts.prepare_warmup`` — Aegra only).
+DEFAULT_SUPERVISOR: list[str] = [
+    "context", "routing", "session_guide", "prompt_capture",
+    "read_file_vision", "prompt_caching",
+]
 
-# Subagents get the context layer + browser_vision by default; routing /
-# session_guide / rubric are supervisor concerns. An org MAY add a subagent
-# middleware via ``middleware.subagent.add``.
-DEFAULT_SUBAGENT: list[str] = ["context", "read_file_vision", "browser_vision", "prompt_caching"]
+# Subagents get the context layer + read_file_vision by default; routing /
+# session_guide / rubric are supervisor concerns. ``browser_vision`` mounts on
+# subagents too (its scope includes SUBAGENT) but only via its gate (browser
+# orgs). An org MAY add a subagent middleware via ``middleware.subagent.add``.
+DEFAULT_SUBAGENT: list[str] = ["context", "read_file_vision", "prompt_caching"]
 
 
 def middleware_names() -> list[str]:
@@ -904,20 +1046,14 @@ def _normalize_overrides(
     """Merge the harness ``middleware:`` block with the deepagents
     ``excluded_middleware`` field into one ``{scope: (add, remove)}`` map.
 
-    The deepagents ``excluded_middleware`` field (a ``frozenset[str]`` on
-    ``HarnessProfileConfig``) was a DEAD path before the factory —
-    ``create_deep_agent`` only honors it through a *registered* profile, which
-    the harness deliberately doesn't use (org-keyed, see module doc). We honor
-    it ourselves here, treating it as an UNSCOPED supervisor remove (the
-    supervisor is the only scope those names could ever mount on today). Both
-    forms route through the same remove-set, so an org can use whichever reads
-    better; the scoped ``middleware.supervisor.remove`` is primary."""
-    sup_remove: set[str] = set(overrides.supervisor_remove)
-    if profile is not None and profile.excluded_middleware:
-        sup_remove |= set(profile.excluded_middleware)
+    The ``excluded_middleware`` fold lives in the ``profile_apply`` seam (single
+    owner of the three upstream-gap applications — see that module's docstring).
+    This function just reshapes the merged overrides into the scoped map the
+    resolver consumes."""
+    merged = merge_profile_excluded_middleware(overrides, profile)
     return {
-        Scope.SUPERVISOR: (list(overrides.supervisor_add), sup_remove),
-        Scope.SUBAGENT: (list(overrides.subagent_add), set(overrides.subagent_remove)),
+        Scope.SUPERVISOR: (list(merged.supervisor_add), set(merged.supervisor_remove)),
+        Scope.SUBAGENT: (list(merged.subagent_add), set(merged.subagent_remove)),
     }
 
 
@@ -928,41 +1064,49 @@ def _resolve_toggles(
     adds: list[str],
     removes: set[str],
 ) -> list[AgentMiddleware]:
-    """Resolve the toggleable middleware for one scope.
+    """Resolve the toggleable middleware for one scope as a PURE DATA MERGE.
 
-    The on-set is composed in the order that makes org overrides win: defaults +
-    gate-driven ``rubric`` (supervisor only), then the runtime-facts rules seam,
-    then removes, then adds — so an add wins a same-named remove. Every on-set
-    name is validated (registered + in-scope) BEFORE building. The built list is
-    emitted in REGISTRY order — a spec's mount position is its registry position,
-    not insertion order — so the stack is byte-identical regardless of which
-    names are defaults vs adds (e.g. ``browser_vision`` always lands innermost
-    past ``rubric``). A ``build`` returning ``None`` is skipped (``rubric`` with
-    no gate, ``browser_vision`` with a text-only driver)."""
+    Composition rule (no hard-coded ``if`` branches — every conditional mount is
+    a ``gate`` on the spec itself):
+
+        base    = defaults | adds                      # what's asserted
+        gated   = { spec.name for spec in REGISTRY     # what conditions arm
+                    if spec.gate and spec.gate(ctx, base | gated_so_far) }
+        on      = (defaults | gated) − removes
+        on     |= adds                                  # add wins over remove
+
+    Gates are evaluated in REGISTRY order; the partial on-set passed to each
+    gate is `defaults | adds | earlier-gated-names`, so PAIRING gates (e.g.
+    ``interpreter_hints`` arming with ``interpreter``) read what's already
+    armed. Every on-set name is validated (registered + in-scope) BEFORE
+    building. The built list is emitted in REGISTRY order — a spec's mount
+    position is its registry position, not insertion order — so the stack is
+    byte-identical regardless of which names are defaults vs adds. A ``build``
+    returning ``None`` is skipped (defense in depth for gated specs whose gate
+    already filtered them; also covers ``web-router``'s tools-armed re-check).
+    """
     by_name = _specs_by_name()
 
-    # defaults + gate-driven rubric/tool_retry/interpreter → rules → removes → adds (add wins over remove).
-    on: set[str] = set(default_names)
-    if scope is Scope.SUPERVISOR and ctx.rubric_gate is not None and ctx.rubric_gate.enabled:
-        on.add("rubric")
-    if scope is Scope.SUPERVISOR and ctx.tool_retry_cfg is not None:
-        on.add("tool_retry")
-    # Dynamic-subagent happy path: auto-mount iff the resolved base model is a
-    # strong orchestrator (strength: pro). Weak/unknown → off (no token waste);
-    # middleware.supervisor.add/remove override either way (add wins, below).
-    if scope is Scope.SUPERVISOR and driver_strong_orchestrator(role="base", org=ctx.org):
-        on.add("interpreter")
-    on = set(_apply_rules(ctx.facts, scope, list(on)))
-    on -= set(removes)
-    on |= set(adds)
-    # Pair interpreter_hints with interpreter — the diagnostic layer mounts
-    # iff the eval tool is armed (add wins, so ``add:[interpreter]`` also
-    # pulls in hints; ``remove:[interpreter]`` drops both). This runs AFTER
-    # rules/adds/removes so the pairing tracks the FINAL interpreter state.
-    if "interpreter" in on and "interpreter_hints" not in removes:
-        on.add("interpreter_hints")
+    add_set = set(adds)
+    remove_set = set(removes)
+    base = frozenset(default_names) | add_set
 
-    # Validate the FULL on-set — fail loud on an unknown add, a rule typo, or a
+    # Gates: evaluate in registry order, accumulating armed names so later
+    # pairing gates can see earlier results. ``interpreter_hints`` reads
+    # ``interpreter`` this way (interpreter is opt-in via ``add`` → already in
+    # `base`; the gate check is equivalent).
+    gated: set[str] = set()
+    for spec in MIDDLEWARE_REGISTRY:
+        if spec.gate is None or scope not in spec.scope:
+            continue
+        if spec.gate(ctx, base | gated):
+            gated.add(spec.name)
+
+    # on = (defaults + gates) − removes, then + adds (add wins over remove).
+    on: set[str] = (set(default_names) | gated) - remove_set
+    on |= add_set
+
+    # Validate the FULL on-set — fail loud on an unknown add, a gate typo, or a
     # scope mismatch. (Remove-name typos are caught offline by validate_overrides.)
     unknown = sorted(n for n in on if n not in by_name)
     if unknown:
@@ -1075,22 +1219,6 @@ def _scope_supervisor_tools(
                 continue
         out.append(t)
     return out
-
-
-def _apply_rules(facts: RuntimeFacts, scope: Scope, names: list[str]) -> list[str]:
-    """Runtime-facts rules seam for the MIDDLEWARE list. Identity today — kept as
-    an explicit, tested function so the policy layer is legible + extensible
-    rather than a hidden branch.
-
-    This is the middleware-level seam (called from ``_resolve_toggles``). The
-    runtime-facts rule that DID land — drop ``ask_user`` over MCP/autonomous —
-    is TOOL-level, so it lives in ``build_stack`` (the tool isn't constructed at
-    all rather than constructed-then-filtered). When a future rule needs to
-    toggle a MIDDLEWARE on transport (e.g. a streaming-only middleware), wire it
-    here.
-    """
-    _ = facts  # no middleware rule wired yet; param kept for the seam + stability
-    return list(names)
 
 
 # --- the plan + the factory ----------------------------------------------
@@ -1280,9 +1408,9 @@ def build_stack(
     # the model-keyed ``_HARNESS_PROFILES`` registry (two orgs on one model
     # would merge-collide; the long-lived server builds many orgs per process;
     # there is no ``unregister``), so without an explicit spec the auto-add
-    # fires for EVERY org — even coder, whose roster rule
-    # (``coder-no-general-subagent``) reads ``org.yaml`` and so NEVER sees the
-    # auto-added slot.
+    # fires for EVERY org — even coder, whose roster-deny rule
+    # (``roster-deny-enforced`` reads ``org.yaml`` ``roster_deny:``) so NEVER
+    # sees the auto-added slot.
     #
     # Honor the NATIVE field (no parallel grammar): when the org's profile
     # carries a ``general_purpose_subagent:`` block (flowed straight through

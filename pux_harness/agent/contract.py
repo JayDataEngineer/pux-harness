@@ -386,37 +386,37 @@ def check_org(name: str) -> list[Violation]:
         except Exception:
             roster = slugs
 
-    # Permanent tripwire (no-legacy-left-behind): coder is the
-    # Claude-Code-equivalent CODING org — the CTO does all the thinking and
-    # delegates only narrow execution (code-worker) / recon (coder-explorer)
-    # / e2e verification (web-agent). A generic catch-all subagent
-    # (``general`` / ``general-purpose`` / the shared ``researcher``) would let
-    # the CTO delegate the DESIGN itself, which is exactly the anti-pattern the
-    # roster exists to prevent. A future re-add is a HARD contract failure, not
-    # a silent drift.
-    if name == "coder":
-        forbidden = {"general", "general-purpose", "researcher"}
-        bad = sorted(set(slugs) & forbidden)
-        if bad:
-            v.append(Violation(
-                "error", "coder-no-general-subagent",
-                f"coder: roster must not include a generic subagent "
-                f"({bad}); the CTO does the thinking — delegate only to "
-                f"coder-explorer / code-worker / web-agent"))
+    # Data-driven roster deny-list (replaces the former ``if name == "coder"``
+    # hard-coded branch). An org declares ``roster_deny: [...]`` in org.yaml;
+    # the checker enforces NO listed slug appears in the effective
+    # (chain-inherited) roster. The focus-CTO intent (coder refuses a generic
+    # catch-all so the CTO can't delegate the thinking) is now expressed as
+    # DATA on the org that owns it, not as a branch in the checker. Any org can
+    # declare the same shape by populating this field.
+    roster_deny: list[str] = []
+    if org_yaml.is_file() and shape_ok:
+        roster_deny = _parse_list(data.get("roster_deny"))
+    bad = sorted(set(roster) & set(roster_deny))
+    if bad:
+        v.append(Violation(
+            "error", "roster-deny-enforced",
+            f"{name}: roster must not include any slug from org.yaml "
+            f"``roster_deny:`` ({bad}); denied={sorted(set(roster_deny))}. "
+            f"This list is the org's own focus-CTO declaration — the CTO does "
+            f"the thinking, delegates only to narrow specialists."))
 
-    # Defense in depth via a SECOND code path. The roster rule above
-    # (``coder-no-general-subagent``) reads org.yaml, so it NEVER sees the
-    # ``general-purpose`` slot deepagents auto-adds to EVERY graph
-    # (deepagents/graph.py:716-717) when no inline spec owns that name. This
-    # sibling rule reads profile.yaml and asserts coder OPTS OUT of that
-    # auto-add via the NATIVE ``general_purpose_subagent.enabled: false`` field
-    # — which the harness turns into a neutered spec (``orgs.
-    # _build_general_purpose_sub``, Safeguard S1). Two layers, two files, one
-    # intent: coder must not ship a generic catch-all worker. A re-enable OR a
-    # dropped field is a HARD contract failure, not a silent drift back to the
-    # heavy auto-add. (Skipped on a malformed profile — the ``profile-schema``
-    # rule below already reports that, no double-noise.)
-    if name == "coder":
+    # Defense in depth via a SECOND data-driven rule. ``roster_deny`` reads
+    # org.yaml, so it NEVER sees the ``general-purpose`` slot deepagents
+    # auto-adds to EVERY graph (deepagents/graph.py:716-717) when no inline
+    # spec owns that name. When ``general-purpose`` (or ``general``) is in the
+    # deny-list, the org's profile MUST declare
+    # ``general_purpose_subagent: {enabled: false}`` so the harness neutered
+    # spec (``orgs._build_general_purpose_sub``) claims the name before
+    # deepagents' auto-add fires. Same intent, expressed as data: an org that
+    # denies general-purpose at the roster level must also deny it at the
+    # deepagents-auto-add level. (Skipped on a malformed profile — the
+    # ``profile-schema`` rule below already reports that, no double-noise.)
+    if any(s in {"general-purpose", "general"} for s in roster_deny):
         gp_cfg: Any = None
         gp_ok = True
         try:
@@ -427,11 +427,11 @@ def check_org(name: str) -> list[Violation]:
             gp = gp_cfg.general_purpose_subagent if gp_cfg is not None else None
             if gp is None or gp.enabled is not False:
                 v.append(Violation(
-                    "error", "coder-disables-general-purpose",
-                    "coder: profile.yaml must declare "
-                    "'general_purpose_subagent: {enabled: false}' — deepagents "
-                    "otherwise auto-adds a heavy generic worker the roster rule "
-                    "(coder-no-general-subagent) cannot see"))
+                    "error", "roster-deny-disables-general-purpose",
+                    f"{name}: profile.yaml must declare "
+                    "'general_purpose_subagent: {enabled: false}' — the roster "
+                    "denies general-purpose but deepagents otherwise auto-adds "
+                    "a heavy generic worker the roster-deny rule cannot see"))
 
     # Rule 3: every slug resolves to a valid agent .md (org-local or _shared)
     # with required frontmatter keys + a non-empty body (system_prompt).
@@ -1557,6 +1557,104 @@ def _pux_namespace_resolvable() -> list[Violation]:
     return v
 
 
+def _no_hardcoded_org_name_branches() -> list[Violation]:
+    """Rule: zero hard-coded org-name ``if`` branches in ``pux_harness/``.
+
+    The org system is DATA-DRIVEN: org-specific behavior lives in each org's
+    ``org.yaml`` / ``profile.yaml`` / ``AGENTS.md``, NOT as ``if name ==
+    "<org>"`` branches in harness Python. The former ``if name == "coder"``
+    contract branches were re-expressed as the data-driven ``roster_deny:``
+    field (see ``roster-deny-enforced``); this tripwire prevents regression.
+
+    AST-walks every ``.py`` under ``pux_harness/`` and rejects any ``Compare``
+    node that string-compares against a known org name. Comments/docstrings are
+    allowed (archaeology); only EXECUTABLE compares fail.
+    """
+    import ast as _ast
+    org_names = set(discover_orgs())
+    # Also forbid the former culprits explicitly (defense against a rename).
+    org_names |= {"coder", "orchestrator", "deep-research-engine", "game-studio"}
+    v: list[Violation] = []
+    pkg_root = Path(__file__).parent
+    for py in sorted(pkg_root.rglob("*.py")):
+        try:
+            tree = _ast.parse(py.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Compare):
+                continue
+            operands = [node.left, *node.comparators]
+            for op in operands:
+                if (
+                    isinstance(op, _ast.Constant)
+                    and isinstance(op.value, str)
+                    and op.value in org_names
+                ):
+                    v.append(Violation(
+                        "error", "no-hardcoded-org-name-branches",
+                        f"{py.name}:{node.lineno}: compare against org name "
+                        f"{op.value!r} — org-specific rules must be DATA on the "
+                        f"org (org.yaml/profile.yaml), not a branch in harness code"
+                    ))
+                    break
+    return v
+
+
+def _middleware_registry_structural() -> list[Violation]:
+    """Rule: the middleware registry is structurally sound.
+
+    Three load-bearing invariants of the gate-as-data design (A1):
+
+    1. Every spec declares the ``gate`` field (the dataclass default is None,
+       but the field MUST be present — a spec without it is a schema violation
+       caught by Python at import, so this is defense in depth).
+    2. ``interpreter`` has ``gate=None`` and is NOT in ``DEFAULT_SUPERVISOR``
+       (opt-in only — the deleted strength-auto-arm must not creep back).
+    3. ``interpreter_hints`` has a non-None gate (PAIRS with interpreter).
+
+    These are the structural guarantees that make the resolver a pure data
+    merge. A regression on any one re-introduces the hard-coded branch pattern
+    the user asked to eliminate.
+    """
+    v: list[Violation] = []
+    try:
+        from pux_harness.agent.stack import (
+            DEFAULT_SUPERVISOR, MIDDLEWARE_REGISTRY, _specs_by_name,
+        )
+    except ImportError as exc:
+        v.append(Violation(
+            "error", "middleware-registry-structural",
+            f"cannot import stack.MIDDLEWARE_REGISTRY: {exc}"))
+        return v
+    by_name = _specs_by_name()
+    # (2) interpreter is opt-in only — no gate, not in defaults.
+    interp = by_name.get("interpreter")
+    if interp is None:
+        v.append(Violation(
+            "error", "middleware-registry-structural",
+            "interpreter spec missing from MIDDLEWARE_REGISTRY"))
+    else:
+        if interp.gate is not None:
+            v.append(Violation(
+                "error", "middleware-registry-structural",
+                f"interpreter must have gate=None (opt-in only via `add:`); "
+                f"got gate={interp.gate!r}. The strength-auto-arm was deleted "
+                f"by design — a gate here re-introduces silent auto-arming."))
+        if "interpreter" in DEFAULT_SUPERVISOR:
+            v.append(Violation(
+                "error", "middleware-registry-structural",
+                "interpreter must NOT be in DEFAULT_SUPERVISOR (opt-in only)"))
+    # (3) interpreter_hints has a non-None gate (PAIRS with interpreter).
+    hints = by_name.get("interpreter_hints")
+    if hints is not None and hints.gate is None:
+        v.append(Violation(
+            "error", "middleware-registry-structural",
+            "interpreter_hints must have a non-None gate (it PAIRS with "
+            "interpreter — its gate reads the on-set for 'interpreter')"))
+    return v
+
+
 def check_harness() -> list[Violation]:
     """Rule 6 (no hardcoded org->agent manifest) + rule 7 (no orphan agents)
     + permanent legacy tripwires. Global — not per-org."""
@@ -1590,6 +1688,8 @@ def check_harness() -> list[Violation]:
     v.extend(_no_harness_profile_registration())
     v.extend(_no_load_skill_tool())
     v.extend(_pux_namespace_resolvable())
+    v.extend(_no_hardcoded_org_name_branches())
+    v.extend(_middleware_registry_structural())
     return v
 
 

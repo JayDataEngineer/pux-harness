@@ -883,16 +883,12 @@ def apply_profile_to_tools(
 ) -> list[BaseTool]:
     """Apply ``tool_description_overrides`` + ``excluded_tools`` to a tool list.
 
-    Used at both application sites — the MAIN agent stack (in ``build_graph``)
-    and EACH subagent's resolved whitelist (in ``load_subagents``) — so an
-    org-wide override reaches the browser subagent, not just the CTO.
-    ``_apply_tool_description_overrides`` copies + rewrites (it never mutates
-    caller-owned tools), so this is safe to call per-subagent. Filtering by
-    ``tool.name`` (the prefixed ``pux_sandbox_*`` identifier the profile keys
-    on)."""
-    out: list[BaseTool] = tools
-    if cfg.tool_description_overrides:
-        out = _apply_tool_description_overrides(out, cfg.tool_description_overrides)
-    if cfg.excluded_tools:
-        out = [t for t in out if t.name not in cfg.excluded_tools]
-    return out
+    .. deprecated:: seam
+        Moved to ``pux_harness.agent.profile_apply`` — the single owner of the
+        three upstream-gap applications (tools / middleware / prompt suffix).
+        This re-export is back-compat for existing imports; new code imports
+        from ``profile_apply`` directly. When the upstream per-call-profile PR
+        lands, ``profile_apply`` is deleted and this re-export goes with it.
+    """
+    from pux_harness.agent.profile_apply import apply_profile_to_tools as _impl
+    return _impl(tools, cfg)
