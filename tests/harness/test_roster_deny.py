@@ -21,7 +21,23 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
+
 from pux_harness.agent.contract import check_org
+
+
+# ``check_org`` resolves orgs through ``kit._paths.project_root()``, which is
+# ``$PUX_PROJECT_ROOT`` if set, else the CWD. When pytest runs inside the
+# ``pux-harness`` submodule (no ``orgs/`` dir), the CWD fallback can't find the
+# org under test. ``bin/pux`` sets ``PUX_PROJECT_ROOT`` in production; mirror
+# that here by deriving the parent repo from this file's location.
+# (pux-harness/tests/harness/test_roster_deny.py → parents[3] = parent repo.)
+_PARENT_REPO = pathlib.Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def _seed_project_root(monkeypatch):
+    monkeypatch.setenv("PUX_PROJECT_ROOT", str(_PARENT_REPO))
 
 
 def _violation_rules(org: str) -> list[str]:
