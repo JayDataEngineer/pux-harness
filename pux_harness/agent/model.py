@@ -45,6 +45,13 @@ openai-kind id, ``ChatAnthropic`` for an anthropic-kind id — so one deployment
 serves models from different vendors/protocols (e.g. glm-5.2 over ZAI's
 Anthropic-compat endpoint, mimo-v2.5 over OpenRouter's OpenAI-compat endpoint).
 ``PUX_MAX_TOKENS`` / ``PUX_TEMPERATURE`` still override per-deployment.
+OpenRouter backend preference (``provider.only``) comes from the per-id
+``provider_pin`` (declared in the ``models:`` registry — the SSOT knows which
+backends serve the model) else the ``PUX_OPENROUTER_PROVIDER_ONLY`` deployment
+default. A pin is a PREFERENCE: a pinned call that 404s with "No allowed
+providers are available for the selected model" is retried once unpinned
+(``_PinnedProviderOpenAI``) — availability drifts, and a pin that can't be
+satisfied must degrade, not kill the run.
 
 Historical notes:
   - Pre-17.B.0 a single ``DEFAULT_MODEL``/``get_model(model=None)`` was shared by
@@ -209,6 +216,16 @@ def validate_models_spec() -> None:
     model would silently break ``describe_image`` at runtime, so fail it here."""
     spec = _spec()
     registry = spec.get("models") or {}
+    for mid, caps in registry.items():
+        if not isinstance(caps, dict) or "provider_pin" not in caps:
+            continue
+        pin = caps["provider_pin"]
+        if not isinstance(pin, list) or not all(
+            isinstance(p, str) and p for p in pin
+        ):
+            raise RuntimeError(
+                f"models.yaml model {mid!r}: provider_pin must be a list of "
+                f"non-empty provider-name strings, got {pin!r}")
     for tname, tmap in spec["tiers"].items():
         mm = tmap["multimodal_model"]
         caps = registry.get(mm)
@@ -299,6 +316,41 @@ def wire_id_for(model_id: str) -> str:
         if isinstance(val, str) and val:
             return val
     return model_id
+
+
+# OpenRouter's exact 404 body when a ``provider.only`` pin names no provider
+# that can serve the requested model. This is NOT a config bug (the narrow
+# transient policy dies loud on 401/400/404 for a reason): provider↔model
+# availability DRIFTS, and the pin is a preference, not a contract —
+# ``_PinnedProviderOpenAI`` retries once unpinned on this exact signature.
+_OPENROUTER_PIN_404 = "No allowed providers are available for the selected model"
+
+
+def provider_pin_for(model_id: str) -> list[str] | None:
+    """The OpenRouter backend pin (``provider.only``) for ``model_id``.
+
+    A per-id ``provider_pin`` declared in the ``models:`` registry WINS (the
+    SSOT knows which backends serve the model — ``provider_pin: []`` is a
+    deliberate exemption, e.g. the mimo ids are not servable on the shipped
+    Parasail default). An undeclared id inherits the deployment default
+    ``PUX_OPENROUTER_PROVIDER_ONLY`` (comma-separated provider names). ``None``
+    = no pin — the request routes to any provider that serves the model.
+    Applied only to openrouter.ai profiles (the ``provider`` body key is
+    OpenRouter-specific); non-OpenRouter gateways never see it."""
+    caps = _models_registry().get(model_id)
+    if isinstance(caps, dict) and "provider_pin" in caps:
+        pin = caps["provider_pin"]
+        if not isinstance(pin, list) or not all(
+            isinstance(p, str) and p for p in pin
+        ):
+            raise RuntimeError(
+                f"models.yaml {model_id!r}: provider_pin must be a list of "
+                f"non-empty provider-name strings, got {pin!r}")
+        return list(pin)
+    env_pin = os.environ.get("PUX_OPENROUTER_PROVIDER_ONLY", "").strip()
+    if env_pin:
+        return [p.strip() for p in env_pin.split(",") if p.strip()]
+    return None
 
 
 def _tiers() -> dict:
@@ -444,7 +496,106 @@ def resolve_model_id(
     return _tier_role(role, active_tier())
 
 
-class _FallbackReasoningChatOpenAI(ReasoningChatOpenAI):
+class _PinnedProviderOpenAI(ReasoningChatOpenAI):
+    """A ``ReasoningChatOpenAI`` with an OpenRouter provider pin that SELF-HEALS.
+
+    ``provider.only`` (from ``provider_pin_for``) routes OpenRouter traffic
+    through a preferred backend (e.g. Parasail). It is a PREFERENCE, not a
+    contract: provider↔model availability drifts, and OpenRouter answers a pin
+    naming no servable provider with a 404 ("No allowed providers are available
+    for the selected model") — NOT a transient 429, so neither the SDK retries
+    nor the fallback chains would ever recover it.
+
+    On exactly that signature, the call is retried ONCE on an unpinned twin of
+    this client (WARNING-logged) — the model routes via any provider that
+    serves it. Any other 404 (bad model id, auth) still dies loud, preserving
+    the narrow policy the fallback chains rely on. All four generation entry
+    points degrade the same way; the agent hot path streams via ``_astream``.
+
+    The twin is built from ``_unpinned_kwargs`` (the same kwargs minus the
+    ``provider`` body key), so a twin of a fallback-bearing subclass is a plain
+    client — the chain is not re-attached on the retry.
+    """
+
+    _unpinned_kwargs: dict = PrivateAttr(default_factory=dict)
+    _degrade_warned: bool = PrivateAttr(default=False)
+
+    def _is_pin_404(self, exc: BaseException) -> bool:
+        return (
+            isinstance(exc, openai.NotFoundError)
+            and _OPENROUTER_PIN_404 in str(exc)
+        )
+
+    def _degrade(self, fn_name: str, *args, **kwargs):
+        try:
+            return getattr(super(), fn_name)(*args, **kwargs)
+        except Exception as exc:
+            if not self._is_pin_404(exc):
+                raise
+            if not self._degrade_warned:
+                self._degrade_warned = True
+                _log.warning(
+                    "OpenRouter provider pin unsatisfiable (%s) — retrying once "
+                    "unpinned; the pin is a preference, not a contract",
+                    exc,
+                )
+            twin = type(self)(**self._unpinned_kwargs)
+            return getattr(twin, fn_name)(*args, **kwargs)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._degrade("_generate", messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return await self._degrade("_agenerate", messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        # ChatOpenAI._stream is a lazy generator — the 404 raises on FIRST
+        # iteration. Buffering one chunk before yielding is fine: a failed
+        # stream never produced output, so the unpinned retry is lossless.
+        it = super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+        try:
+            first = next(it)
+        except Exception as exc:
+            if not self._is_pin_404(exc):
+                raise
+            if not self._degrade_warned:
+                self._degrade_warned = True
+                _log.warning(
+                    "OpenRouter provider pin unsatisfiable (%s) — retrying once "
+                    "unpinned; the pin is a preference, not a contract",
+                    exc,
+                )
+            twin = type(self)(**self._unpinned_kwargs)
+            yield from twin._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+            return
+        yield first
+        yield from it
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        # Async twin of ``_stream`` — same lazy-first-iteration shape.
+        it = super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs)
+        try:
+            first = await anext(it)
+        except Exception as exc:
+            if not self._is_pin_404(exc):
+                raise
+            if not self._degrade_warned:
+                self._degrade_warned = True
+                _log.warning(
+                    "OpenRouter provider pin unsatisfiable (%s) — retrying once "
+                    "unpinned; the pin is a preference, not a contract",
+                    exc,
+                )
+            twin = type(self)(**self._unpinned_kwargs)
+            async for chunk in twin._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
+                yield chunk
+            return
+        yield first
+        async for chunk in it:
+            yield chunk
+
+
+class _FallbackReasoningChatOpenAI(_PinnedProviderOpenAI):
     """A ``ReasoningChatOpenAI`` carrying a LangChain ``with_fallbacks`` chain.
 
     WHY THIS CLASS EXISTS (the deepagents seam)
@@ -646,22 +797,34 @@ def _instantiate(
     effort = reasoning_effort_for(model_id)
     if effort:
         extra["reasoning_effort"] = effort
-    # OpenRouter backend forcing (e.g. Parasail). Only injected when the profile
-    # targets openrouter.ai AND the deployment sets PUX_OPENROUTER_PROVIDER_ONLY
-    # (comma-separated provider names → OpenRouter `provider.only` body param).
-    # Mirrors Athena's provider_routing.only. Non-OpenRouter gateways never see
-    # it (the body key is OpenRouter-specific), so zai-coding calls are unaffected.
+    # OpenRouter backend preference (e.g. Parasail): the per-id `provider_pin`
+    # declared in models.yaml WINS, else the deployment default
+    # PUX_OPENROUTER_PROVIDER_ONLY (comma-separated names → OpenRouter
+    # `provider.only` body param). Mirrors Athena's provider_routing.only.
+    # Non-OpenRouter gateways never see it (the body key is OpenRouter-specific),
+    # so zai-coding calls are unaffected. A pin that names no servable provider
+    # degrades at call time (see `_PinnedProviderOpenAI`): the pinned client
+    # keeps `_unpinned_kwargs` (same kwargs minus the provider key) and retries
+    # once unpinned on OpenRouter's "No allowed providers" 404.
+    pinned_kwargs: dict[str, Any] | None = None
     if "openrouter.ai" in base_url:
-        _route_only = os.environ.get("PUX_OPENROUTER_PROVIDER_ONLY", "").strip()
-        if _route_only:
-            extra["provider"] = {
-                "only": [p.strip() for p in _route_only.split(",") if p.strip()]
-            }
+        pin = provider_pin_for(model_id)
+        if pin:
+            extra["provider"] = {"only": pin}
+            pinned_kwargs = dict(
+                kwargs, extra_body={k: v for k, v in extra.items() if k != "provider"}
+            )
     kwargs["extra_body"] = extra
     if fallback_models:
         m = _FallbackReasoningChatOpenAI(**kwargs)
         m._fallback_models = list(fallback_models)
         m._fallback_exceptions = tuple(fallback_exceptions)
+        if pinned_kwargs is not None:
+            m._unpinned_kwargs = pinned_kwargs
+        return m
+    if pinned_kwargs is not None:
+        m = _PinnedProviderOpenAI(**kwargs)
+        m._unpinned_kwargs = pinned_kwargs
         return m
     return ReasoningChatOpenAI(**kwargs)
 

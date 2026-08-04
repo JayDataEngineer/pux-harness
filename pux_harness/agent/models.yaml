@@ -86,6 +86,15 @@
 #   thinks at that depth. An unset/absent flag sends NO extra_body (the model's
 #   own default). `PUX_REASONING_EFFORT` overrides per-deployment. openai-kind
 #   only (it's an OpenAI extension).
+#   `provider_pin:` is the OpenRouter backend preference for THIS id (a list of
+#   provider slugs → `provider.only`). A declared pin WINS over the deployment
+#   default `PUX_OPENROUTER_PROVIDER_ONLY`; an id with NO declaration inherits
+#   that default; `provider_pin: []` is a deliberate EXEMPTION (the id is not
+#   servable on the deployment default — a blanket pin would 404 it).
+#   Availability drifts, so the pin is a PREFERENCE, not a contract: a pinned
+#   call that 404s with OpenRouter's "No allowed providers are available for
+#   the selected model" is retried once UNPINNED (WARNING-logged) — see
+#   `_PinnedProviderOpenAI` in agent/model.py. `provider_pin_for(id)` reads it.
 #
 # THE `dcode:` BLOCK
 #   The TUI (dcode) names our endpoint `pux-openai` and uses the SAME ids (see
@@ -95,10 +104,12 @@
 # Named provider profiles — each a wire protocol + endpoint + key env.
 providers:
   # OpenRouter — OpenAI-compatible aggregator. Primary serving backend. Serves
-  # the mimo/kimi/deepseek ids (full upstream ids via each id's `wire_id`). Force
-  # a specific backend (e.g. Parasail) with PUX_OPENROUTER_PROVIDER_ONLY in .env
-  # — see _instantiate in
-  # agent/model.py. Same OPENROUTER_API_KEY as Athena.
+  # the mimo/kimi/deepseek ids (full upstream ids via each id's `wire_id`).
+  # Backend preference: each id declares its `provider_pin` below (the shipped
+  # deployment routes through Parasail — kimi/deepseek are servable there, the
+  # mimo ids are NOT and are explicitly exempt). A pin is a preference — a
+  # pinned call that can't be satisfied degrades (see agent/model.py
+  # `_PinnedProviderOpenAI`). Same OPENROUTER_API_KEY as Athena.
   openrouter:
     kind: openai
     base_url: https://openrouter.ai/api/v1
@@ -137,15 +148,21 @@ providers:
 default_provider: openrouter
 
 # Per-id registry: capability flag + which profile serves it.
+# `provider_pin` on an openrouter id = OpenRouter backend preference
+# (provider.only). Verified 08-04: Parasail hosts kimi-k2.6/k2.7-code and the
+# deepseek-v4 ids, but NOT the mimo ids — pinning mimo to Parasail 404s
+# ("No allowed providers are available"), which previously killed the base
+# fallback chain while ZAI was rate-limited. The mimo ids are deliberately
+# exempt (`provider_pin: []`); the rest pin Parasail explicitly.
 models:
   glm-5.2:           {provider: zai-coding, multimodal: false, strength: pro, reasoning_effort: max}
   glm-5.1:           {provider: zai-coding, multimodal: false, strength: pro, reasoning_effort: max}
-  mimo-v2.5:         {provider: openrouter, wire_id: xiaomi/mimo-v2.5, multimodal: true, strength: flash}
-  mimo-v2.5-pro:     {provider: openrouter, wire_id: xiaomi/mimo-v2.5-pro, multimodal: true, strength: flash}
-  kimi-k2.7-code:    {provider: openrouter, wire_id: moonshotai/kimi-k2.7-code, multimodal: false, strength: flash}
-  kimi-k2.6:         {provider: openrouter, wire_id: moonshotai/kimi-k2.6, multimodal: false, strength: flash}
-  deepseek-v4-pro:   {provider: openrouter, wire_id: deepseek/deepseek-v4-pro, multimodal: false, strength: flash}
-  deepseek-v4-flash: {provider: openrouter, wire_id: deepseek/deepseek-v4-flash, multimodal: false, strength: flash}
+  mimo-v2.5:         {provider: openrouter, wire_id: xiaomi/mimo-v2.5, multimodal: true, strength: flash, provider_pin: []}
+  mimo-v2.5-pro:     {provider: openrouter, wire_id: xiaomi/mimo-v2.5-pro, multimodal: true, strength: flash, provider_pin: []}
+  kimi-k2.7-code:    {provider: openrouter, wire_id: moonshotai/kimi-k2.7-code, multimodal: false, strength: flash, provider_pin: [parasail]}
+  kimi-k2.6:         {provider: openrouter, wire_id: moonshotai/kimi-k2.6, multimodal: false, strength: flash, provider_pin: [parasail]}
+  deepseek-v4-pro:   {provider: openrouter, wire_id: deepseek/deepseek-v4-pro, multimodal: false, strength: flash, provider_pin: [parasail]}
+  deepseek-v4-flash: {provider: openrouter, wire_id: deepseek/deepseek-v4-flash, multimodal: false, strength: flash, provider_pin: [parasail]}
 
 # Named tiers — a coherent role map per "mode". `default_tier` is the shipped
 # default; --tier <name> (or --fast) selects another at run time.

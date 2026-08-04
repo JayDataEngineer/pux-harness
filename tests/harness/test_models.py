@@ -503,3 +503,209 @@ def test_validate_rejects_duplicate_fallback_ids(tmp_path, _spec_cleared, monkey
     )
     with pytest.raises(RuntimeError, match="base_fallbacks has duplicate"):
         model.validate_models_spec()
+
+
+# --- OpenRouter provider pins (provider_pin) + the degrade path --------------
+# A per-model ``provider_pin`` (models.yaml `models:` registry) declares the
+# OpenRouter backend preference for THAT id; it WINS over the deployment
+# default PUX_OPENROUTER_PROVIDER_ONLY. ``[]`` is a deliberate exemption — the
+# id is NOT servable on the deployment default (a blanket pin would 404 it,
+# which killed the base fallback chain live 08-04 while ZAI was rate-limited).
+# The pin is a PREFERENCE, not a contract: a pinned call that 404s with
+# OpenRouter's "No allowed providers are available for the selected model" is
+# retried once UNPINNED (``_PinnedProviderOpenAI``), because provider↔model
+# availability drifts and a pin that can't be satisfied must degrade, not kill
+# the run. Other 404s (bad id, auth) still die loud — the narrow transient
+# policy is preserved.
+
+def test_shipped_openrouter_ids_declare_provider_pin():
+    """The shipped SSOT declares a pin for every openrouter id: the mimo ids
+    (NOT servable on Parasail — the outage) are explicitly exempt, the
+    kimi/deepseek ids pin Parasail. The base fallback (mimo-v2.5-pro) must
+    resolve unpinned EVEN with the deployment env default set — that exact
+    combination previously 404ed and killed the fallback chain."""
+    for mid in ("kimi-k2.6", "kimi-k2.7-code", "deepseek-v4-pro", "deepseek-v4-flash"):
+        assert model.provider_pin_for(mid) == ["parasail"], mid
+    for mid in ("mimo-v2.5", "mimo-v2.5-pro"):
+        assert model.provider_pin_for(mid) == [], mid
+    # The fallback's wire id must be an OpenRouter id (the pin field only makes
+    # sense there) — guard against a future edit pinning it to a dead value.
+    assert "openrouter" in model._provider_for_model("mimo-v2.5-pro")["base_url"]
+
+
+def test_provider_pin_env_default_for_undeclared_ids(monkeypatch):
+    """An id WITHOUT a declared ``provider_pin`` inherits the deployment default
+    PUX_OPENROUTER_PROVIDER_ONLY (comma-separated provider names)."""
+    monkeypatch.setenv("PUX_OPENROUTER_PROVIDER_ONLY", "Parasail, Nova")
+    assert model.provider_pin_for("undeclared-id") == ["Parasail", "Nova"]
+    # No env, no declaration → None (no pin — route anywhere).
+    monkeypatch.delenv("PUX_OPENROUTER_PROVIDER_ONLY")
+    assert model.provider_pin_for("undeclared-id") is None
+
+
+def test_provider_pin_model_decl_wins_over_env(monkeypatch):
+    """A declared per-id pin beats the deployment default — the SSOT knows which
+    backends serve the model; the env is only the fallback for undeclared ids."""
+    monkeypatch.setenv("PUX_OPENROUTER_PROVIDER_ONLY", "Parasail")
+    assert model.provider_pin_for("mimo-v2.5-pro") == []       # exemption wins
+    assert model.provider_pin_for("kimi-k2.6") == ["parasail"]  # explicit wins
+
+
+def test_validate_rejects_malformed_provider_pin(tmp_path, _spec_cleared, monkeypatch):
+    """A non-list / non-string-entry ``provider_pin`` fails ``--check-contract``
+    loud (a malformed pin would silently skip the pin and change routing)."""
+    spec = (
+        "providers:\n  p: {kind: openai, base_url: x, api_key_env: K}\n"
+        "default_provider: p\n"
+        "models:\n  a: {provider_pin: parasail}\n"
+        "tiers:\n  t:\n"
+        + _minimal_role_lines()
+        + "\ndefault_tier: t\n"
+    )
+    (tmp_path / "models.yaml").write_text(spec)
+    monkeypatch.setattr(model, "_YAML", tmp_path / "models.yaml")
+    with pytest.raises(RuntimeError, match="provider_pin must be a list"):
+        model.validate_models_spec()
+
+
+def test_get_model_pin_plumbing(monkeypatch):
+    """``get_model`` threads the per-id pin into ``extra_body.provider.only``
+    and stashes the unpinned twin kwargs for the degrade retry. kimi-k2.6 is
+    pinned; mimo-v2.5-pro (the fallback) is NOT — the exact outage pairing."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    m = model.get_model(role="base", model="kimi-k2.6")
+    assert m.extra_body["provider"] == {"only": ["parasail"]}
+    assert m._unpinned_kwargs["extra_body"].get("provider") is None
+    fb = model.get_model(role="base", model="mimo-v2.5-pro")
+    assert "provider" not in (fb.extra_body or {})
+    # The shipped chain: glm-5.2 primary is zai-coding (no pin concept there),
+    # the fallback is the exempt mimo id — nothing in the chain is pin-404-able.
+    chain = model.get_model(role="base")
+    assert "provider" not in (chain.extra_body or {})
+    for cfb in chain._fallback_models:
+        assert "provider" not in (cfb.extra_body or {})
+
+
+def _routing_404() -> openai.NotFoundError:
+    """OpenRouter's exact unsat-pin 404 (message signature drives the degrade)."""
+    import httpx
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(404, request=req)
+    return openai.NotFoundError(
+        "Error code: 404 - No allowed providers are available for the selected model.",
+        response=resp, body={},
+    )
+
+
+def _rate_limit() -> openai.RateLimitError:
+    import httpx
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(429, request=req)
+    return openai.RateLimitError("Error code: 429", response=resp, body={})
+
+
+def test_pinned_model_degrades_on_routing_404(monkeypatch):
+    """REGRESSION (verify-or-die): a pinned call that 404s with the routing
+    signature is retried ONCE on the unpinned twin and succeeds. This is the
+    live failure: PUX_OPENROUTER_PROVIDER_ONLY=Parasail blanket-pinned the
+    mimo-v2.5-pro fallback → hard 404 → RUN_ERROR. With the fix the pin is a
+    preference: degrade, don't die."""
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_core.messages import AIMessage
+    from pux_harness.agent.model import _PinnedProviderOpenAI
+
+    calls = {"pinned": 0, "unpinned": 0}
+    fake = ChatResult(generations=[ChatGeneration(message=AIMessage(content="PONG"))])
+
+    def fake_generate(self, messages, stop=None, run_manager=None, **kwargs):
+        eb = getattr(self, "extra_body", None) or {}
+        if "provider" in eb:
+            calls["pinned"] += 1
+            raise _routing_404()
+        calls["unpinned"] += 1
+        return fake
+
+    monkeypatch.setattr(model.ReasoningChatOpenAI, "_generate", fake_generate)
+    m = _PinnedProviderOpenAI(
+        model="xiaomi/mimo-v2.5-pro", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8,
+        extra_body={"provider": {"only": ["parasail"]}},
+    )
+    m._unpinned_kwargs = dict(
+        model="xiaomi/mimo-v2.5-pro", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8, extra_body={},
+    )
+    out = m.invoke("hi")
+    assert out.content == "PONG"
+    assert calls == {"pinned": 1, "unpinned": 1}
+
+
+def test_other_404_still_dies_loud(monkeypatch):
+    """Only the routing signature degrades. A plain 404 (bad id / auth) still
+    propagates — the narrow policy that makes config bugs loud is preserved."""
+    from pux_harness.agent.model import _PinnedProviderOpenAI
+
+    import httpx
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(404, request=req)
+    exc = openai.NotFoundError(
+        "Error code: 404 - Model not found", response=resp, body={})
+
+    def fake_generate_other(self, messages, stop=None, run_manager=None, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(model.ReasoningChatOpenAI, "_generate", fake_generate_other)
+    m = _PinnedProviderOpenAI(
+        model="kimi-k2.6", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8,
+        extra_body={"provider": {"only": ["parasail"]}},
+    )
+    m._unpinned_kwargs = dict(
+        model="kimi-k2.6", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8, extra_body={},
+    )
+    with pytest.raises(openai.NotFoundError):
+        m.invoke("hi")
+
+
+def test_fallback_primary_pin_degrades_before_chain(monkeypatch):
+    """A fallback-bearing PINNED primary degrades (routing-404 → unpinned twin)
+    BEFORE the declared chain fires; the chain only takes over on a TRANSIENT
+    error from the twin. Ordering matters: the degrade is not a model swap."""
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_core.messages import AIMessage
+    from pux_harness.agent.model import _FallbackReasoningChatOpenAI
+
+    calls = {"pinned": 0, "twin": 0, "fallback": 0}
+    fake = ChatResult(generations=[ChatGeneration(message=AIMessage(content="DONE"))])
+
+    def fake_generate(self, messages, stop=None, run_manager=None, **kwargs):
+        eb = getattr(self, "extra_body", None) or {}
+        if "provider" in eb:
+            calls["pinned"] += 1
+            raise _routing_404()
+        if eb.get("marker") == "twin":
+            calls["twin"] += 1
+            raise _rate_limit()
+        calls["fallback"] += 1
+        return fake
+
+    monkeypatch.setattr(model.ReasoningChatOpenAI, "_generate", fake_generate)
+    fb = model.ReasoningChatOpenAI(
+        model="deepseek/deepseek-v4-pro", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8, extra_body={"marker": "fb"},
+    )
+    m = _FallbackReasoningChatOpenAI(
+        model="kimi-k2.6", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8,
+        extra_body={"provider": {"only": ["parasail"]}},
+    )
+    m._fallback_models = [fb]
+    m._fallback_exceptions = model._TRANSIENT_EXCEPTIONS
+    m._unpinned_kwargs = dict(
+        model="kimi-k2.6", base_url="https://openrouter.ai/api/v1",
+        api_key="k", max_tokens=8, extra_body={"marker": "twin"},
+    )
+    out = m.invoke("hi")
+    assert out.content == "DONE"
+    assert calls == {"pinned": 1, "twin": 1, "fallback": 1}
