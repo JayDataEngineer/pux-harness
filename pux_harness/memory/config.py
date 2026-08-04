@@ -22,8 +22,8 @@ def _project_key() -> str:
     """Derive a stable project key from the working directory.
 
     Flattens the absolute path like Claude does:
-    ``/home/ubuntu/.../auto-developer-orchestrator``
-    becomes ``-home-ubuntu-...-auto-developer-orchestrator``.
+    ``/home/<user>/.../auto-developer-orchestrator``
+    becomes ``-home-<user>-...-auto-developer-orchestrator``.
     """
     return str(Path.cwd()).replace("/", "-").lstrip("-")
 
