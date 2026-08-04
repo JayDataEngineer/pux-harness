@@ -11,6 +11,7 @@
     "game-studio": "./pux_harness/runtime/upstream.py:graph__game_studio",
     "general": "./pux_harness/runtime/upstream.py:graph__general",
     "invest": "./pux_harness/runtime/upstream.py:graph__invest",
+    "media-studio": "./pux_harness/runtime/upstream.py:graph__media_studio",
     "orchestrator": "./pux_harness/runtime/upstream.py:graph__orchestrator",
     "social-media-pipeline": "./pux_harness/runtime/upstream.py:graph__social_media_pipeline",
     "telegram-agent": "./pux_harness/runtime/upstream.py:graph__telegram_agent",
