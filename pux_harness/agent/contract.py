@@ -652,22 +652,23 @@ def check_org(name: str) -> list[Violation]:
             for err in stack_mod.validate_overrides(name):
                 v.append(Violation("error", "middleware-overrides", err))
 
-    # Token-budget gate (Track C). Fails when the assembled supervisor prompt
-    # exceeds the org's budget (``orgs/_shared/budgets.yaml``). Uses the SAME
-    # static assembler as ``pux prompt stats`` / ``pux prompt show`` — the
-    # offline check == runtime composition. Skipped (no violation) when no
-    # budgets.yaml ships. DRE has a temporary waiver (budget: 6000) until the
-    # B1 slimming lands; a waiver with ``waiver_reason`` is a TRACKED debt,
-    # not a silent pass.
+    # Token-budget gate (Track C). Fails when the assembled supervisor OR
+    # subagent prompt exceeds its budget (``orgs/_shared/budgets.yaml``). Uses
+    # the SAME static assembler as ``pux prompt stats`` / ``pux prompt show``
+    # — the offline check == runtime composition. Skipped (no violation) when
+    # no budgets.yaml ships.
     try:
-        from pux_harness.agent.prompt_show import budget_for, stats_for_org
-        budget = budget_for(name, _orgs_dir().parent, scope="supervisor")
+        from pux_harness.agent.prompt_show import (
+            budget_for, stats_for_org, stats_for_agent,
+        )
+        project_root = _orgs_dir().parent
+
+        # Supervisor prompt budget.
+        budget = budget_for(name, project_root, scope="supervisor")
         if budget is not None:
-            stats = stats_for_org(name, _orgs_dir().parent)
+            stats = stats_for_org(name, project_root)
             over_by = stats["total_tokens"] - budget
             if over_by > 0:
-                # Look up the waiver reason for a richer message.
-                overrides = stats.get("_overrides") or {}
                 v.append(Violation(
                     "error", "prompt-budget",
                     f"{name}: supervisor prompt {stats['total_tokens']:,} tokens > "
@@ -676,6 +677,25 @@ def check_org(name: str) -> list[Violation]:
                     f"orgs/_shared/budgets.yaml with a waiver_reason. Run "
                     f"`pux prompt stats --org {name}` for the per-part breakdown."
                 ))
+
+        # Subagent prompt budget — check every agent in the effective roster.
+        sub_budget = budget_for(name, project_root, scope="subagent")
+        if sub_budget is not None:
+            for slug in org_agent_slugs(name):
+                agent_stats = stats_for_agent(name, slug, project_root)
+                if agent_stats is None:
+                    continue
+                over_by = agent_stats["total_tokens"] - sub_budget
+                if over_by > 0:
+                    v.append(Violation(
+                        "error", "prompt-budget-subagent",
+                        f"{name}/{slug}: subagent prompt "
+                        f"{agent_stats['total_tokens']:,} tokens > budget "
+                        f"{sub_budget:,} (over by {over_by:,}). Slim the agent "
+                        f"body (move how-to to a skill reference, keep only "
+                        f"role + rubric) or raise subagent_default in "
+                        f"orgs/_shared/budgets.yaml."
+                    ))
     except (FileNotFoundError, ImportError, ValueError):
         pass  # no budgets.yaml / assembly failed / missing dep — skip silently
 

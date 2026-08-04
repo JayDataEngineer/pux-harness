@@ -461,3 +461,65 @@ def show_stats(
     return format_stats(stats_for_org(
         org, project_root, ask_user=ask_user, interpreter=interpreter,
     ))
+
+
+# --- subagent stats -------------------------------------------------------
+
+
+def stats_for_agent(
+    org: str, slug: str, project_root: Path,
+) -> dict | None:
+    """Compute the prompt stats for one subagent. Returns ``None`` when the
+    slug can't be resolved under the org.
+
+    Measures the SAME static assembly as ``show_subagent``: the agent body +
+    the org suffix + the agent's own frontmatter suffix + extra parts. Note:
+    deepagents prepends its own short ``DEFAULT_SUBAGENT_PROMPT`` at bind time
+    — that prefix is NOT measured here (it's upstream, ~200 chars)."""
+    ctx, error = _build_subagent_ctx(org, slug, project_root)
+    if error:
+        return None
+    extra = _resolve_extra_parts(org, project_root, PromptScope.SUBAGENT)
+    parts = render_parts(PromptScope.SUBAGENT, ctx, extra=extra)
+    active = [p for p in parts if p.content is not None]
+    total_chars = sum(len(p.content) for p in active)
+    total_tokens = _chars_to_tokens(total_chars)
+    budget = budget_for(org, project_root, scope="subagent")
+    return {
+        "org": org,
+        "slug": slug,
+        "total_chars": total_chars,
+        "total_tokens": total_tokens,
+        "budget_tokens": budget,
+        "headroom_tokens": (budget - total_tokens) if budget is not None else None,
+        "over_budget": (total_tokens > budget) if budget is not None else False,
+        "parts": [
+            {
+                "name": p.name,
+                "chars": len(p.content) if p.content is not None else 0,
+                "tokens": _chars_to_tokens(len(p.content)) if p.content is not None else 0,
+                "active": p.content is not None,
+            }
+            for p in parts
+        ],
+    }
+
+
+def show_agent_stats(org: str, slug: str, project_root: Path) -> str:
+    """Render the stats report for one subagent's prompt."""
+    stats = stats_for_agent(org, slug, project_root)
+    if stats is None:
+        return f"ERROR: agent {slug!r} not found under org {org!r}"
+    lines = [
+        f"=== {org} / {slug} — subagent prompt stats ===",
+        "",
+        f"total:  {stats['total_chars']:>7,} chars  ≈ {stats['total_tokens']:>5,} tokens",
+    ]
+    budget = stats["budget_tokens"]
+    if budget is not None:
+        headroom = stats["headroom_tokens"]
+        marker = "❌ OVER" if stats["over_budget"] else "✅ under"
+        lines.append(
+            f"budget: {budget:>7,} tokens  →  {headroom:+,} headroom  {marker}"
+        )
+    return "\n".join(lines)

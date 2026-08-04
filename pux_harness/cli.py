@@ -645,26 +645,31 @@ def cmd_prompt_show(
 
 def cmd_prompt_stats(
     org: str, project_root: str | None,
+    agent: str | None = None,
     with_ask_user: bool = False, with_interpreter: bool = False,
 ) -> None:
-    """Token-budget report for ``org``'s supervisor prompt.
+    """Token-budget report for ``org``'s supervisor prompt (or one subagent
+    when ``agent`` is set).
 
     Prints total tokens (4 chars/token heuristic), per-part breakdown,
-    shared-vs-org-specific split, and headroom against the budget in
-    ``orgs/_shared/budgets.yaml``. The measurement tool behind the slimming
-    pass + the contract budget rule. Docker-free — same static renderer as
-    ``pux prompt show``.
+    shared-vs-org-specific split (supervisor only), and headroom against the
+    budget in ``orgs/_shared/budgets.yaml``. Docker-free — same static
+    renderer as ``pux prompt show``.
     """
     from pathlib import Path
 
     from pux_harness.agent.orgs import _orgs_dir
-    from pux_harness.agent.prompt_show import show_stats
 
     root = Path(project_root) if project_root else _orgs_dir().parent
     try:
-        print(show_stats(
-            org, root, ask_user=with_ask_user, interpreter=with_interpreter,
-        ))
+        if agent:
+            from pux_harness.agent.prompt_show import show_agent_stats
+            print(show_agent_stats(org, agent, root))
+        else:
+            from pux_harness.agent.prompt_show import show_stats
+            print(show_stats(
+                org, root, ask_user=with_ask_user, interpreter=with_interpreter,
+            ))
     except FileNotFoundError as exc:
         import sys
 
@@ -899,6 +904,9 @@ def main() -> None:
         help="token-budget report: total tokens, per-part breakdown, headroom")
     p_pst.add_argument("--org", required=True, help="the org to measure")
     p_pst.add_argument(
+        "--agent", default=None,
+        help="measure one subagent's prompt instead of the supervisor")
+    p_pst.add_argument(
         "--project-root", default=None,
         help="repo root containing orgs/ (default: auto-detected)")
     p_pst.add_argument(
@@ -1124,8 +1132,9 @@ def main() -> None:
         elif args.prompt_cmd == "stats":
             cmd_prompt_stats(
                 args.org, args.project_root,
-                getattr(args, "with_ask_user", False),
-                getattr(args, "with_interpreter", False),
+                agent=getattr(args, "agent", None),
+                with_ask_user=getattr(args, "with_ask_user", False),
+                with_interpreter=getattr(args, "with_interpreter", False),
             )
 
     # --- Org inheritance introspection ---
