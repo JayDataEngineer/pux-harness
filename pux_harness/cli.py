@@ -643,6 +643,35 @@ def cmd_prompt_show(
         sys.exit(1)
 
 
+def cmd_prompt_stats(
+    org: str, project_root: str | None,
+    with_ask_user: bool = False, with_interpreter: bool = False,
+) -> None:
+    """Token-budget report for ``org``'s supervisor prompt.
+
+    Prints total tokens (4 chars/token heuristic), per-part breakdown,
+    shared-vs-org-specific split, and headroom against the budget in
+    ``orgs/_shared/budgets.yaml``. The measurement tool behind the slimming
+    pass + the contract budget rule. Docker-free — same static renderer as
+    ``pux prompt show``.
+    """
+    from pathlib import Path
+
+    from pux_harness.agent.orgs import _orgs_dir
+    from pux_harness.agent.prompt_show import show_stats
+
+    root = Path(project_root) if project_root else _orgs_dir().parent
+    try:
+        print(show_stats(
+            org, root, ask_user=with_ask_user, interpreter=with_interpreter,
+        ))
+    except FileNotFoundError as exc:
+        import sys
+
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_org_chain(org: str, project_root: str | None) -> None:
     """Print the inheritance chain for ``org``: the extends-chain (root→child),
     which files each org in the chain contributes, and the per-file merge rule
@@ -861,6 +890,25 @@ def main() -> None:
         help="simulate dynamic_dispatch ACTIVE (preview the eval-tool suffix "
              "that would emit when CodeInterpreterMiddleware is mounted)")
 
+    # ``pux prompt stats <org>`` — token-budget gate (Track C). Prints total
+    # tokens (4 chars/token), per-part breakdown, shared-vs-org-specific split,
+    # and budget headroom against orgs/_shared/budgets.yaml. The measurement
+    # tool the slimming pass (Track B) + the contract rule (C2) use.
+    p_pst = prompt_sub.add_parser(
+        "stats",
+        help="token-budget report: total tokens, per-part breakdown, headroom")
+    p_pst.add_argument("--org", required=True, help="the org to measure")
+    p_pst.add_argument(
+        "--project-root", default=None,
+        help="repo root containing orgs/ (default: auto-detected)")
+    p_pst.add_argument(
+        "--with-ask-user", action="store_true",
+        help="simulate ask_user ACTIVE (the HITL suffix adds ~100 tokens)")
+    p_pst.add_argument(
+        "--with-interpreter", action="store_true",
+        help="simulate dynamic_dispatch ACTIVE (the eval-tool suffix adds "
+             "~370 tokens)")
+
     # Org inheritance introspection — the extends-chain, per-file merge rules,
     # and which files each org in the chain contributes. Read-only.
     p_org = sub.add_parser(
@@ -1070,6 +1118,12 @@ def main() -> None:
         if args.prompt_cmd == "show":
             cmd_prompt_show(
                 args.org, args.scope, args.raw, args.project_root,
+                getattr(args, "with_ask_user", False),
+                getattr(args, "with_interpreter", False),
+            )
+        elif args.prompt_cmd == "stats":
+            cmd_prompt_stats(
+                args.org, args.project_root,
                 getattr(args, "with_ask_user", False),
                 getattr(args, "with_interpreter", False),
             )

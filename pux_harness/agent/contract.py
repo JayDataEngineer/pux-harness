@@ -652,6 +652,33 @@ def check_org(name: str) -> list[Violation]:
             for err in stack_mod.validate_overrides(name):
                 v.append(Violation("error", "middleware-overrides", err))
 
+    # Token-budget gate (Track C). Fails when the assembled supervisor prompt
+    # exceeds the org's budget (``orgs/_shared/budgets.yaml``). Uses the SAME
+    # static assembler as ``pux prompt stats`` / ``pux prompt show`` — the
+    # offline check == runtime composition. Skipped (no violation) when no
+    # budgets.yaml ships. DRE has a temporary waiver (budget: 6000) until the
+    # B1 slimming lands; a waiver with ``waiver_reason`` is a TRACKED debt,
+    # not a silent pass.
+    try:
+        from pux_harness.agent.prompt_show import budget_for, stats_for_org
+        budget = budget_for(name, _orgs_dir().parent, scope="supervisor")
+        if budget is not None:
+            stats = stats_for_org(name, _orgs_dir().parent)
+            over_by = stats["total_tokens"] - budget
+            if over_by > 0:
+                # Look up the waiver reason for a richer message.
+                overrides = stats.get("_overrides") or {}
+                v.append(Violation(
+                    "error", "prompt-budget",
+                    f"{name}: supervisor prompt {stats['total_tokens']:,} tokens > "
+                    f"budget {budget:,} (over by {over_by:,}). Slim the prompt "
+                    f"(AGENTS.md / skills escape hatch) or raise the budget in "
+                    f"orgs/_shared/budgets.yaml with a waiver_reason. Run "
+                    f"`pux prompt stats --org {name}` for the per-part breakdown."
+                ))
+    except (FileNotFoundError, ImportError, ValueError):
+        pass  # no budgets.yaml / assembly failed / missing dep — skip silently
+
     return v
 
 

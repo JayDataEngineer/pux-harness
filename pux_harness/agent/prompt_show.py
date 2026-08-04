@@ -316,3 +316,148 @@ def show_subagent(
     return format_prompt_with_provenance(
         parts, scope_label=f"SUBAGENT prompt — org {org!r}, agent {slug!r}"
     )
+
+
+# --- token-budget gate (Track C) ------------------------------------------
+
+
+CHARS_PER_TOKEN = 4  # the heuristic used everywhere in pux
+
+
+def load_budgets(project_root: Path) -> dict:
+    """Load ``orgs/_shared/budgets.yaml`` → ``{default, subagent_default,
+    overrides: {org: {budget, waiver_reason}}}``.
+
+    Returns ``{}`` when the file is absent (no budget gate — the contract rule
+    is skipped). A malformed file raises ``ValueError`` (fail loud on a typo'd
+    budget that would silently weaken the gate)."""
+    import yaml
+    path = project_root / "orgs" / "_shared" / "budgets.yaml"
+    if not path.is_file():
+        return {}
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top-level must be a mapping")
+    return {
+        "default": int(data.get("default", 4000)),
+        "subagent_default": int(data.get("subagent_default", 1500)),
+        "overrides": data.get("overrides") or {},
+    }
+
+
+def budget_for(org: str, project_root: Path, *, scope: str = "supervisor") -> int | None:
+    """The token budget for ``org``'s ``scope`` prompt, or None when no budgets
+    file ships. Per-org overrides win; otherwise the scope default."""
+    budgets = load_budgets(project_root)
+    if not budgets:
+        return None
+    if scope == "supervisor":
+        override = budgets["overrides"].get(org)
+        if isinstance(override, dict) and override.get("budget"):
+            return int(override["budget"])
+        return budgets["default"]
+    return budgets["subagent_default"]
+
+
+def _chars_to_tokens(chars: int) -> int:
+    """4 chars/token, rounded up (the pux heuristic)."""
+    return (chars + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+
+
+def stats_for_org(
+    org: str, project_root: Path, *,
+    ask_user: bool = False, interpreter: bool = False,
+) -> dict:
+    """Compute the per-org prompt stats: total tokens, per-part breakdown,
+    shared-vs-org-specific split, and budget headroom.
+
+    ``ask_user`` / ``interpreter`` simulate the runtime-on state (same as
+    ``show_supervisor``). Default False = the common static case."""
+    ctx = _build_supervisor_ctx(
+        org, project_root, ask_user=ask_user, interpreter=interpreter
+    )
+    extra = _resolve_extra_parts(org, project_root, PromptScope.SUPERVISOR)
+    parts = render_parts(PromptScope.SUPERVISOR, ctx, extra=extra)
+    active = [p for p in parts if p.content is not None]
+    total_chars = sum(len(p.content) for p in active)
+    total_tokens = _chars_to_tokens(total_chars)
+    # Shared = the parts EVERY org pays: the harness addendum (folded into
+    # agents_md_core, so measure it directly from ctx) + the ask_user suffix
+    # + the dynamic_dispatch suffix (when active). Org-specific = the rest.
+    shared_chars = len(ctx.harness_addendum or "")
+    shared_names = {"ask_user_suffix", "dynamic_dispatch_suffix"}
+    shared_chars += sum(len(p.content) for p in active if p.name in shared_names)
+    org_specific_chars = total_chars - shared_chars
+    budget = budget_for(org, project_root, scope="supervisor")
+    return {
+        "org": org,
+        "total_chars": total_chars,
+        "total_tokens": total_tokens,
+        "budget_tokens": budget,
+        "headroom_tokens": (budget - total_tokens) if budget is not None else None,
+        "over_budget": (total_tokens > budget) if budget is not None else False,
+        "shared_chars": shared_chars,
+        "shared_tokens": _chars_to_tokens(shared_chars),
+        "org_specific_chars": org_specific_chars,
+        "org_specific_tokens": _chars_to_tokens(org_specific_chars),
+        "parts": [
+            {
+                "name": p.name,
+                "chars": len(p.content) if p.content is not None else 0,
+                "tokens": _chars_to_tokens(len(p.content)) if p.content is not None else 0,
+                "active": p.content is not None,
+                "source": p.source,
+            }
+            for p in parts
+        ],
+    }
+
+
+def format_stats(stats: dict) -> str:
+    """Human-readable rendering of ``stats_for_org``'s output."""
+    lines: list[str] = []
+    org = stats["org"]
+    lines.append(f"=== {org} — supervisor prompt stats ===")
+    lines.append("")
+    lines.append(f"total:    {stats['total_chars']:>7,} chars  ≈ {stats['total_tokens']:>5,} tokens")
+    lines.append(f"  shared: {stats['shared_chars']:>7,} chars  ≈ {stats['shared_tokens']:>5,} tokens")
+    lines.append(f"  org:    {stats['org_specific_chars']:>7,} chars  ≈ {stats['org_specific_tokens']:>5,} tokens")
+    budget = stats["budget_tokens"]
+    if budget is not None:
+        headroom = stats["headroom_tokens"]
+        marker = "❌ OVER" if stats["over_budget"] else "✅ under"
+        lines.append(
+            f"budget:   {budget:>7,} tokens  →  {headroom:+,} headroom  {marker}"
+        )
+        if stats["over_budget"]:
+            lines.append(
+                f"  ⚠️  over by {-headroom:,} tokens — "
+                f"`pux check-contract` will FAIL"
+            )
+    else:
+        lines.append("budget:   (no budgets.yaml — gate disabled)")
+    lines.append("")
+    lines.append("per-part breakdown (active parts, by tokens desc):")
+    active = sorted(
+        (p for p in stats["parts"] if p["active"]),
+        key=lambda p: p["tokens"], reverse=True,
+    )
+    for p in active:
+        lines.append(f"  {p['tokens']:>5,} t  {p['chars']:>6,} c  {p['name']}")
+    inactive = [p for p in stats["parts"] if not p["active"]]
+    if inactive:
+        lines.append("")
+        lines.append("inactive (conditional off):")
+        for p in inactive:
+            lines.append(f"  —  {p['name']}")
+    return "\n".join(lines)
+
+
+def show_stats(
+    org: str, project_root: Path, *,
+    ask_user: bool = False, interpreter: bool = False,
+) -> str:
+    """Render the stats report for ``org``'s supervisor prompt."""
+    return format_stats(stats_for_org(
+        org, project_root, ask_user=ask_user, interpreter=interpreter,
+    ))
