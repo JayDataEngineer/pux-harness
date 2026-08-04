@@ -4,13 +4,13 @@ version = "0.1.0"
 description = "deepagents-based Pux harness — the org+skill compiler (slim kit) + the Docker sandbox runtimes."
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "deepagents",
+    "deepagents>=0.7.3",
     "deepagents-acp>=0.0.9",
     "docker>=7.1.0",
     "fastapi>=0.139.0",
     "httpx>=0.28.1",
     "anthropic>=0.100",
-    "langchain-anthropic>=1.4",
+    "langchain-anthropic>=1.5.3",
     "langchain-openai",
     "langchain-mcp-adapters>=0.3.0",
     "langgraph-checkpoint-sqlite>=3.1.0",
@@ -20,7 +20,7 @@ dependencies = [
     "deepagents-code",
     "ag-ui-langgraph",
     "fastmcp>=3.4.2",
-    "langchain-quickjs>=0.2.0",
+    "langchain-quickjs>=0.3.5",
 ]
 
 # Optional extras — the base install stays lean. The Python-import extras
