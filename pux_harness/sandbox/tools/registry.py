@@ -72,6 +72,7 @@ from pux_harness.sandbox.tools.browser import (
     _browser_accept_cookies_tool,
     _browser_warmup_history_tool,
     _browser_solve_captcha_tool,
+    _browser_reset_tool,
 )
 from pux_harness.sandbox.tools.desktop import (
     _desktop_screenshot_tool,
@@ -208,6 +209,7 @@ REGISTRY: list[ToolSpec] = [
     ToolSpec("browser_accept_cookies", Category.SPECIALIST, Requirements(exec_client=True), _browser_accept_cookies_tool, "browser"),
     ToolSpec("browser_warmup_history", Category.SPECIALIST, Requirements(exec_client=True), _browser_warmup_history_tool, "browser"),
     ToolSpec("browser_solve_captcha", Category.SPECIALIST, Requirements(exec_client=True), _browser_solve_captcha_tool, "browser"),
+    ToolSpec("browser_reset", Category.SPECIALIST, Requirements(exec_client=True), _browser_reset_tool, "browser"),
 
     # desktop (xdotool + Xvfb)
     ToolSpec("desktop_screenshot", Category.SPECIALIST,

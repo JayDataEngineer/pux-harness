@@ -30,6 +30,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from pux_harness.context.events import EventStore
+from pux_harness.sandbox.docker_exec import ExecTimeout
 
 
 # -- language → command maps (pure, testable without Docker) -----------------
@@ -222,6 +223,32 @@ class _FetchArgs(BaseModel):
 
 # -- tool builder ------------------------------------------------------------
 
+def _timeout_envelope(tool: str, exc: ExecTimeout, cmd: str) -> str:
+    """Render an ExecTimeout as a clean tool-result string the agent can act on.
+
+    Without this, ExecTimeout walks out of the StructuredTool, through
+    langgraph's ToolNode (whose default ``_handle_tool_errors`` re-raises
+    anything that isn't a ``ToolInvocationError``), up to the model node —
+    where ``retry_on_stream_stall`` matches the words "timed out" / "timeout"
+    in the exception message and triggers 4 useless retries of the SAME tool
+    call (each hitting the same 120s wall-clock budget) before surfacing the
+    misleading "⚠️ model stream stalled" banner. The describe_image tool
+    already does this envelope conversion at ``sandbox/tools/_media.py:230``;
+    the ctx_* tools were missing it.
+
+    The envelope tells the agent (a) it was a timeout, not a crash, (b) the
+    budget that was hit, and (c) the workaround for long-running work — split
+    into shorter steps and poll across calls instead of waiting in one exec.
+    """
+    preview = cmd if len(cmd) <= 140 else cmd[:137] + "..."
+    return (
+        f"[{tool}] timeout: {exc}.\n"
+        f"Command preview: {preview}\n"
+        f"The sandbox caps each exec call at a hard wall-clock budget. "
+        f"For long-running work, write progress to a marker file and poll "
+        f"across separate tool calls — do NOT wrap the wait in one exec."
+    )
+
 def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredTool]:
     """The 4 exec-dependent context tools, bound to ``store`` + ``exec_client``.
 
@@ -236,7 +263,10 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
             cmd = _build_exec_command(language, code)
         except ValueError as e:
             return str(e)
-        out, exit_code = exec_client.exec(cmd)
+        try:
+            out, exit_code = exec_client.exec(cmd)
+        except ExecTimeout as exc:
+            return _timeout_envelope("ctx_execute", exc, cmd)
         if exit_code != 0:
             return f"[ctx_execute] exit {exit_code}\n{out}"
         return out
@@ -246,7 +276,10 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
             cmd = _build_file_command(path, language, code)
         except ValueError as e:
             return str(e)
-        out, exit_code = exec_client.exec(cmd)
+        try:
+            out, exit_code = exec_client.exec(cmd)
+        except ExecTimeout as exc:
+            return _timeout_envelope("ctx_execute_file", exc, cmd)
         if exit_code != 0:
             return f"[ctx_execute_file] exit {exit_code}\n{out}"
         return out
@@ -265,7 +298,15 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
                 label = getattr(entry, "label", "") or command[:60]
             if not command:
                 continue
-            out, exit_code = exec_client.exec(command)
+            # Per-command try/except: a timeout on one command is reported in
+            # its section, and the rest of the batch continues. Aborting the
+            # whole loop on a single timeout would lose partial progress and
+            # hide which commands actually completed.
+            try:
+                out, exit_code = exec_client.exec(command)
+            except ExecTimeout as exc:
+                sections.append(f"- {label}: TIMEOUT — {exc}")
+                continue
             stash = store.stash_blob(out, tool=f"ctx_batch:{label}")
             sections.append(
                 f"- {label}: exit={exit_code}, {len(out)} chars, handle {stash.handle}"
@@ -305,7 +346,10 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
                 )
         # Fetch + convert HTML→text inside the container (one exec call).
         cmd = _build_fetch_command(url)
-        out, exit_code = exec_client.exec(cmd)
+        try:
+            out, exit_code = exec_client.exec(cmd)
+        except ExecTimeout as exc:
+            return _timeout_envelope("ctx_fetch_and_index", exc, cmd)
         if exit_code != 0:
             return f"[ctx_fetch_and_index] fetch failed (exit {exit_code}):\n{out[:300]}"
         if not out.strip():

@@ -41,18 +41,20 @@ _EXEC = "DUMMY-EXEC"
 
 
 def test_registry_is_non_empty_and_partitioned():
-    """49 tools: 39 specialist + 7 native + 3 grader. Catches an accidental
-    add/drop in any one partition. (Added 7 browser specialists:
-    drag/hover/press/click_at/scroll_into_view/a11y/iframe. REMOVED
-    ``load_skill`` — skill bodies peek via native read_file now.)"""
+    """54 tools: 44 specialist + 7 native + 3 grader. Catches an accidental
+    add/drop in any one partition. (Grew from 49→54: added 5 browser
+    specialists — accept_cookies/download/dropdown_options/extract_images/
+    find_text/go_back/restore_session/save_session/search/solve_captcha/
+    switch_tab/tabs/warmup_history/multimodal_mega. REMOVED ``load_skill`` —
+    skill bodies peek via native read_file now.)"""
     counts = {c: 0 for c in Category}
     for spec in REGISTRY:
         assert isinstance(spec, ToolSpec)
         counts[spec.category] += 1
         assert spec.slug, f"empty slug in {spec!r}"
-    assert len(REGISTRY) == 49, counts
+    assert len(REGISTRY) == 54, counts
     assert counts == {
-        Category.SPECIALIST: 39,
+        Category.SPECIALIST: 44,
         Category.NATIVE: 7,
         Category.GRADER: 3,
     }, counts
@@ -249,11 +251,11 @@ def test_tool_group_tools_derives_from_registry():
     assert seen == set(SPECIALISTS)
 
 
-def test_resolve_tool_allowlist_empty_means_all():
-    """No ``tool_surface.groups`` → ``None`` → the supervisor carries EVERY
-    specialist (byte-identical to today)."""
-    assert resolve_tool_allowlist([]) is None
-    assert resolve_tool_allowlist(()) is None
+def test_resolve_tool_allowlist_empty_means_none_on_supervisor():
+    """No ``tool_surface.groups`` → ``frozenset()`` → the supervisor carries NO
+    specialist (the OPT-IN default; they still reach them via subagents)."""
+    assert resolve_tool_allowlist([]) == frozenset()
+    assert resolve_tool_allowlist(()) == frozenset()
 
 
 def test_resolve_tool_allowlist_expands_groups_and_slugs():

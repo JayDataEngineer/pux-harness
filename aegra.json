@@ -4,6 +4,7 @@
   ],
   "graphs": {
     "_demo": "./pux_harness/runtime/upstream.py:graph___demo",
+    "browser-agent": "./pux_harness/runtime/upstream.py:graph__browser_agent",
     "coder": "./pux_harness/runtime/upstream.py:graph__coder",
     "deep-research-engine": "./pux_harness/runtime/upstream.py:graph__deep_research_engine",
     "fs-explorer": "./pux_harness/runtime/upstream.py:graph__fs_explorer",

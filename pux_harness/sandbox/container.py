@@ -162,9 +162,18 @@ DEFAULT_CPU_CORES = 2.0
 # subagent / Python helper is more. 512 (the old default) EAGAIN'd on fork
 # ("Resource temporarily unavailable" / gVisor "procReady not received") once a
 # browser org also ran a dev server + subagents — forcing the agent to restart
-# the sandbox mid-task. 2048 is 4x headroom while still bounded; operators who
-# need tighter/looser bounds override via PUX_SANDBOX_PIDS.
-DEFAULT_PIDS = 2048
+# the sandbox mid-task.
+#
+# 2048 turned out too tight for long-running sessions: each browser spawn
+# leaves ~5 Chrome helper subprocesses orphaned when fuser kills only the port
+# listener (the leak fixed in tools/browser.py::_spawn_one_attempt's
+# process-group kill). Over ~48 hours of intermittent browser use the orphans
+# piled up to the 2048 ceiling and killed the container with the same
+# "Resource temporarily unavailable" the 512 limit used to. 8192 gives ~4x
+# headroom over observed peak (~1800 PIDs in a heavy multi-specialist session)
+# while still bounded; operators who need tighter/looser bounds override via
+# PUX_SANDBOX_PIDS.
+DEFAULT_PIDS = 8192
 
 CACHE_MOUNT_TARGET = "/root/.cache"
 CACHE_DISABLED_ENV = "PUX_CACHE_VOLUME"
@@ -460,6 +469,23 @@ class SandboxContainer:
             # would NOT connect — Aegra isn't on the docker-gateway iface).
             f"PUX_API_HOST={_env_str('PUX_API_HOST', '127.0.0.1')}",
             f"PUX_API_PORT={_env_str('PUX_API_PORT', '9988')}",
+            # Redirect uv's project env + cache to CONTAINER-LOCAL paths so that
+            # any ``uv sync`` / ``uv run`` / ``uv lock`` invoked inside the
+            # sandbox cannot write through the /sandbox/workspace bind-mount to
+            # the host's .venv. Without this, the container (running as root)
+            # recreates the host .venv root-owned with a python symlink that
+            # resolves to /root/.local/share/uv/python/... — a path that exists
+            # only inside the container. The host then sees a venv it cannot
+            # canonicalize (Permission denied, os error 13) and every host-side
+            # ``pux``/``uv`` invocation dies. /sandbox/.venv + /sandbox/.uv-cache
+            # are NOT under /sandbox/workspace (the bind mount), so they live
+            # only in the container's writable layer. Paired with the anonymous
+            # volume shadow at /sandbox/workspace/.venv in _build_binds (which
+            # catches bare ``uv venv`` — UV_PROJECT_ENVIRONMENT does not redirect
+            # that subcommand), this fully isolates the container's venv work
+            # from the host. Allow operator override via env for debugging.
+            f"UV_PROJECT_ENVIRONMENT={_env_str('PUX_SANDBOX_UV_PROJECT_ENV', '/sandbox/.venv')}",
+            f"UV_CACHE_DIR={_env_str('PUX_SANDBOX_UV_CACHE_DIR', '/sandbox/.uv-cache')}",
         ]
         # Policy creds/cookies (required validated before this point). Appended
         # last → last-wins, matching Docker semantics.
@@ -474,6 +500,18 @@ class SandboxContainer:
             f"{policies_dir}:/etc/openshell/policies:ro",
             "/tmp:/sandbox/tmp",
             f"{persist}:/sandbox/persist",
+            # Anonymous volume that SHADOWS the host project's .venv inside the
+            # container. Docker applies the most-specific mount per path, so
+            # this empty anonymous volume at /sandbox/workspace/.venv overrides
+            # the .venv subtree of the bind-mount above. Any bare ``uv venv``
+            # run at /sandbox/workspace (which ignores UV_PROJECT_ENVIRONMENT
+            # and writes to ./venv in cwd) lands in this anonymous volume —
+            # container-local, ephemeral, never visible on the host. Without
+            # this, a single ``uv venv`` inside the sandbox recreates the host
+            # .venv root-owned with symlinks into /root/.local/share/uv/...,
+            # and the host's next ``pux`` invocation dies with ``failed to
+            # canonicalize path: Permission denied (os error 13)``.
+            "/sandbox/workspace/.venv",
         ]
         _ensure_volume(self.client, persist)
         # Per-project cache volume (disabled via PUX_CACHE_VOLUME=off).
@@ -864,10 +902,29 @@ class SandboxContainer:
         running = self._running_for_project()
         if running:
             self._validate_reused_container(running)
-            self._name = running
-            log.info("reusing running container %s", running)
-            _projects.record(self.project_path, self.sandbox_id, self.org)
-            return running
+            if not self._network_healthy(running):
+                # The container looks alive (Status=running) but its veth
+                # isn't carrying packets — a docker-daemon race we hit
+                # intermittently on container recreate (the veth is attached
+                # to the bridge in `ip link` but tcpdump on the bridge shows
+                # zero packets). The agent experiences this as "browser
+                # unavailable" because sb_server can't reach any site.
+                # Self-heal: force-remove + fall through to create() so the
+                # agent NEVER sees the failure. Save-on-destroy is skipped
+                # (the container is broken — there's nothing to save).
+                log.warning(
+                    "reused container %s failed the gateway reachability "
+                    "check (docker veth/iptables race) — force-removing and "
+                    "recreating so the agent never sees the failure",
+                    running,
+                )
+                self._force_remove_unhealthy(running)
+                # Fall through to create() — do NOT set self._name or return.
+            else:
+                self._name = running
+                log.info("reusing running container %s", running)
+                _projects.record(self.project_path, self.sandbox_id, self.org)
+                return running
         try:
             name = self.create()
         except ContainerError as exc:
@@ -895,8 +952,89 @@ class SandboxContainer:
                 _projects.record(self.project_path, self.sandbox_id, self.org)
                 return running
             name = self.create()  # exactly one retry
+        # Verify the fresh container's networking before handing it back. The
+        # same docker-daemon veth-attachment race that breaks reused containers
+        # can break a fresh one at create() time; catching it here gives the
+        # agent a working container on the FIRST tool call instead of a
+        # confusing "browser unavailable" error.
+        if not self._network_healthy(name):
+            log.warning(
+                "fresh container %s failed the gateway reachability check — "
+                "one retry (docker daemon veth/iptables race)", name,
+            )
+            self._force_remove_unhealthy(name)
+            name = self.create()  # exactly one retry; escalate on real failure
         _projects.record(self.project_path, self.sandbox_id, self.org)
         return name
+
+    def _network_healthy(self, name: str) -> bool:
+        """Quick TCP-reachability probe to the container's gateway.
+
+        Catches the docker-daemon race where a container's veth is attached to
+        the bridge (visible in ``ip link``) but packets don't flow (verified
+        via ``tcpdump`` — zero packets on the bridge interface). The container
+        looks healthy (``Status=running``) but no outbound traffic works,
+        including sb_server's browser requests. The agent sees this as
+        "browser unavailable due to sandbox issues" — a confusing error that
+        blames the sandbox when the real cause is a docker networking race.
+
+        Returns ``False`` ONLY on a definitive "broken" signal: the gateway
+        TCP probe TIMED OUT (exit 124 from ``timeout(1)``). Every other
+        outcome — connected (exit 0), refused (exit 1, network works but
+        nothing listens on :53), or check-unavailable (mock container without
+        ``exec_run``, NotFound, exception) — returns ``True`` so we never
+        churn a healthy container on a check glitch. The contract: act only
+        on positive evidence of breakage.
+        """
+        try:
+            c = self.client.containers.get(name)
+        except NotFound:
+            return True  # vanished — create() will make a new one
+        nets = (c.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
+        gateway = next(
+            (cfg.get("Gateway") for cfg in nets.values() if cfg.get("Gateway")),
+            None,
+        )
+        if not gateway:
+            return True  # no gateway → can't probe → assume healthy
+        try:
+            # bash /dev/tcp is a builtin — no dependency on ping/curl being
+            # installed in the image. Port 53 (DNS) is open on any routable
+            # gateway; connection refused (exit 1) still proves the TCP SYN
+            # reached the gateway and got a RST back, which is what we're
+            # testing. timeout(1) exit 124 = SYN went into the void.
+            result = c.exec_run(
+                ["bash", "-c",
+                 f"timeout 3 bash -c 'echo > /dev/tcp/{gateway}/53' >/dev/null 2>&1"],
+                tty=False,
+            )
+        except Exception:
+            # exec unsupported (test stub), daemon unreachable, etc. — don't
+            # claim breakage we can't prove.
+            return True
+        return (result.exit_code or 0) != 124
+
+    def _force_remove_unhealthy(self, name: str) -> None:
+        """Force-remove a container that failed the network probe.
+
+        Uses the hardened ``_safe_remove`` (tolerant of a concurrent 409
+        removal race) — same path as ``reset()``. Skips the save-on-destroy
+        step: a broken-network container has nothing worth preserving (the
+        workspace is a bind-mount and survives independently). Never raises:
+        if removal fails, ``create()`` will still run (it has its own
+        stale-removal path) and the worst case is a leaked stopped container.
+        """
+        try:
+            c = self.client.containers.get(name)
+        except NotFound:
+            return  # already gone — nothing to remove
+        try:
+            self._safe_remove(c, name=name)
+        except Exception as exc:
+            log.warning(
+                "force-remove of unhealthy %s failed (non-fatal — create() "
+                "has its own stale-removal fallback): %s", name, exc,
+            )
 
     def _validate_reused_container(self, name: str) -> None:
         """Reject a reused container whose security posture doesn't match the

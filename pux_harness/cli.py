@@ -605,6 +605,63 @@ def cmd_capabilities_list(org: str | None, kind: str | None) -> None:
             print(f"      {r.ref}")
 
 
+def cmd_prompt_show(
+    org: str, scope: str, raw: bool, project_root: str | None,
+    with_ask_user: bool = False, with_interpreter: bool = False,
+) -> None:
+    """Render the assembled system prompt for ``org`` with provenance.
+
+    ``--scope supervisor`` (default) shows the CTO prompt (4 parts + any extras).
+    ``--scope subagent:<slug>`` shows one subagent's prompt (3 parts + any extras).
+    ``--raw`` prints just the assembled text (no part labels).
+    ``--with-ask-user`` / ``--with-interpreter`` simulate the runtime-on state
+    for the two conditional parts (preview what they'd emit over a real transport).
+
+    Docker-free: walks the same part registries (``SUPERVISOR_PROMPT_PARTS`` /
+    ``SUBAGENT_PROMPT_PARTS``) that ``assemble_prompt`` uses at runtime, but
+    statically. See ``docs/prompt-system.md``.
+    """
+    from pathlib import Path
+
+    from pux_harness.agent.orgs import _orgs_dir
+    from pux_harness.agent.prompt_show import show_subagent, show_supervisor
+
+    root = Path(project_root) if project_root else _orgs_dir().parent
+    try:
+        if scope.startswith("subagent:"):
+            slug = scope.split(":", 1)[1]
+            print(show_subagent(org, slug, root, raw=raw))
+        else:
+            print(show_supervisor(
+                org, root, raw=raw,
+                ask_user=with_ask_user, interpreter=with_interpreter,
+            ))
+    except FileNotFoundError as exc:
+        import sys
+
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_org_chain(org: str, project_root: str | None) -> None:
+    """Print the inheritance chain for ``org``: the extends-chain (root→child),
+    which files each org in the chain contributes, and the per-file merge rule
+    that applies. Read-only introspection — no behavior change."""
+    from pathlib import Path
+
+    from pux_harness.agent.orgs import _orgs_dir
+    from pux_harness.agent.org_chain import render_org_chain
+
+    root = Path(project_root) if project_root else _orgs_dir().parent
+    try:
+        print(render_org_chain(org, root))
+    except FileNotFoundError as exc:
+        import sys
+
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 # --- Unified CLI dispatcher ---------------------------------------------------
 
 
@@ -643,7 +700,7 @@ def main() -> None:
     p_tui.add_argument("--org", default=os.environ.get("PUX_ORG", "general"))
     p_tui.add_argument("--list-orgs", action="store_true", help="list available orgs and exit")
     p_tui.add_argument("--model", default=None,
-                       help="dcode model (provider:model), e.g. opencode-go-openai:kimi-k2.7-code")
+                       help="dcode model (provider:model), e.g. pux-openai:kimi-k2.7-code")
     p_tui.add_argument("-y", "--auto-approve", action="store_true",
                        help="auto-approve tool calls (interactive); always on when task given")
     p_tui.add_argument("-S", "--shell-allow", default=None,
@@ -654,7 +711,14 @@ def main() -> None:
     # In-process runner
     p_dir = sub.add_parser("direct", help="in-process deepagents runner (no server)")
     p_dir.add_argument("--org", default="general")
-    p_dir.add_argument("--task", required=True)
+    p_dir.add_argument("--task", required=True,
+                       help="the objective ONLY — never embed data paths here; "
+                            "use --data for the data folder")
+    p_dir.add_argument("--data", default=None, metavar="DIR",
+                       help="data folder for the org to process. Sets DATA_DIR "
+                            "(absolute) in the agent's environment so the org's "
+                            "pipeline can preprocess it — the path never enters "
+                            "the task/prompt. This is the structural input hand-off.")
     p_dir.add_argument("--rubric", default=None)
     p_dir.add_argument("--recursion-limit", type=int, default=60)
     p_dir.add_argument("--thread", default=None,
@@ -770,6 +834,46 @@ def main() -> None:
         choices=["tool", "skill", "mcp", "middleware", "job"],
         help="filter to one capability surface")
 
+    # Prompt introspection (D8) — render the assembled system prompt with
+    # provenance. Docker-free: walks the same part registries the runtime uses.
+    p_prompt = sub.add_parser(
+        "prompt", help="inspect the assembled system prompt")
+    prompt_sub = p_prompt.add_subparsers(dest="prompt_cmd", required=True)
+    p_ps = prompt_sub.add_parser(
+        "show",
+        help="render the assembled prompt with part-by-part provenance")
+    p_ps.add_argument("--org", required=True, help="the org to render")
+    p_ps.add_argument(
+        "--scope", default="supervisor",
+        help="'supervisor' (default) or 'subagent:<slug>' for one subagent")
+    p_ps.add_argument(
+        "--raw", action="store_true",
+        help="print just the assembled text (no part labels)")
+    p_ps.add_argument(
+        "--project-root", default=None,
+        help="repo root containing orgs/ (default: auto-detected)")
+    p_ps.add_argument(
+        "--with-ask-user", action="store_true",
+        help="simulate ask_user ACTIVE (preview the HITL suffix that would "
+             "emit over a turn-based transport: direct/tui/acp/agui)")
+    p_ps.add_argument(
+        "--with-interpreter", action="store_true",
+        help="simulate dynamic_dispatch ACTIVE (preview the eval-tool suffix "
+             "that would emit when CodeInterpreterMiddleware is mounted)")
+
+    # Org inheritance introspection — the extends-chain, per-file merge rules,
+    # and which files each org in the chain contributes. Read-only.
+    p_org = sub.add_parser(
+        "org", help="inspect org inheritance and structure")
+    org_sub = p_org.add_subparsers(dest="org_cmd", required=True)
+    p_oc = org_sub.add_parser(
+        "chain",
+        help="print the extends-chain + per-file merge rules for an org")
+    p_oc.add_argument("--org", required=True, help="the org to inspect")
+    p_oc.add_argument(
+        "--project-root", default=None,
+        help="repo root containing orgs/ (default: auto-detected)")
+
     # Pack — manifest-driven default-deny portable archive (successor to the
     # deprecated `export`). ``pux pack`` is the validated path; the legacy
     # ``pux export`` verb HARD-ERRORS (Decision 5: no silent alias).
@@ -884,6 +988,21 @@ def main() -> None:
     elif args.cmd == "direct":
         from pux_harness.main import run_direct
 
+        # --data: the structural data-folder hand-off. Sets DATA_DIR (absolute)
+        # in the process environment so the org's pipeline reads it via
+        # ``$DATA_DIR`` — the path NEVER enters the task/prompt string.
+        # This is how Pux keeps the objective clean: --task is the mission,
+        # --data is the input. They are separate concerns.
+        data_dir = getattr(args, "data", None)
+        if data_dir:
+            # Relative to project root so it resolves in both host (CWD=repo)
+            # and container (CWD=/sandbox/workspace) contexts.
+            abs_path = os.path.abspath(data_dir)
+            try:
+                os.environ["DATA_DIR"] = os.path.relpath(abs_path, os.getcwd())
+            except ValueError:
+                os.environ["DATA_DIR"] = abs_path
+
         run_direct(args.org, args.task, args.rubric, args.recursion_limit, args.thread)
 
     # --- Sandbox ---
@@ -945,6 +1064,20 @@ def main() -> None:
     elif args.cmd == "capabilities":
         if args.caps_cmd == "list":
             cmd_capabilities_list(args.org, args.kind)
+
+    # --- Prompt introspection (D8) ---
+    elif args.cmd == "prompt":
+        if args.prompt_cmd == "show":
+            cmd_prompt_show(
+                args.org, args.scope, args.raw, args.project_root,
+                getattr(args, "with_ask_user", False),
+                getattr(args, "with_interpreter", False),
+            )
+
+    # --- Org inheritance introspection ---
+    elif args.cmd == "org":
+        if args.org_cmd == "chain":
+            cmd_org_chain(args.org, args.project_root)
 
     # --- Pack (manifest-driven default-deny archive; successor to `export`) ---
     elif args.cmd == "pack":

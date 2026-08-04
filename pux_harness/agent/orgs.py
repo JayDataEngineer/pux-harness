@@ -34,6 +34,7 @@ from pux_harness.agent.model import get_model
 from pux_harness.agent.prompt_parts import (
     SUBAGENT_PROMPT_PARTS,
     PromptCtx,
+    PromptPartSpec,
     PromptScope,
     assemble_prompt,
 )
@@ -159,6 +160,83 @@ def build_system_prompt(org: str) -> str:
     ``build_system_prompt`` (cycle-aware; falls back to ``[org]`` on a broken
     chain) — ONE entrypoint shared by harness + standalone consumers."""
     return _aloaders.build_system_prompt(org, project_root=_orgs_dir().parent)
+
+
+def harness_addendum_text() -> str:
+    """The supervisor addendum from ``orgs/_shared/harness_addendum.md`` (body +
+    leading ``"\\n"`` seam, ready for ``ctx.harness_addendum``). CWD-relative
+    like ``build_system_prompt``. Falls back to the embedded ``_ADDENDUM``
+    constant when the file is absent (minimal fixtures / packed archives). This
+    is the runtime-path reader; the introspection view (``prompt_show``) calls
+    ``load_harness_addendum`` directly with an explicit ``project_root``."""
+    from pux_harness.agent.prompt_parts import load_harness_addendum
+
+    return load_harness_addendum(_orgs_dir().parent)
+
+
+def ask_user_suffix_text() -> str:
+    """The ask-user turn-ending suffix from ``orgs/_shared/ask_user_suffix.md``
+    (ready for ``ctx.ask_user_text``). CWD-relative like
+    ``build_system_prompt``. Falls back to the embedded
+    ``ASK_USER_PROMPT_SUFFIX`` constant when the file is absent. This is the
+    runtime-path reader; the introspection view calls
+    ``load_ask_user_suffix`` directly with an explicit ``project_root``."""
+    from pux_harness.agent.prompt_parts import load_ask_user_suffix
+
+    return load_ask_user_suffix(_orgs_dir().parent)
+
+
+def dynamic_dispatch_suffix_text() -> str:
+    """The eval-tool dispatch strategy from
+    ``orgs/_shared/dynamic_dispatch_suffix.md`` (ready for
+    ``ctx.dynamic_dispatch_text``). CWD-relative like
+    ``build_system_prompt``. Falls back to the embedded
+    ``_DYNAMIC_DISPATCH_SUFFIX`` constant when the file is absent. This is the
+    runtime-path reader; the introspection view calls
+    ``load_dynamic_dispatch_suffix`` directly with an explicit
+    ``project_root``."""
+    from pux_harness.agent.prompt_parts import load_dynamic_dispatch_suffix
+
+    return load_dynamic_dispatch_suffix(_orgs_dir().parent)
+
+
+def _load_extra_parts_for_scope(
+    org: str, scope: "PromptScope", project_root: "Path | None" = None,
+) -> tuple["PromptPartSpec", ...]:
+    """Read ``extra_prompt_parts:`` from the extends-chain and build always-on
+    ``PromptPartSpec`` instances filtered to ``scope``. Walks the chain
+    root→child; the CHILD-MOST org that declares ``extra_prompt_parts`` wins
+    (lists are delta-wins in the deep-merge). File paths resolve relative to the
+    DECLARING org's directory (so a parent's extras inherit with their own
+    relative paths intact). Returns ``()`` when no org in the chain declares
+    extras (the common case — opt-in). ``project_root`` defaults to the
+    CWD-resolved orgs tree (runtime path); the introspection view passes it
+    explicitly."""
+    import yaml
+
+    from pux_harness.kit._paths import search_org_dir
+    from pux_harness.kit.loaders import _resolved_org_chain
+    from pux_harness.agent.prompt_parts import build_extra_parts
+
+    if project_root is None:
+        project_root = _orgs_dir().parent
+    entries = None
+    declaring_dir = None
+    for ancestor in _resolved_org_chain(org, project_root):  # root→child
+        try:
+            org_dir = search_org_dir(ancestor, project_root)
+        except FileNotFoundError:
+            continue
+        profile_path = org_dir / "profile.yaml"
+        if not profile_path.is_file():
+            continue
+        data = yaml.safe_load(profile_path.read_text())
+        if data and data.get("extra_prompt_parts"):
+            entries = data["extra_prompt_parts"]
+            declaring_dir = org_dir
+    if not entries or declaring_dir is None:
+        return ()
+    return build_extra_parts(entries, org, declaring_dir, scope)
 
 
 def _resolve_tools(raw: Any, tool_map: dict[str, BaseTool]) -> list[BaseTool]:
@@ -584,7 +662,7 @@ def load_subagents(
     subagent_middleware: list[AgentMiddleware],
     retrieval_tools: list[BaseTool],
     mcp_tools: Sequence[BaseTool] = (),
-    build_subagent_middleware: Callable[[list[str]], list[AgentMiddleware]] | None = None,
+    build_subagent_middleware: Callable[..., list[AgentMiddleware]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build deepagents SubAgent dicts for ``org``'s specialists.
 
@@ -683,7 +761,13 @@ def load_subagents(
                     f"build_subagent_middleware=...)."
                 )
             mw_names = [extra_mw] if isinstance(extra_mw, str) else list(extra_mw)
-            sub["middleware"] = build_subagent_middleware(mw_names)
+            # Thread the agent's per-agent ``rubric:`` frontmatter field (if any)
+            # so the middleware builder can prepend a ``_RubricOverride`` that
+            # injects the agent's OWN rubric into state before RubricMiddleware.
+            agent_rubric = spec.get("rubric")
+            sub["middleware"] = build_subagent_middleware(
+                mw_names, rubric_text=agent_rubric,
+            )
         # Per-agent overrides from the spec's OWN frontmatter.
         agent_cfg = _agent_profile_from_spec(spec)
         # Subagent prompt = its OWN body + the org-wide suffix + its own
@@ -699,7 +783,7 @@ def load_subagents(
                 f"Use `system_prompt_suffix` (append) instead."
             )
         sub["system_prompt"] = assemble_prompt(
-            SUBAGENT_PROMPT_PARTS,
+            (*SUBAGENT_PROMPT_PARTS, *_load_extra_parts_for_scope(org, PromptScope.SUBAGENT)),
             PromptCtx(
                 agent_body=spec["system_prompt"],
                 system_prompt_suffix=(

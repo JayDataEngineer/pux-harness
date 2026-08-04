@@ -1,7 +1,14 @@
-"""pux_sandbox_browser_* — in-sandbox SeleniumBase Chrome via sb_server.py."""
+"""pux_sandbox_browser_* — in-sandbox SeleniumBase Chrome via sb_server.py.
+
+Each pux process gets its OWN ephemeral sb_server + Chrome inside the
+container — no sharing between concurrent orgs or subagents. The default
+sb_server (port 9876) remains for warmup/status; all browser TOOL calls
+route to the process's ephemeral instance on a unique port pair.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -16,8 +23,70 @@ from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result, _NoArgs
 
 
-_SB_SERVER_ADDR = "http://127.0.0.1:9876"
+# --- ephemeral per-process browser isolation --------------------------------
+# Each pux process (one per org via `pux acp --org X`) gets its own
+# sb_server + Chrome on a unique port pair. Deterministic from PID so
+# restarts of the same process reuse the same ports (stale detection
+# cleans up dead instances). Range: 50 concurrent browser processes.
+_EPHEMERAL_HTTP_BASE = 9900
+_EPHEMERAL_CDP_BASE = 9300
+_EPHEMERAL_RANGE = 50
+_process_http_port: int | None = None  # cached for this process lifetime
+
+# --- RELIABILITY FALLBACK ---------------------------------------------------
+# The supervisord-managed default sb_server on port 9876 is ALWAYS running
+# (started at container boot by supervisord — see sandbox/supervisord.conf).
+# It is the NEVER-FAIL fallback when the per-process ephemeral spawn breaks.
+# The ephemeral path can fail because: Chromium download glitch, Chrome cold-
+# start timeout, port-kill race, /tmp pressure, sb_server Python error, etc.
+# When that happens we fall back to 9876 — losing per-process isolation and
+# stealth (shared default Chrome profile) but GUARANTEEING a working browser.
+# The contract: the browser tool returns a working browser, always. Period.
+_SUPERVISORD_SB_PORT = 9876
+
+
+def _supervisord_browser_ready(exec_client: DockerExecClient) -> bool:
+    """Is the supervisord-managed default sb_server up AND Chrome alive?
+
+    Checks BOTH ``ok`` (sb_server process) AND ``alive`` (Chrome attached) in
+    the /status response — a server with a dead Chrome is NOT a fallback
+    candidate. If the server is up but Chrome cold, hit /warmup once and
+    re-check (Chrome cold-start is ~10s, bounded by the server's own
+    /warmup handler)."""
+    out, _ = exec_client.exec(
+        f"curl -sS --max-time 3 http://127.0.0.1:{_SUPERVISORD_SB_PORT}/status "
+        f"2>/dev/null || true"
+    )
+    if '"alive": true' not in out and '"alive":true' not in out:
+        # Chrome not yet alive — try to warm it up (supervisord sb_server
+        # lazily inits Chrome on first request). One shot; if warmup fails
+        # the fallback isn't usable.
+        if '"ok": true' not in out and '"ok":true' not in out:
+            return False  # sb_server itself is down — no fallback possible
+        exec_client.exec(
+            f"curl -sS --max-time 20 http://127.0.0.1:{_SUPERVISORD_SB_PORT}/warmup "
+            f">/dev/null 2>&1 || true"
+        )
+        out, _ = exec_client.exec(
+            f"curl -sS --max-time 3 http://127.0.0.1:{_SUPERVISORD_SB_PORT}/status "
+            f"2>/dev/null || true"
+        )
+    return '"alive": true' in out or '"alive":true' in out
+
 _BROWSER_TIMEOUT = 60
+
+# Browser spawn deadline: each call waits up to this many seconds for the
+# ephemeral sb_server + Chrome cold start before returning a TRANSIENT error
+# for THAT call. Every browser tool call attempts spawn fresh — no sticky
+# circuit breaker, no permanent "browser dead" state. If spawn fails, the
+# agent gets a transient error and can retry; the underlying cause (broken
+# container, dead Chrome, sb_server crash) is also being self-healed at the
+# SandboxContainer.ensure() layer (network probe + auto-recreate). The
+# previous sticky circuit breaker was a reliability defect: once tripped it
+# instructed the agent to TELL THE USER "browser is down" and give up — the
+# exact opposite of reliable. Removed.
+_BROWSER_SPAWN_TIMEOUT = int(os.environ.get("PUX_BROWSER_SPAWN_TIMEOUT", "20"))
+_warmup_started = False  # guards the background warmup so it fires once
 
 # Human-like pacing: random delay before each browser tool call so the
 # action cadence looks natural to antibot services. 250-700ms mimics
@@ -33,17 +102,240 @@ def _pace():
         time.sleep(delay)
 
 
+def _alloc_port_pair() -> tuple[int, int]:
+    """Deterministic (http_port, cdp_port) pair based on PID."""
+    h = int(hashlib.md5(str(os.getpid()).encode()).hexdigest(), 16)
+    offset = h % _EPHEMERAL_RANGE
+    return _EPHEMERAL_HTTP_BASE + offset, _EPHEMERAL_CDP_BASE + offset
+
+
+def _is_server_alive(exec_client: DockerExecClient, http_port: int) -> bool:
+    out, _ = exec_client.exec(
+        f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 "
+        f"http://127.0.0.1:{http_port}/status 2>/dev/null || true"
+    )
+    return out.strip() == "200"
+
+
+# Shell fragment (no fuser — busybox skips it; ss is always present). Walks
+# the process tree by ppid so Chrome's setsid helpers are reaped too. The
+# recursion via ``_kt`` is bounded by Chrome's actual tree depth (~3-4 levels).
+_KILL_STALE_TEMPLATE = (
+    "_kt() { "
+    "  for c in $(ps -eo pid,ppid --noheaders | "
+    "             awk -v P=$1 '$2==P{print $1}'); do "
+    "    _kt $c; "
+    "  done; "
+    "  kill -9 $1 2>/dev/null; "
+    "}; "
+    "for port in %d %d; do "
+    "  pid=$(ss -tlnp 2>/dev/null | grep \":$port \" | "
+    "        grep -oP 'pid=\\K\\d+' | head -1); "
+    "  [ -n \"$pid\" ] && _kt $pid; "
+    "done; sleep 0.5 || true"
+)
+
+
+def _spawn_one_attempt(exec_client: DockerExecClient, http_port: int, cdp_port: int) -> bool:
+    """One spawn attempt: kill stale, launch sb_server, poll for ready.
+
+    Returns True on ready, False on timeout. Single-attempt; the caller
+    decides whether to retry. Split out from ``_ensure_ephemeral_server`` so
+    the retry loop is explicit and testable."""
+    # Kill stale processes on our ports AND all their descendants.
+    #
+    # Two non-obvious facts drove this shape:
+    #
+    #   1. The container's busybox does NOT ship ``fuser`` — earlier code
+    #      that called ``fuser -k`` silently no-op'd (stderr was discarded).
+    #      Every kill was a lie. Orphaned Chrome helpers piled up across
+    #      spawns and tripped the container's PID cgroup limit ("Resource
+    #      temporarily unavailable"), killing the sandbox mid-task. We use
+    #      ``ss`` (always present in the image) to find the listener PID.
+    #
+    #   2. Chrome calls ``setsid()`` on some helper subprocesses, detaching
+    #      them from the spawner's process group. ``kill -9 -PGID`` therefore
+    #      misses them. Only a recursive descendant walk by PPID reaches
+    #      every Chrome helper (renderer, GPU process, zygote, crashpad).
+    exec_client.exec(_KILL_STALE_TEMPLATE % (http_port, cdp_port))
+
+    # Spawn ephemeral sb_server: own Chrome, own CDP port, own profile dir.
+    # The --cdp-port flag makes sb_server NOT kill other instances' Chrome.
+    display = os.environ.get("DISPLAY", ":99")
+    cmd = (
+        f"DISPLAY={display} SB_SERVER_PORT={http_port} "
+        f"SB_CDP_PORT={cdp_port} "
+        f"python3 /usr/local/bin/sb_server.py --stealth --use-chromium "
+        f"> /tmp/sb_ephemeral_{http_port}.log 2>&1 &"
+    )
+    exec_client.exec(cmd)
+
+    # Wait for Chrome cold start + sb_server ready (capped at _BROWSER_SPAWN_TIMEOUT)
+    deadline = time.monotonic() + _BROWSER_SPAWN_TIMEOUT
+    while time.monotonic() < deadline:
+        if _is_server_alive(exec_client, http_port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# Number of full spawn attempts per _ensure_ephemeral_server call. Each attempt
+# is bounded by _BROWSER_SPAWN_TIMEOUT; on failure the next attempt kills stale
+# processes (including a half-spawned Chrome from the prior attempt) and tries
+# fresh. Reliable-by-default: the browser MUST come up. Only after this many
+# genuine attempts do we surface a transient error to the agent.
+_BROWSER_SPAWN_ATTEMPTS = int(os.environ.get("PUX_BROWSER_SPAWN_ATTEMPTS", "3"))
+
+
+def _ensure_ephemeral_server(exec_client: DockerExecClient) -> int:
+    """Ensure THIS PROCESS has its own ephemeral sb_server running. Returns HTTP port.
+
+    On first browser tool call in the process:
+      1. Allocates a unique port pair (http + cdp) from PID
+      2. Spawns a fresh sb_server with its own Chrome (--cdp-port, unique profile)
+      3. Waits for /status to answer (Chrome cold start ~10-15s)
+      4. Restores saved session cookies if a session file exists
+
+    RELIABILITY CONTRACT: this function tries ``_BROWSER_SPAWN_ATTEMPTS`` times
+    before surfacing a transient error. Each attempt is a full kill-stale +
+    spawn + wait-for-ready cycle — a half-dead Chrome from one attempt gets
+    cleaned up by the next. The agent should essentially never see a spawn
+    failure; when it does, the error says "transient — retry" and the next
+    tool call will spawn fresh again (no sticky dead state).
+
+    The underlying sandbox is also self-healed at SandboxContainer.ensure()
+    (network probe + auto-recreate on container-level breakage)."""
+    global _process_http_port
+
+    if _process_http_port is not None:
+        if _is_server_alive(exec_client, _process_http_port):
+            return _process_http_port
+        # Dead — fall through to respawn
+
+    http_port, cdp_port = _alloc_port_pair()
+
+    last_log = ""
+    for attempt in range(_BROWSER_SPAWN_ATTEMPTS):
+        if _spawn_one_attempt(exec_client, http_port, cdp_port):
+            _process_http_port = http_port
+            # Restore saved cookies so the ephemeral browser has the org's session
+            _restore_session_cookies(exec_client, http_port)
+            return http_port
+        # Capture log for the final error; keep latest.
+        log_out, _ = exec_client.exec(
+            f"tail -5 /tmp/sb_ephemeral_{http_port}.log 2>/dev/null || true"
+        )
+        last_log = _tail(log_out, 200)
+
+    # All ephemeral attempts failed — FALL BACK to the supervisord-managed
+    # default sb_server (port 9876). It's always running at container boot,
+    # so if it's up + Chrome alive, we use it. Loses per-process isolation
+    # + stealth but delivers the RELIABILITY CONTRACT: browser tool always
+    # returns a working browser. The fallback path is logged so operators
+    # can see ephemeral is broken (and fix the root cause) without the agent
+    # ever seeing a failure.
+    if _supervisord_browser_ready(exec_client):
+        # Use stderr-style logging via the exec client (module-level `log`
+        # isn't imported here; the tail of the ephemeral log already shows
+        # the failure for diagnosis).
+        exec_client.exec(
+            f"echo '[pux browser] ephemeral spawn failed ({_BROWSER_SPAWN_ATTEMPTS} "
+            f"attempts); falling back to supervisord sb_server on port "
+            f"{_SUPERVISORD_SB_PORT}' >> /tmp/pux_browser_fallback.log 2>&1 || true"
+        )
+        _process_http_port = _SUPERVISORD_SB_PORT
+        return _SUPERVISORD_SB_PORT
+
+    # Truly catastrophic: ephemeral spawn failed AND the supervisord
+    # fallback isn't usable. This should essentially never happen — the
+    # supervisord sb_server is started at container boot and re-spawns on
+    # crash. If we get here, the container itself is broken; the next
+    # SandboxContainer.ensure() call will detect it (network probe) and
+    # recreate. Return a transient error so the agent retries.
+    raise RuntimeError(
+        f"ALL browser spawn paths failed: ephemeral ({_BROWSER_SPAWN_ATTEMPTS} "
+        f"attempts × {_BROWSER_SPAWN_TIMEOUT}s) AND supervisord fallback "
+        f"(port {_SUPERVISORD_SB_PORT} not ready). Transient — the container "
+        f"will be recreated on the next ensure() call. Retry the browser tool. "
+        f"Last ephemeral log: {last_log}"
+    )
+
+
+def warmup_ephemeral_browser(exec_client: DockerExecClient) -> None:
+    """Kick off the ephemeral browser spawn in a BACKGROUND thread.
+
+    Called at graph-build time (before the agent loop starts) so Chrome is
+    already warming while the CTO boots + thinks. By the time the CTO
+    dispatches to web-agent, Chrome should be ready — the first
+    ``browser_navigate`` call hits a warm server (instant) instead of
+    cold-starting (15-20s inside the LLM turn budget).
+
+    Fire-and-forget: the result populates ``_process_http_port``. If the
+    sandbox is down, the background thread fails silently — the first real
+    tool call will discover the failure via the normal path (and retry, since
+    there's no longer a sticky circuit breaker). No exception escapes to the
+    caller.
+    """
+    global _warmup_started
+    if _warmup_started:
+        return
+    _warmup_started = True
+
+    import threading
+
+    def _warm():
+        try:
+            _ensure_ephemeral_server(exec_client)
+        except Exception:  # noqa: BLE001 — background warmup must never crash the agent
+            pass
+
+    t = threading.Thread(target=_warm, daemon=True, name="browser-warmup")
+    t.start()
+
+
+def _restore_session_cookies(exec_client: DockerExecClient, http_port: int) -> None:
+    """Restore saved session cookies to the ephemeral browser if a file exists.
+
+    Ephemeral browsers start with a fresh profile — no cookies. If the org
+    has a saved session (e.g. from brave_cookie_bridge for twitter-agent),
+    restore it so the browser is immediately authenticated."""
+    for session_file in (
+        "/sandbox/workspace/data/.twitter-session.json",
+        "/sandbox/workspace/data/.browser-session.json",
+    ):
+        out, _ = exec_client.exec(f"test -f {session_file} && echo exists || echo missing")
+        if "exists" in out:
+            exec_client.exec(
+                f"curl -s -X POST http://127.0.0.1:{http_port}/restore_session "
+                f"-H 'Content-Type: application/json' "
+                f"-d '{{\"path\":\"{session_file}\"}}' --max-time 10 2>/dev/null || true"
+            )
+            break  # one session file per browser
+
+
 def _sb_post(exec_client: DockerExecClient, endpoint: str, body_obj: dict | None,
              *, timeout: int = _BROWSER_TIMEOUT) -> str:
-    """POST ``body_obj`` to the in-sandbox sb_server.py endpoint, return the
-    parsed JSON re-serialized via ``_result``."""
+    """POST ``body_obj`` to THIS PROCESS's ephemeral sb_server endpoint, return the
+    parsed JSON re-serialized via ``_result``.
+
+    Every call attempts spawn fresh — no circuit breaker, no sticky "dead"
+    state. If spawn fails for this call, the agent gets a transient error it
+    can retry. The underlying sandbox is self-healed at the container layer."""
     _pace()
+    # Ensure we have our own isolated browser instance
+    try:
+        http_port = _ensure_ephemeral_server(exec_client)
+    except Exception as exc:
+        # Transient spawn failure for THIS call only — agent can retry.
+        return _result({"success": False, "reason": "browser_spawn_failed",
+                        "error": f"ephemeral browser: {exc}"})
+    addr = f"http://127.0.0.1:{http_port}"
     max_time = max(1, timeout)
     parts = [
         "curl -s -S",
         f"--max-time {max_time}",
         "-X POST",
-        f"{_SB_SERVER_ADDR}{endpoint}",
+        f"{addr}{endpoint}",
         "-H 'Content-Type: application/json'",
     ]
     body = ""
@@ -75,11 +367,7 @@ def _sb_post(exec_client: DockerExecClient, endpoint: str, body_obj: dict | None
 # --- navigate ---------------------------------------------------------------
 
 _BROWSER_NAVIGATE_DESC = (
-    "Open a URL in the sandbox's persistent Chrome. Returns page title, URL, "
-    "text snippet, and a base64 screenshot with Set-of-Marks labels on "
-    "interactive elements. The session persists — subsequent browser_click / "
-    "browser_type / browser_screenshot calls operate on this page until you "
-    "navigate again."
+    "Open a URL in the persistent Chrome. Returns page state + labeled screenshot."
 )
 
 
@@ -102,19 +390,14 @@ def _browser_navigate_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- click ------------------------------------------------------------------
 
 _BROWSER_CLICK_DESC = (
-    "Click an element on the current page. Pass either a SoM label (integer "
-    "from the labeled screenshot) or a CSS selector string. Returns the "
-    "post-click page state (URL, title, screenshot). For anti-bot sites "
-    "(Cloudflare Turnstile, behavioral fingerprinting) that ignore normal "
-    "clicks, set trusted=true to drive the real OS cursor via CDP "
-    "(isTrusted=true) — only when a normal click silently no-ops."
+    "Click an element by SoM label or CSS selector. trusted=true for anti-bot sites that ignore synthetic clicks."
 )
 
 
 class _BrowserClickArgs(BaseModel):
     index: int | None = Field(None, description="SoM label (numbered box on interactive elements from the last screenshot)")
     selector: str | None = Field(None, description="CSS selector (e.g. 'button#submit'). Used when index is omitted.")
-    trusted: bool = Field(False, description="Trusted input: drive the real cursor via CDP Input (isTrusted=true) so anti-bot defenses register a genuine click. Default false (Selenium click). Use only when a normal click silently no-ops on a protected site.")
+    trusted: bool = Field(False, description="Drive the real cursor via CDP (isTrusted=true). Use when a normal click silently no-ops on anti-bot sites.")
 
 
 def _browser_click_tool(exec_client: DockerExecClient) -> StructuredTool:
@@ -138,11 +421,7 @@ def _browser_click_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- type -------------------------------------------------------------------
 
 _BROWSER_TYPE_DESC = (
-    "Type text into a form field on the current page. Uses CDP character-by-"
-    "character input (React-safe — fires real DOM events). Pass either a SoM "
-    "label or CSS selector to identify the target input. For anti-bot sites "
-    "with keystroke-fingerprinting, set trusted=true to type via CDP "
-    "Input.insertText (isTrusted input events)."
+    "Type text into a form field by SoM label or selector. trusted=true for keystroke-fingerprinting defenses."
 )
 
 
@@ -150,7 +429,7 @@ class _BrowserTypeArgs(BaseModel):
     text: str = Field(..., description="Text to type into the field")
     index: int | None = Field(None, description="SoM label of the target input")
     selector: str | None = Field(None, description="CSS selector of the target input")
-    trusted: bool = Field(False, description="Trusted input: type via CDP Input.insertText (isTrusted input events) instead of the native value-setter. Default false. Use for keystroke-fingerprinting anti-bot defenses.")
+    trusted: bool = Field(False, description="Type via CDP Input.insertText (isTrusted events). Use for keystroke-fingerprinting defenses.")
 
 
 def _browser_type_tool(exec_client: DockerExecClient) -> StructuredTool:
@@ -178,9 +457,7 @@ def _browser_type_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- screenshot -------------------------------------------------------------
 
 _BROWSER_SCREENSHOT_DESC = (
-    "Capture the current browser state as a labeled screenshot. Returns base64 "
-    "PNG + SoM-numbered boxes on interactive elements. Use to re-orient after "
-    "page updates, or to get fresh label numbers for clicking."
+    "Capture a fresh labeled screenshot with SoM labels on interactive elements."
 )
 
 
@@ -197,36 +474,14 @@ def _browser_screenshot_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- evaluate ---------------------------------------------------------------
 
 _BROWSER_EVALUATE_DESC = (
-    "Evaluate JavaScript on the current page, return the result. Power-tool "
-    "escape hatch when navigate/click/type/screenshot don't fit (e.g. read "
-    "window.__NEXT_DATA__, scroll to an element, fetch XHR). Runs in the page "
-    "context — same-origin policy applies.\n\n"
-    "GOTCHAS (both cost real debugging time):\n"
-    "1. OBJECT-LITERAL RETURNS NEED PARENS. `return {a: 1}` is a SYNTAX ERROR "
-    "— the JS parser treats `{` as a block statement, not an object literal. "
-    "Wrap object literals: `return ({a: 1, b: 2})`. Primitives/strings/arrays "
-    "are fine unwrapped: `return document.title`, `return [1, 2, 3]`.\n"
-    "2. PERSISTENT REPL STATE. This is a long-lived JS REPL, not a fresh "
-    "context — `let`/`var` declarations, DOM mutations, and global assignments "
-    "from one call PERSIST into the next. A variable you declared in call #1 "
-    "is still there in call #5 (re-declaring it throws `Identifier has already "
-    "been declared`). Wrap one-shot scripts in an IIFE to avoid leaking state: "
-    "`(function(){ ... })()`. Or reuse the persistence deliberately — declare a "
-    "counter once, increment it across calls."
+    "Evaluate JavaScript on the page, return the result. Escape hatch when dedicated tools don't fit."
 )
 
 
 class _BrowserEvaluateArgs(BaseModel):
     code: str = Field(
         ...,
-        description=(
-            "JavaScript to evaluate. Use `return <value>` for the result. "
-            "CRITICAL: wrap object-literal returns in parens — "
-            "`return ({a: 1})` — `return {a: 1}` is a syntax error "
-            "(parsed as a block statement). The REPL persists across calls "
-            "(variables + mutations leak); wrap one-shot scripts in an IIFE "
-            "to isolate."
-        ),
+        description="JavaScript to evaluate. Use `return <value>` for the result. CRITICAL: wrap object-literal returns in parens: `return ({a: 1})`, not `return {a: 1}` (syntax error). The REPL persists across calls.",
     )
 
 
@@ -245,11 +500,7 @@ def _browser_evaluate_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- search -----------------------------------------------------------------
 
 _BROWSER_SEARCH_DESC = (
-    "Search the web via DuckDuckGo and land on the results page. Returns the "
-    "same labeled screenshot + page state as browser_navigate (the engine builds "
-    "the DuckDuckGo URL for you). Use as the ENTRY POINT when you have a query "
-    "but no URL. After searching, read the returned screenshot, pick a result by "
-    "its SoM label, and browser_click it to open."
+    "Search via DuckDuckGo and land on the results page. Entry point when you have a query, not a URL."
 )
 
 
@@ -272,11 +523,7 @@ def _browser_search_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- scroll -----------------------------------------------------------------
 
 _BROWSER_SCROLL_DESC = (
-    "Scroll the current page to reveal more content, then return a fresh "
-    "labeled screenshot of the newly-visible region. Pass direction='down' or "
-    "'up' for a viewport-sized jump; or set amount to a pixel count (e.g. 800) "
-    "for a precise scroll. Essential on long pages — interactive elements below "
-    "the fold have NO SoM label until you scroll them into view."
+    "Scroll the page (direction or pixel amount). Elements below the fold have no SoM label until scrolled into view."
 )
 
 
@@ -298,9 +545,7 @@ def _browser_scroll_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- go_back ----------------------------------------------------------------
 
 _BROWSER_GO_BACK_DESC = (
-    "Navigate back to the previous page in history. Returns the prior page's "
-    "labeled screenshot. Use when a navigation took you somewhere unhelpful and "
-    "you want to undo it without re-searching or re-typing a URL."
+    "Navigate back to the previous page in history."
 )
 
 
@@ -317,11 +562,7 @@ def _browser_go_back_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- wait -------------------------------------------------------------------
 
 _BROWSER_WAIT_DESC = (
-    "Pause for up to 30 seconds (server clamps; default 2) for async content to "
-    "load, then return a fresh labeled screenshot. Use after navigate/click/type "
-    "when the page is still loading or a JS render is in flight — a cheap way to "
-    "let the DOM settle before re-reading. Prefer this over guessing that a "
-    "screenshot is current."
+    "Pause for async content to load (default 2s, max 30), then return a fresh screenshot."
 )
 
 
@@ -342,10 +583,7 @@ def _browser_wait_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- find_text --------------------------------------------------------------
 
 _BROWSER_FIND_TEXT_DESC = (
-    "Scroll to and highlight the first occurrence of the given text on the "
-    "current page (uses window.find). Returns a fresh labeled screenshot centered "
-    "on the match. Use to locate specific information in a long page faster than "
-    "scanning the whole screenshot."
+    "Scroll to and highlight the first occurrence of the given text on the page."
 )
 
 
@@ -368,11 +606,7 @@ def _browser_find_text_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- extract ----------------------------------------------------------------
 
 _BROWSER_EXTRACT_DESC = (
-    "Extract structured text data from the current page: title, url, headings, "
-    "paragraphs, lists, tables, and forms. The query is a free-text note of "
-    "intent (defaults to 'extract all text content'). Returns {extracted:{...}}. "
-    "Use to pull CLEAN text from an article or enumerate form fields, instead of "
-    "OCR-ing the screenshot."
+    "Extract structured text from the page (title, headings, paragraphs, lists, tables, forms). Returns {extracted:{...}}."
 )
 
 
@@ -393,10 +627,7 @@ def _browser_extract_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- extract_images ---------------------------------------------------------
 
 _BROWSER_EXTRACT_IMAGES_DESC = (
-    "List every <img> on the current page with its src + alt text. Returns "
-    "{images:[{src,alt}], url}. Use to collect image URLs for downloading (pass "
-    "a src to browser_download) or to inventory page media without parsing the "
-    "screenshot."
+    "List every <img> on the page with src + alt text. Returns {images:[{src,alt}], url}."
 )
 
 
@@ -413,11 +644,7 @@ def _browser_extract_images_tool(exec_client: DockerExecClient) -> StructuredToo
 # --- save_screenshot --------------------------------------------------------
 
 _BROWSER_SAVE_SCREENSHOT_DESC = (
-    "Save the current page as a clean PNG file at the given path (e.g. "
-    "/tmp/evidence.png). DISTINCT from browser_screenshot (which returns a "
-    "base64 SoM-labeled view for ACTING on the page): this writes an archival "
-    "image to disk for evidence, attachments, or later describe_image analysis. "
-    "Returns {screenshot_path, url}."
+    "Save the page as a clean PNG file at a path (for evidence/attachments, not for acting on). Returns {screenshot_path, url}."
 )
 
 
@@ -441,10 +668,7 @@ def _browser_save_screenshot_tool(exec_client: DockerExecClient) -> StructuredTo
 # --- download ---------------------------------------------------------------
 
 _BROWSER_DOWNLOAD_DESC = (
-    "Download a file from a direct URL to a path inside the sandbox (e.g. "
-    "/tmp/report.pdf). Both url and path are required. Returns {url, path, size}. "
-    "Use for direct file URLs (discovered via browser_extract_images or link "
-    "hrefs) — NOT for pages that require interaction to produce the file."
+    "Download a file from a direct URL to a sandbox path. Returns {url, path, size}. Not for pages that need interaction to produce the file."
 )
 
 
@@ -468,11 +692,7 @@ def _browser_download_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- upload -----------------------------------------------------------------
 
 _BROWSER_UPLOAD_DESC = (
-    "Upload a local file into an <input type='file'> on the current page. "
-    "Identify the input by CSS selector and pass a sandbox-absolute file_path "
-    "(which must already exist). Returns {uploaded, selector, file}. Use to "
-    "attach a resume/photo/document to a form whose upload UI can't be driven by "
-    "browser_type."
+    "Upload a local file into an <input type='file'> by CSS selector. Returns {uploaded, selector, file}."
 )
 
 
@@ -496,10 +716,7 @@ def _browser_upload_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- tabs -------------------------------------------------------------------
 
 _BROWSER_TABS_DESC = (
-    "List all open browser tabs with their index, url, title, and which is "
-    "active. Returns {tabs:[{index,url,title,active}]}. Use before "
-    "browser_switch_tab to find the index of the tab you want, or to confirm how "
-    "many tabs are open."
+    "List all open tabs with index, url, title, active flag. Returns {tabs:[{index,url,title,active}]}."
 )
 
 
@@ -516,9 +733,7 @@ def _browser_tabs_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- new_tab ----------------------------------------------------------------
 
 _BROWSER_NEW_TAB_DESC = (
-    "Open a new browser tab to the given URL (default about:blank) and switch to "
-    "it. Returns the new tab's labeled screenshot. Use to open a link without "
-    "losing the current page, or to compare pages side-by-side."
+    "Open a new tab to a URL and switch to it."
 )
 
 
@@ -539,9 +754,7 @@ def _browser_new_tab_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- switch_tab -------------------------------------------------------------
 
 _BROWSER_SWITCH_TAB_DESC = (
-    "Switch to the browser tab at the given 0-based index. Returns that tab's "
-    "labeled screenshot with fresh SoM labels. Use browser_tabs first to learn "
-    "the index→url mapping."
+    "Switch to the tab at the given 0-based index."
 )
 
 
@@ -562,9 +775,7 @@ def _browser_switch_tab_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- close_tab --------------------------------------------------------------
 
 _BROWSER_CLOSE_TAB_DESC = (
-    "Close the current browser tab and switch to the last remaining one (the "
-    "engine refuses to close the final tab). Returns the now-active tab's "
-    "labeled screenshot. Use to clean up after browser_new_tab."
+    "Close the current tab and switch to the last remaining one."
 )
 
 
@@ -581,10 +792,7 @@ def _browser_close_tab_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- dropdown_options -------------------------------------------------------
 
 _BROWSER_DROPDOWN_OPTIONS_DESC = (
-    "Read the options of a <select> dropdown. Identify the select element by SoM "
-    "label (index) or CSS selector. Returns {selector, options, multiple, "
-    "selected_count}. Call BEFORE browser_select_dropdown to learn the available "
-    "option values and visible text."
+    "Read the options of a <select> dropdown by SoM label or selector. Call before browser_select_dropdown."
 )
 
 
@@ -613,11 +821,7 @@ def _browser_dropdown_options_tool(exec_client: DockerExecClient) -> StructuredT
 # --- select_dropdown --------------------------------------------------------
 
 _BROWSER_SELECT_DROPDOWN_DESC = (
-    "Choose an option in a <select> dropdown. Identify the select by SoM label "
-    "(index) or CSS selector, then specify the option by its value attribute OR "
-    "its visible text (exactly one). Returns the post-selection labeled "
-    "screenshot. Use browser_dropdown_options first to discover the right value "
-    "or text."
+    "Choose an option in a <select> by value attribute or visible text (XOR). Identify the select by SoM label or selector."
 )
 
 
@@ -655,10 +859,7 @@ def _browser_select_dropdown_tool(exec_client: DockerExecClient) -> StructuredTo
 # --- save_session -----------------------------------------------------------
 
 _BROWSER_SAVE_SESSION_DESC = (
-    "Save the current browser session (cookies + localStorage) to a JSON file "
-    "(default /tmp/browser-session.json). Returns {saved, path, cookies, "
-    "storage_items}. Call AFTER logging into an auth-heavy site so a later run "
-    "can browser_restore_session without re-authenticating."
+    "Save cookies + localStorage to a JSON file. Call after login."
 )
 
 
@@ -679,10 +880,7 @@ def _browser_save_session_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- restore_session --------------------------------------------------------
 
 _BROWSER_RESTORE_SESSION_DESC = (
-    "Restore a previously-saved browser session (cookies + localStorage) from a "
-    "JSON file (default /tmp/browser-session.json). Returns {restored, path, "
-    "cookies, storage_items}. Call right after browser_navigate to the site's "
-    "domain, BEFORE other actions, to reuse saved auth."
+    "Restore a saved session (cookies + localStorage). Call after navigating to the domain, before other actions."
 )
 
 
@@ -703,17 +901,7 @@ def _browser_restore_session_tool(exec_client: DockerExecClient) -> StructuredTo
 # --- drag (SOTA drag-and-drop) ------------------------------------------------
 
 _BROWSER_DRAG_DESC = (
-    "Drag-and-drop an element on the current page — the gap this fills vs older "
-    "browser_click/type tooling. Works for sortable lists (Kanban boards, "
-    "SortableJS/react-dnd/dnd-kit), file drop-zones, sliders, and custom "
-    "draggables. Identify the SOURCE with a SoM index, CSS selector, or x/y "
-    "coords; identify the TARGET with a SoM index/selector, x/y coords, OR a "
-    "dx/dy pixel offset (offset mode is how you nudge a slider thumb). strategy: "
-    "'auto' (default) picks HTML5-event drag for genuinely draggable elements "
-    "and mouse-physics otherwise; 'html5' forces the synthetic dragstart/drop "
-    "chain (best for sortable lists); 'physics' forces mousedown→mousemove(N)"
-    "→mouseup (best for sliders/canvas). ALWAYS verify the result in the "
-    "returned screenshot — if 'auto' picked wrong, retry with the other strategy."
+    "Drag-and-drop: sortable lists, sliders, file drop-zones. Source: index/selector/coords; target: index/selector/coords or dx/dy offset. strategy auto/html5/physics."
 )
 
 
@@ -778,13 +966,7 @@ def _browser_drag_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- hover ------------------------------------------------------------------
 
 _BROWSER_HOVER_DESC = (
-    "Hover the mouse over an element on the current page (dispatches "
-    "mouseover/mousemove/mouseenter). Use to reveal dropdown menus, tooltips, "
-    "fly-out panels, and hover-cards that only appear on mouseover — often a "
-    "required precursor to clicking a menu item that has no SoM label until the "
-    "menu opens. Identify the target with a SoM index, CSS selector, or x/y "
-    "coords. Returns a fresh labeled screenshot so you can see what the hover "
-    "revealed."
+    "Hover an element (by index/selector/coords) to reveal dropdowns, tooltips, fly-out panels."
 )
 
 
@@ -821,14 +1003,7 @@ def _browser_hover_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- press (keys / hotkeys) -------------------------------------------------
 
 _BROWSER_PRESS_DESC = (
-    "Press a key or hotkey combination on the current page (dispatches "
-    "keydown/keypress/keyup with modifier flags). Examples: 'Enter', 'Escape', "
-    "'Tab', 'ArrowDown', 'Control+a', 'Shift+ArrowDown', 'Control+Enter'. Use "
-    "for non-character keys browser_type can't send — to submit/dismiss, move a "
-    "slider thumb with arrow keys, select-all, copy/paste, navigate comboboxes "
-    "and menus by keyboard, or close a modal. Optionally target a SoM "
-    "index/selector to focus it first; otherwise the currently-focused element "
-    "receives the press."
+    "Press a key or hotkey (Enter, Escape, Tab, Control+a, etc.). For non-character keys browser_type can't send."
 )
 
 
@@ -858,14 +1033,7 @@ def _browser_press_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- click_at (coords / right / double) -------------------------------------
 
 _BROWSER_CLICK_AT_DESC = (
-    "Click at exact pixel coordinates on the current page — the vision-grounded "
-    "click. Use when a target has no SoM label and no clean selector (a canvas, "
-    "a chart point, an image map, a custom-drawn button), so you must click a "
-    "screen position from the screenshot. Also covers right-click (open a "
-    "context menu: right=true) and double-click (double=true). If you pass a "
-    "SoM index/selector instead of coords, the engine resolves it to the "
-    "element's center and clicks there. Returns the post-click labeled "
-    "screenshot."
+    "Click at exact pixel coordinates — for targets with no SoM label/selector (canvas, chart points). Also right=true / double=true."
 )
 
 
@@ -877,7 +1045,7 @@ class _BrowserClickAtArgs(BaseModel):
     button: int = Field(0, description="mouse button: 0=left (default), 1=middle, 2=right")
     double: bool = Field(False, description="true → double-click")
     right: bool = Field(False, description="true → right-click (dispatches contextmenu)")
-    trusted: bool = Field(False, description="Trusted input: drive the real cursor via CDP Input (isTrusted=true). Default false. Use for anti-bot sites that ignore synthetic clicks.")
+    trusted: bool = Field(False, description="Drive the real cursor via CDP (isTrusted=true). Use for anti-bot sites.")
 
 
 def _browser_click_at_tool(exec_client: DockerExecClient) -> StructuredTool:
@@ -910,12 +1078,7 @@ def _browser_click_at_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- scroll_into_view -------------------------------------------------------
 
 _BROWSER_SCROLL_INTO_VIEW_DESC = (
-    "Scroll a specific element into the visible viewport, centered, then return "
-    "a fresh labeled screenshot. Use BEFORE clicking/typing an element that you "
-    "know exists (by index/selector) but is off-screen and so has no SoM label. "
-    "Distinct from browser_scroll (viewport jump / pixel scroll) — this targets "
-    "one element. After it returns, the element's SoM label is fresh and "
-    "clickable."
+    "Scroll a specific element (by index/selector) into the viewport, centered."
 )
 
 
@@ -944,13 +1107,7 @@ def _browser_scroll_into_view_tool(exec_client: DockerExecClient) -> StructuredT
 # --- a11y (accessibility tree) ----------------------------------------------
 
 _BROWSER_A11Y_DESC = (
-    "Read the current page as an accessibility tree: a compact list of "
-    "{role, name, selector} for every interactive element. Far cheaper to "
-    "reason over than a screenshot when the page is dense (a long form, a data "
-    "table, a settings panel) — use it alongside browser_screenshot to find the "
-    "right SoM label or selector by role/name ('button Submit', 'textbox Email') "
-    "instead of scanning the image. Returns {items:[...], total}. The selectors "
-    "are usable directly by browser_click / browser_type."
+    "Read the page as an accessibility tree: {role, name, selector} per element. Cheaper than screenshots on dense pages. Selectors are usable by click/type."
 )
 
 
@@ -967,17 +1124,7 @@ def _browser_a11y_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- iframe -----------------------------------------------------------------
 
 _BROWSER_IFRAME_DESC = (
-    "Act on elements inside <iframe>s on the current page. Many sites embed "
-    "CAPTCHAs, payment forms, rich-text editors, and widgets in iframes — their "
-    "contents are invisible to browser_click/type on the top page. "
-    "action='list' enumerates iframes (index/name/id/src). "
-    "action='click' clicks an element INSIDE a same-origin iframe: pass the "
-    "iframe as index/selector and inner_selector for the in-frame target. "
-    "action='evaluate' runs JS inside a same-origin iframe (pass code). "
-    "Cross-origin iframes are blocked by same-origin policy — the tool returns a "
-    "clear error for those (they need provider-level handling). The legacy "
-    "'enter'/'exit' frame-switch actions are RETIRED (CDP has no global frame "
-    "context like WebDriver's switch_to); use 'click'/'evaluate' instead."
+    "Act on elements inside iframes: action=list/click/evaluate. Cross-origin iframes blocked by SOP. Legacy enter/exit retired."
 )
 
 
@@ -1012,29 +1159,7 @@ def _browser_iframe_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- UC mode (Cloudflare / Turnstile / hCaptcha bypass) ---------------------
 
 _BROWSER_UC_DESC = (
-    "Bypass Cloudflare Turnstile, hCaptcha, and reCAPTCHA on pages the persistent "
-    "Chrome can't pass. Spawns a dedicated SeleniumBase SB(uc=True) Chrome and calls "
-    "uc_gui_click_captcha — a REAL pyautogui mouse click on the checkbox, the only "
-    "reliable way past cross-origin captcha iframes (CDP/JS clicks are blocked by SOP "
-    "and lack the isTrusted=true signal anti-bot scripts require).\n\n"
-    "WHEN TO USE: after browser_navigate, if the page shows 'Just a moment', 'Checking "
-    "your browser', 'Verify you are human', a Cloudflare/hCaptcha challenge, OR if "
-    "browser_solve_captcha returned captcha_solved=false. Also use pre-emptively on "
-    "sites known to cage job applications behind Turnstile (Workday, some Greenhouse).\n\n"
-    "LIFECYCLE: action=open creates a persistent UC session you can follow with "
-    "action=click / type / read / evaluate on the SAME CF-cleared page, then "
-    "action=close to tear it down. Cookies (including cf_clearance) are auto-handed "
-    "off to the persistent browser so later browser_navigate calls to the same domain "
-    "inherit the cleared state.\n\n"
-    "ACTIONS:\n"
-    "  open    {url, click_captcha=true, handoff=true} — open in UC Chrome, click any "
-    "          captcha, hand cookies to persistent browser. Returns page data + cf_cleared.\n"
-    "  click   {selector?, text?} — click in the UC session.\n"
-    "  type    {selector, text, submit=false, clear=true} — type in the UC session.\n"
-    "  read    {} — re-read the UC page (title, url, text, screenshot).\n"
-    "  evaluate {code} — run JS in the UC session.\n"
-    "  cookies {cookie_action='get'|'inject_persistent'} — cookie management.\n"
-    "  close   {} — tear down the UC session."
+    "Cloudflare/Turnstile/hCaptcha bypass via SB(uc=True) + real pyautogui click. Actions: open|click|type|read|evaluate|cookies|close. See AGENTS.md captcha ladder."
 )
 
 
@@ -1091,18 +1216,7 @@ def _browser_uc_tool(exec_client: DockerExecClient) -> StructuredTool:
 # --- accept cookies (GDPR / CCPA banner dismissal) --------------------------
 
 _BROWSER_ACCEPT_COOKIES_DESC = (
-    "Dismiss GDPR/CCPA cookie-consent banners ('We use cookies', 'Accept all', "
-    "'Manage preferences' popups). Call this IMMEDIATELY after browser_navigate lands "
-    "on a site where a cookie banner is visible — before doing anything else on the "
-    "page. Banners block the underlying UI and waste your turns if you try to SoM-click "
-    "around them.\n\n"
-    "Uses a curated selector list covering OneTrust, TrustArc, CookieBot, Quantcast, "
-    "Didomi, SourcePoint, and BBC/legacy banners, plus a text-based fallback (matches "
-    "'Accept all', 'I agree', 'Got it', etc.). More reliable than SoM-guessing: these "
-    "banners often render in containers the SoM labeler skips.\n\n"
-    "Returns cookies_accepted=true with the method/selector that worked, or "
-    "cookies_accepted=false with method='no-banner-found' (which is HONEST — banners "
-    "are geo-targeted; a US-egress browser won't see EU GDPR banners, and that's fine)."
+    "Dismiss GDPR/CCPA cookie-consent banners. Call right after navigate. Returns cookies_accepted + method. See AGENTS.md."
 )
 
 
@@ -1122,16 +1236,7 @@ def _browser_accept_cookies_tool(exec_client: DockerExecClient) -> StructuredToo
 # --- warmup history (fingerprint legitimacy) --------------------------------
 
 _BROWSER_WARMUP_HISTORY_DESC = (
-    "Build browsing-history legitimacy before a sensitive task (job applications, "
-    "account login). Visits benign high-traffic sites (Wikipedia, Hacker News, GitHub, "
-    "Stack Overflow) with realistic dwell times + scroll, so the browser's history + "
-    "cookie jar + TLS fingerprint look like a real user rather than a fresh automation "
-    "session that went straight about:blank → target-site.\n\n"
-    "WHEN TO USE: ONCE at the start of a session that will touch sensitive targets "
-    "(LinkedIn login, Workday applications, Twitter). Combats 'fresh automation' "
-    "heuristics. Don't overuse — it burns ~15-30s.\n\n"
-    "Optional: pass urls=[...] to customize the site list, dwell=N (seconds per site, "
-    "default 3.0). Returns visited count + per-site status."
+    "Build browsing-history legitimacy before sensitive targets (login, job apps). Call ONCE at session start. Optional urls=[...] and dwell=N."
 )
 
 
@@ -1183,14 +1288,7 @@ def _browser_warmup_history_tool(exec_client: DockerExecClient) -> StructuredToo
 # --- solve captcha (honest best-effort on persistent browser) ----------------
 
 _BROWSER_SOLVE_CAPTCHA_DESC = (
-    "Best-effort captcha click on the persistent Chrome via JS. HONEST: verifies "
-    "whether a challenge is still on screen after the attempt and returns "
-    "captcha_solved=false when it can't pass (cross-origin Cloudflare/hCaptcha iframes "
-    "cannot be clicked via CDP — SOP blocks access and the click lacks isTrusted).\n\n"
-    "Use this FIRST for simple in-page captchas (old-style reCAPTCHA checkboxes that "
-    "aren't in a cross-origin iframe). If it returns captcha_solved=false with a hint, "
-    "switch to browser_uc (the SB(uc=True) + uc_gui_click_captcha path) which can pass "
-    "cross-origin Turnstile/hCaptcha via real pyautogui clicks."
+    "Best-effort captcha click on persistent Chrome. Returns honest captcha_solved=false if it can't pass — then use browser_uc."
 )
 
 
@@ -1204,4 +1302,25 @@ def _browser_solve_captcha_tool(exec_client: DockerExecClient) -> StructuredTool
     return StructuredTool(
         name=PUX_PREFIX + "browser_solve_captcha", description=_BROWSER_SOLVE_CAPTCHA_DESC,
         args_schema=_BrowserSolveCaptchaArgs, func=_run,
+    )
+
+
+# --- reset (fresh Chrome — clears stale tabs/captcha state) ------------------
+
+_BROWSER_RESET_DESC = (
+    "Reset the browser: close UC session, re-init Chrome, clear tabs + cookies. "
+    "Use when the browser is stuck on a captcha/error page or has stale tabs from a previous task."
+)
+
+
+class _BrowserResetArgs(BaseModel):
+    pass
+
+
+def _browser_reset_tool(exec_client: DockerExecClient) -> StructuredTool:
+    def _run() -> str:
+        return _sb_post(exec_client, "/reset", {})
+    return StructuredTool(
+        name=PUX_PREFIX + "browser_reset", description=_BROWSER_RESET_DESC,
+        args_schema=_BrowserResetArgs, func=_run,
     )

@@ -113,6 +113,24 @@ class ThreadStore:
             return None
         return {"thread_id": r[0], "org": r[1], "metadata": r[2], "created_at": r[3]}
 
+    async def delete_thread(self, thread_id: str) -> None:
+        """Permanently delete a thread from the index AND the checkpointer.
+
+        Removes the ``pux_threads`` row plus ALL checkpoint + write rows
+        for this ``thread_id``. The conversation is gone after this — no undo.
+        Backs the ACP ``session/delete`` surface.
+        """
+        await self.db.execute(
+            "DELETE FROM pux_threads WHERE thread_id = ?", (thread_id,)
+        )
+        await self.db.execute(
+            "DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,)
+        )
+        await self.db.execute(
+            "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
+        )
+        await self.db.commit()
+
     async def merge_metadata(
         self, thread_id: str, metadata: dict[str, Any],
     ) -> bool:

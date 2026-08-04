@@ -332,6 +332,27 @@ def build_system_prompt(org: str, *, project_root: Path, addendum: str = "") -> 
     return f"{_chain_overlay(org, project_root)}{addendum}"
 
 
+def load_shared_prompt_body(filename: str, project_root: Path) -> str:
+    """Read ``orgs/_shared/<filename>`` -> body (frontmatter stripped,
+    ``.strip()``-clean). Returns ``""`` when the file is absent — the common
+    case for minimal fixtures / packed archives that omit ``_shared/``.
+
+    This is the kit's ONE reader for EVERY ``orgs/_shared/*.md`` prompt block
+    (harness_addendum, dynamic_dispatch_suffix, ask_user_suffix). The caller
+    adds any seam / fallback logic. CWD-independent (takes ``project_root``
+    explicitly)."""
+    path = _orgs_dir(project_root) / "_shared" / filename
+    if not path.is_file():
+        return ""
+    return _split_frontmatter(path.read_text())[1]
+
+
+def load_harness_addendum_body(project_root: Path) -> str:
+    """Read ``orgs/_shared/harness_addendum.md`` -> body. Thin wrapper over
+    ``load_shared_prompt_body`` (kept for the existing call sites)."""
+    return load_shared_prompt_body("harness_addendum.md", project_root)
+
+
 # --- agent specs + skills --------------------------------------------------
 
 def _merge_extends(base: dict[str, Any], delta_fm: dict[str, Any], body: str) -> dict[str, Any]:

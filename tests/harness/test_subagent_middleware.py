@@ -46,13 +46,17 @@ def _no_browser_vision(monkeypatch):
 
 def test_builder_baseline_is_context_only():
     """``builder([])`` (no per-agent extras) = the org's subagent baseline —
-    just ``context`` (browser_vision skipped via env). Byte-identical to the
-    pre-per-agent shared list, so a subagent that declares no ``middleware:``
-    is unchanged."""
+    context + read_file_vision + full_prefix_caching (browser_vision skipped
+    via env). Byte-identical to the pre-per-agent shared list, so a subagent
+    that declares no ``middleware:`` is unchanged."""
     builder = stack.make_subagent_middleware_builder(_ctx(), [], set())
     baseline = builder([])
-    assert len(baseline) == 1
-    assert isinstance(baseline[0], ContextMiddleware)
+    names = [type(m).__name__ for m in baseline]
+    assert names == [
+        "ContextMiddleware",
+        "ReadFileVisionMiddleware",
+        "_FullPrefixCachingMiddleware",
+    ], names
 
 
 def test_builder_adds_audit_outermost():
@@ -63,10 +67,15 @@ def test_builder_adds_audit_outermost():
     scope (so rows are attributable to the worker tier)."""
     builder = stack.make_subagent_middleware_builder(_ctx(), [], set())
     mw = builder(["audit"])
-    assert len(mw) == 2
+    names = [type(m).__name__ for m in mw]
+    assert names == [
+        "AuditMiddleware",
+        "ContextMiddleware",
+        "ReadFileVisionMiddleware",
+        "_FullPrefixCachingMiddleware",
+    ], names
     assert isinstance(mw[0], AuditMiddleware)
     assert mw[0].scope == "subagent"
-    assert isinstance(mw[1], ContextMiddleware)
 
 
 def test_builder_rubric_name_resolves_on_subagent_without_gate():
@@ -78,7 +87,11 @@ def test_builder_rubric_name_resolves_on_subagent_without_gate():
     the scope (regression) makes this raise again."""
     builder = stack.make_subagent_middleware_builder(_ctx(), [], set())
     mw = builder(["rubric"])                # _ctx().rubric_gate is None
-    assert [type(m).__name__ for m in mw] == ["ContextMiddleware"]
+    assert [type(m).__name__ for m in mw] == [
+        "ContextMiddleware",
+        "ReadFileVisionMiddleware",
+        "_FullPrefixCachingMiddleware",
+    ]
 
 
 def test_builder_adds_rubric_on_subagent_when_gate_armed(monkeypatch):
@@ -103,8 +116,15 @@ def test_builder_adds_rubric_on_subagent_when_gate_armed(monkeypatch):
     builder = stack.make_subagent_middleware_builder(ctx, [], set())
 
     mw = builder(["rubric"])
-    # Registry order: ``context`` precedes ``rubric`` — context first, rubric last.
-    assert [type(m).__name__ for m in mw] == ["ContextMiddleware", "RubricMiddleware"]
+    # Registry order: ``context`` → ``rubric`` → ``read_file_vision`` →
+    # ``full_prefix_caching``.
+    names = [type(m).__name__ for m in mw]
+    assert names == [
+        "ContextMiddleware",
+        "RubricMiddleware",
+        "ReadFileVisionMiddleware",
+        "_FullPrefixCachingMiddleware",
+    ], names
     assert isinstance(mw[1], RubricMiddleware)
     assert mw[1].max_iterations == 3
 
@@ -175,7 +195,7 @@ def test_load_subagents_applies_per_agent_middleware(monkeypatch):
 
     calls: list[list[str]] = []
 
-    def fake_builder(names: list[str]):
+    def fake_builder(names: list[str], *, rubric_text=None):
         calls.append(list(names))
         return [f"MW:{','.join(names)}"]
 
@@ -210,7 +230,7 @@ def test_load_subagents_accepts_scalar_middleware(monkeypatch):
         "fake-org", [],
         subagent_middleware=["shared"],
         retrieval_tools=[],
-        build_subagent_middleware=lambda names: (seen.append(list(names)), ["MW"])[1],
+        build_subagent_middleware=lambda names, *, rubric_text=None: (seen.append(list(names)), ["MW"])[1],
     )
     assert seen == [["audit"]], seen
 

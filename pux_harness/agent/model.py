@@ -43,10 +43,8 @@ profile in the ``models:`` registry (``provider: <name>``; ids without one use
 ``default_provider``). ``get_model`` builds ``ReasoningChatOpenAI`` for an
 openai-kind id, ``ChatAnthropic`` for an anthropic-kind id — so one deployment
 serves models from different vendors/protocols (e.g. glm-5.2 over ZAI's
-Anthropic-compat endpoint, mimo-v2.5 over OpenCode Go's OpenAI-compat router).
-``PUX_MAX_TOKENS`` / ``PUX_TEMPERATURE`` still override per-deployment; the
-OpenCode-Go profile's ``base_url`` still honors the legacy ``OPENCODE_BASE_URL``
-override for back-compat.
+Anthropic-compat endpoint, mimo-v2.5 over OpenRouter's OpenAI-compat endpoint).
+``PUX_MAX_TOKENS`` / ``PUX_TEMPERATURE`` still override per-deployment.
 
 Historical notes:
   - Pre-17.B.0 a single ``DEFAULT_MODEL``/``get_model(model=None)`` was shared by
@@ -115,7 +113,6 @@ _ANTHROPIC_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 
 # Legacy single-model-era env vars still honored (back-compat).
 _LEGACY_DEFAULT_MODEL_ENV = "PUX_MODEL"        # base role only
-_LEGACY_BASE_URL_ENV = "OPENCODE_BASE_URL"
 # The runtime tier selector (set by --tier/--fast). Falls back to default_tier.
 _TIER_ENV = "PUX_TIER"
 # Per-deployment reasoning-depth override (OpenAI `reasoning_effort`, e.g.
@@ -286,6 +283,22 @@ def reasoning_effort_for(model_id: str) -> str | None:
         return None
     val = caps.get("reasoning_effort")
     return val if isinstance(val, str) and val else None
+
+
+def wire_id_for(model_id: str) -> str:
+    """The model name actually sent on the wire for ``model_id``: the per-id
+    ``wire_id`` declared in the ``models:`` registry, else ``model_id`` itself.
+
+    This decouples Pux's canonical short id (used by tiers, tests, dcode refs,
+    frontmatter) from the upstream provider's model string — e.g. the canonical
+    ``mimo-v2.5`` is served by OpenRouter as ``xiaomi/mimo-v2.5``. Unknown ids
+    and ids without a ``wire_id`` pass through unchanged (zero risk)."""
+    caps = _models_registry().get(model_id)
+    if isinstance(caps, dict):
+        val = caps.get("wire_id")
+        if isinstance(val, str) and val:
+            return val
+    return model_id
 
 
 def _tiers() -> dict:
@@ -578,8 +591,7 @@ def _instantiate(
     endpoints, ``ChatAnthropic`` for Anthropic-compatible ones (e.g. ZAI's
     glm-5.2, served where its billing balance lives). ``max_tokens`` /
     ``temperature`` come from the profile (with PUX_MAX_TOKENS / PUX_TEMPERATURE
-    env overrides); the OpenCode-Go profile's ``base_url`` still honors the
-    legacy ``OPENCODE_BASE_URL`` override (matched by api_key_env) for back-compat.
+    env overrides).
 
     When ``fallback_models`` is given, returns the kind's fallback wrapper — a
     ``BaseChatModel`` subclass (so ``deepagents.resolve_model``'s fast-path
@@ -588,8 +600,8 @@ def _instantiate(
     (every entry shares the primary's kind), so the wrapper class matches the
     primary's.
 
-    ``max_retries=6`` lets the client ride transient limits (429s on the free
-    OpenCode Zen Go router; ZAI throttles) with built-in exponential backoff
+    ``max_retries=6`` lets the client ride transient limits (429s on OpenRouter;
+    ZAI throttles) with built-in exponential backoff
     rather than dying on the first 429. Standard client resilience, not a
     behavior fallback — and the precondition for ``get_model``'s declared
     fallback chain (each model is independently resilient; ``with_fallbacks``
@@ -598,19 +610,13 @@ def _instantiate(
     kind = prof.get("kind", "openai")
     base_url = prof["base_url"]
     api_key_env = prof["api_key_env"]  # _spec() validated non-empty
-    # Legacy back-compat: OPENCODE_BASE_URL overrides the OpenCode-Go profile's
-    # base_url (matched by its api_key_env) so existing dev workflows keep working.
-    if api_key_env == "OPENCODE_API_KEY":
-        legacy = os.environ.get(_LEGACY_BASE_URL_ENV)
-        if legacy:
-            base_url = legacy
     api_key = os.environ[api_key_env]
     max_tokens = int(os.environ.get("PUX_MAX_TOKENS", prof.get("max_tokens", 8192)))
     temperature = float(os.environ.get("PUX_TEMPERATURE", prof.get("temperature", 0.2)))
 
     if kind == "anthropic":
         kwargs = dict(
-            model=model_id, base_url=base_url, api_key=api_key,
+            model=wire_id_for(model_id), base_url=base_url, api_key=api_key,
             max_tokens=max_tokens, temperature=temperature, timeout=180, max_retries=6,
         )
         if fallback_models:
@@ -622,7 +628,7 @@ def _instantiate(
 
     # openai-compatible
     kwargs = dict(
-        model=model_id, base_url=base_url, api_key=api_key, timeout=180, max_retries=6,
+        model=wire_id_for(model_id), base_url=base_url, api_key=api_key, timeout=180, max_retries=6,
         max_tokens=max_tokens, temperature=temperature,
     )
     # Reasoning-depth knob (OpenAI `reasoning_effort`): honored by reasoning-
@@ -640,6 +646,17 @@ def _instantiate(
     effort = reasoning_effort_for(model_id)
     if effort:
         extra["reasoning_effort"] = effort
+    # OpenRouter backend forcing (e.g. Parasail). Only injected when the profile
+    # targets openrouter.ai AND the deployment sets PUX_OPENROUTER_PROVIDER_ONLY
+    # (comma-separated provider names → OpenRouter `provider.only` body param).
+    # Mirrors Athena's provider_routing.only. Non-OpenRouter gateways never see
+    # it (the body key is OpenRouter-specific), so zai-coding calls are unaffected.
+    if "openrouter.ai" in base_url:
+        _route_only = os.environ.get("PUX_OPENROUTER_PROVIDER_ONLY", "").strip()
+        if _route_only:
+            extra["provider"] = {
+                "only": [p.strip() for p in _route_only.split(",") if p.strip()]
+            }
     kwargs["extra_body"] = extra
     if fallback_models:
         m = _FallbackReasoningChatOpenAI(**kwargs)
@@ -657,7 +674,7 @@ def get_model(
     path). The model's provider profile (from ``models.yaml``) picks the concrete
     class — ``ReasoningChatOpenAI`` (OpenAI-compatible) or ``ChatAnthropic``
     (Anthropic-compatible, e.g. ZAI glm-5.2). Legacy env overrides
-    (``OPENCODE_BASE_URL``, ``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still win.
+    (``PUX_MAX_TOKENS``, ``PUX_TEMPERATURE``) still win.
 
     When the role resolves from the active tier AND that tier declares a
     ``<role>_fallbacks`` chain, the returned model is a
@@ -746,7 +763,7 @@ def dcode_model_ref(
     *, role: str = "base", org: str | None = None, model: str | None = None,
 ) -> str | None:
     """The dcode ``provider:model`` string for ``role`` (e.g.
-    ``opencode-go-openai:glm-5.2``), or None when no dcode provider is
+    ``pux-openai:glm-5.2``), or None when no dcode provider is
     configured. Resolves the id through the same priority stack as
     ``resolve_model_id`` so the TUI forwards exactly what the harness would
     drive."""

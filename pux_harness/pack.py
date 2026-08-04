@@ -154,6 +154,7 @@ from langchain_openai import ChatOpenAI  # noqa: E402
 from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
 
 from pux_harness.kit import bootstrap_env_and_logging, compile_org  # noqa: E402
+from pux_harness.kit.loaders import supervisor_skills_roots  # noqa: E402
 
 ORG = "__ORG__"
 DEFAULT_MODEL = "__MODEL__"
@@ -161,6 +162,32 @@ DEFAULT_MODEL = "__MODEL__"
 
 def _project_root() -> str:
     return os.environ.get("PUX_PROJECT_ROOT") or str(_ARCHIVE_ROOT)
+
+
+def _middleware() -> list:
+    """Middleware to mount on the agent. Inject yours here.
+
+    Return a list of deepagents ``AgentMiddleware`` instances — they flow
+    straight through ``compile_org`` into ``create_deep_agent``. Examples:
+
+        from copilotkit import CopilotKitMiddleware
+        return [CopilotKitMiddleware()]
+
+        # or any custom middleware (state surfacing, tool hooks, logging, ...)
+        return [MyMiddleware()]
+
+    Default: ``[]`` (no middleware — the plain deepagents agent).
+    """
+    return []
+
+
+def _supervisor_skills() -> list[str]:
+    """Skills-ROOT dirs to mount on the supervisor's SkillsMiddleware.
+
+    Auto-discovers every existing skills root under the kit (``orgs/_shared/
+    skills`` + ``orgs/<ORG>/skills``). Drop a new ``<name>/SKILL.md`` folder in
+    either root and the supervisor sees it next run — no other wiring needed."""
+    return supervisor_skills_roots(ORG, Path(_project_root()))
 
 
 def _build_model() -> ChatOpenAI:
@@ -187,7 +214,10 @@ def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "--check":
         from pux_harness.kit._testing import ScriptedModel  # noqa: PLC0415
-        graph = compile_org(ORG, model=ScriptedModel(), tools=[], project_root=_project_root())
+        graph = compile_org(
+            ORG, model=ScriptedModel(), tools=[], project_root=_project_root(),
+            middleware=_middleware(), skills=_supervisor_skills(),
+        )
         print(f"OK: {ORG} compiled -> {type(graph).__name__} (project_root={_project_root()})")
         return
     task = " ".join(args).strip()
@@ -196,7 +226,8 @@ def main() -> None:
         raise SystemExit(2)
     graph = compile_org(
         ORG, model=_build_model(), tools=[], checkpointer=MemorySaver(),
-        project_root=_project_root(),
+        project_root=_project_root(), middleware=_middleware(),
+        skills=_supervisor_skills(),
     )
     _print_final(graph.invoke({"messages": [{"role": "user", "content": task}]}))
 

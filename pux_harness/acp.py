@@ -484,7 +484,7 @@ class _RegisteringAgentServerACP(AgentServerACP):
         """Emit one ``AgentThoughtChunk`` per reasoning delta, if any.
 
         ``ReasoningChatOpenAI`` accumulates provider reasoning
-        (``delta.reasoning_content`` — DeepSeek / MiMo / OpenCode Zen Go, proven
+        (``delta.reasoning_content`` — DeepSeek / MiMo / OpenRouter, proven
         live vs ``mimo-v2.5``) onto ``message_chunk.additional_kwargs
         ["reasoning_content"]`` as a per-chunk DELTA. Each non-empty delta → one
         thought chunk, so the editor streams the reasoning live exactly like the
@@ -658,6 +658,7 @@ class _RegisteringAgentServerACP(AgentServerACP):
             # inside the base loop, and a genuine cancellation must keep
             # propagating.
             last_exc: Exception | None = None
+            last_recoverable: bool = False
             attempts_made = 0
             for attempt in range(_PROMPT_MAX_ATTEMPTS):
                 attempts_made = attempt + 1
@@ -691,6 +692,7 @@ class _RegisteringAgentServerACP(AgentServerACP):
                 except Exception as exc:
                     last_exc = exc
                     recoverable = _is_stream_stall_recoverable(exc)
+                    last_recoverable = recoverable
                     more_attempts = attempt < _PROMPT_MAX_ATTEMPTS - 1
                     if recoverable and more_attempts:
                         backoff = _PROMPT_BACKOFF_BASE * (2 ** attempt)
@@ -740,16 +742,57 @@ class _RegisteringAgentServerACP(AgentServerACP):
             except Exception:  # noqa: BLE001
                 pass
             try:
-                await self._log_text(
-                    session_id=session_id,
-                    text=(
+                # Pick a notice that honestly describes WHICH layer raised.
+                # The pre-fix text unconditionally called every failure a
+                # "model stream stalled", which sent the operator looking at
+                # provider health when the actual cause was a deterministic
+                # tool-side timeout (e.g. ExecTimeout from a recursive
+                # ``uv run pux`` the agent shelled out to) or an
+                # unrecoverable code error (AttributeError from a malformed
+                # tool schema, KeyError on missing config). ``last_recoverable``
+                # from the classifier above tells us which branch we're in:
+                # ``False`` → unrecoverable exception that bailed after 1
+                # attempt; ``True`` → stall that exhausted
+                # ``_PROMPT_MAX_ATTEMPTS`` retries.
+                from pux_harness.sandbox.docker_exec import (
+                    ExecTimeout as _SandboxExecTimeout,
+                )
+                if isinstance(exc, _SandboxExecTimeout):
+                    notice = (
+                        f"⚠️ A tool call hit the sandbox wall-clock timeout "
+                        f"({exc}) and didn't finish. This is NOT a model "
+                        f"stream stall — the agent's command exceeded its "
+                        f"time budget (often a sign it shelled out to a "
+                        f"long-running subprocess like ``uv run pux`` and "
+                        f"waited inline). Your work up to this point is "
+                        f"checkpointed: re-send the same message and the "
+                        f"subagent will resume from the last completed step."
+                    )
+                elif not last_recoverable:
+                    # Unrecoverable exception that bailed after 1 attempt —
+                    # NOT a stream stall. Surface the actual exception name
+                    # and message so the operator knows where to look.
+                    notice = (
+                        f"⚠️ This turn ended early — the agent raised "
+                        f"{type(exc).__name__}: {exc}. This is a "
+                        f"deterministic error (not a transient stream "
+                        f"stall) and will not change shape on retry. Your "
+                        f"work up to this point is checkpointed: re-send "
+                        f"the same message and the subagent will resume "
+                        f"from the last completed step, not start over."
+                    )
+                else:
+                    notice = (
                         f"⚠️ This turn ended early — the model stream stalled "
                         f"({type(exc).__name__}) and didn't recover after "
                         f"{attempts_made} attempt(s). Your work up to this point "
                         f"is checkpointed: re-send the same message and the "
                         f"subagent will resume from the last completed step, "
                         f"not start over."
-                    ),
+                    )
+                await self._log_text(
+                    session_id=session_id,
+                    text=notice,
                 )
             except Exception:  # noqa: BLE001 — surfacing is best-effort
                 _log.debug(

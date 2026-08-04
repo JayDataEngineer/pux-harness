@@ -27,7 +27,7 @@
 #   This is how one deployment can serve models from DIFFERENT vendors/protocols
 #   at once. (Shipped: glm-5.2/glm-5.1 ride `zai-coding` — ZAI's GLM Coding Plan
 #   OpenAI endpoint — billed against the coding subscription; the cheap ids ride
-#   `opencode-go` (OpenCode Zen Go router). Both are OpenAI-compatible, so
+#   `openrouter`. Both are OpenAI-compatible, so
 #   reasoning streams uniformly as the OpenAI `delta.reasoning_content` shape that
 #   `ReasoningChatOpenAI` captures → ACP thoughts for the DEFAULT supervisor with
 #   no Anthropic extractor. `zai-anthropic` is kept as an available profile; see
@@ -88,20 +88,21 @@
 #   only (it's an OpenAI extension).
 #
 # THE `dcode:` BLOCK
-#   The TUI (dcode) names our opencode endpoint `opencode-go-openai` and uses the
-#   SAME ids (see ~/.deepagents/config.toml). `pux tui` forwards the resolved base
-#   model as `<dcode.provider>:<id>` so dcode never falls back to its own default.
+#   The TUI (dcode) names our endpoint `pux-openai` and uses the SAME ids (see
+#   ~/.deepagents/config.toml). `pux tui` forwards the resolved base model as
+#   `<dcode.provider>:<id>` so dcode never falls back to its own default.
 
 # Named provider profiles — each a wire protocol + endpoint + key env.
 providers:
-  # OpenCode Go — OpenAI-compatible router. Serves the cheap/multimodal ids
-  # (mimo/kimi/deepseek). `OPENCODE_BASE_URL` (legacy) still overrides this
-  # profile's base_url for back-compat (matched by api_key_env), so existing dev
-  # workflows keep working.
-  opencode-go:
+  # OpenRouter — OpenAI-compatible aggregator. Primary serving backend. Serves
+  # the mimo/kimi/deepseek ids (full upstream ids via each id's `wire_id`). Force
+  # a specific backend (e.g. Parasail) with PUX_OPENROUTER_PROVIDER_ONLY in .env
+  # — see _instantiate in
+  # agent/model.py. Same OPENROUTER_API_KEY as Athena.
+  openrouter:
     kind: openai
-    base_url: https://opencode.ai/zen/go/v1
-    api_key_env: OPENCODE_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
     max_tokens: 8192
     temperature: 0.2
   # ZAI — GLM Coding Plan, OpenAI-compatible endpoint. This is where the coding
@@ -131,20 +132,20 @@ providers:
     max_tokens: 8192
     temperature: 0.2
 
-# Profile used by model ids that don't name one in `models:`. opencode-go keeps
-# the shipped behavior (pre-multi-provider everything was the single OpenAI impl).
-default_provider: opencode-go
+# Profile used by model ids that don't name one in `models:`. openrouter is the
+# live default.
+default_provider: openrouter
 
 # Per-id registry: capability flag + which profile serves it.
 models:
   glm-5.2:           {provider: zai-coding, multimodal: false, strength: pro, reasoning_effort: max}
   glm-5.1:           {provider: zai-coding, multimodal: false, strength: pro, reasoning_effort: max}
-  mimo-v2.5:         {provider: opencode-go, multimodal: true, strength: flash}
-  mimo-v2.5-pro:     {provider: opencode-go, multimodal: true, strength: flash}
-  kimi-k2.7-code:    {provider: opencode-go, multimodal: false, strength: flash}
-  kimi-k2.6:         {provider: opencode-go, multimodal: false, strength: flash}
-  deepseek-v4-pro:   {provider: opencode-go, multimodal: false, strength: flash}
-  deepseek-v4-flash: {provider: opencode-go, multimodal: false, strength: flash}
+  mimo-v2.5:         {provider: openrouter, wire_id: xiaomi/mimo-v2.5, multimodal: true, strength: flash}
+  mimo-v2.5-pro:     {provider: openrouter, wire_id: xiaomi/mimo-v2.5-pro, multimodal: true, strength: flash}
+  kimi-k2.7-code:    {provider: openrouter, wire_id: moonshotai/kimi-k2.7-code, multimodal: false, strength: flash}
+  kimi-k2.6:         {provider: openrouter, wire_id: moonshotai/kimi-k2.6, multimodal: false, strength: flash}
+  deepseek-v4-pro:   {provider: openrouter, wire_id: deepseek/deepseek-v4-pro, multimodal: false, strength: flash}
+  deepseek-v4-flash: {provider: openrouter, wire_id: deepseek/deepseek-v4-flash, multimodal: false, strength: flash}
 
 # Named tiers — a coherent role map per "mode". `default_tier` is the shipped
 # default; --tier <name> (or --fast) selects another at run time.
@@ -155,9 +156,9 @@ tiers:
   # BrowserVisionMiddleware text-pointer fallback, not native image blocks.
   default:
     base_model: glm-5.2
-    # glm-5.2 (zai-coding, kind: openai) -> mimo-v2.5-pro (opencode-go, kind:
+    # glm-5.2 (zai-coding, kind: openai) -> mimo-v2.5-pro (openrouter, kind:
     # openai): cross-provider escape — when ZAI's coding-plan rate-limit window
-    # is exhausted, fail over to OpenCode Go. Both are OpenAI-compatible, so the
+    # is exhausted, fail over to OpenRouter. Both are OpenAI-compatible, so the
     # chain stays protocol-homogeneous. Reasoning streams uniformly as
     # delta.reasoning_content regardless of which provider serves the turn.
     base_fallbacks: [mimo-v2.5-pro]
@@ -175,6 +176,6 @@ tiers:
 
 default_tier: default
 
-# dcode (the TUI) provider name for our opencode endpoint — see the block comment.
+# dcode (the TUI) provider name for the endpoint — see the block comment.
 dcode:
-  provider: opencode-go-openai
+  provider: pux-openai

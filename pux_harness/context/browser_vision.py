@@ -13,7 +13,7 @@ THE BLOCK
 WHY A COMPANION HumanMessage, NOT AN IMAGE IN THE ToolMessage
     The OpenAI-style tool-result role accepts a STRING content widely, but
     MULTIMODAL tool-result content is provider/gateway-dependent: the shipped
-    OpenCode-Zen-Go gateway upstream-rejects (HTTP 400) an ``image_url`` block
+    OpenRouter gateway upstream-rejects (HTTP 400) an ``image_url`` block
     inside a tool-role message, even though it accepts the SAME image block in
     a user-role message (proven live against mimo-v2.5: it reads example.com
     correctly from a HumanMessage image, 400s from a ToolMessage image). So we
@@ -88,11 +88,59 @@ _SCREENSHOT_SLUGS = frozenset({
     "navigate", "search", "go_back", "new_tab", "switch_tab",
     "click", "click_at", "hover", "drag", "select_dropdown",
     "accept_cookies", "uc", "screenshot",
+    # scroll + scroll_into_view: the viewport MOVES even though the DOM is
+    # unchanged (the dirty-flag capture skips text re-extraction, but the
+    # screenshot shows a different part of the page). Without the screenshot
+    # the model is blind after scrolling and must call browser_screenshot
+    # explicitly — burning a tool call. The screenshot is already taken
+    # (screenshot_path is in the lightweight result); attaching it is free.
+    "scroll", "scroll_into_view",
 })
 
 # Cap the fetch so a pathological path can't hang the agent — a screenshot over
 # this is dropped (text result still ships).
 _MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024  # 4 MiB
+
+# Keep only the N most recent screenshot HumanMessages in context. Each
+# screenshot is ~1,425 vision tokens; after 5 navigations that's ~7K
+# tokens/turn of STALE images the model re-processes every turn. The model
+# only needs the CURRENT page state to decide the next action — historical
+# screenshots are replaced with a text placeholder so the execution trace
+# (what was observed) is preserved without the pixel cost.
+_KEEP_RECENT_SCREENSHOTS = 2
+
+
+def _prune_old_screenshots(messages: list) -> list:
+    """Replace image blocks in HumanMessages older than the last N with a text
+    placeholder. Returns the original list (identity) when nothing to prune,
+    a new list otherwise — so callers can cheaply check ``is`` to skip the
+    ``request.override`` path."""
+    screenshot_indices: list[int] = []
+    for i, msg in enumerate(messages):
+        if (isinstance(msg, HumanMessage)
+                and isinstance(msg.content, list)
+                and any(isinstance(b, dict) and b.get("type") == "image"
+                        for b in msg.content)):
+            screenshot_indices.append(i)
+
+    if len(screenshot_indices) <= _KEEP_RECENT_SCREENSHOTS:
+        return messages  # nothing to prune
+
+    to_prune = set(screenshot_indices[:-_KEEP_RECENT_SCREENSHOTS])
+    new_messages = []
+    for i, msg in enumerate(messages):
+        if i in to_prune:
+            new_content = []
+            for block in msg.content:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    new_content.append({"type": "text",
+                                        "text": "[screenshot removed to save context]"})
+                else:
+                    new_content.append(block)
+            new_messages.append(HumanMessage(content=new_content))
+        else:
+            new_messages.append(msg)
+    return new_messages
 
 
 def _screenshot_b64(exec_client: Any, path: str) -> str | None:
@@ -236,6 +284,32 @@ class BrowserVisionMiddleware(AgentMiddleware):
             return await handler(request)
         result = await handler(request)
         return self._enrich(result)
+
+    # --- history pruning: strip old screenshot image blocks before model call --
+    # Each screenshot is ~1,425 vision tokens re-sent EVERY turn. After 5
+    # navigations the model carries ~7K tokens of stale images it no longer
+    # needs — the current page state is all that matters for the next action.
+    # We keep the last _KEEP_RECENT_SCREENSHOTS and replace older image blocks
+    # with a text placeholder so the execution trace survives without the
+    # pixel cost. This runs in wrap_model_call (before the model sees the
+    # messages) and does NOT mutate graph state — it's a fresh transform each
+    # turn.
+
+    def wrap_model_call(self, request, handler):  # type: ignore[no-untyped-def]
+        if not self.enabled:
+            return handler(request)
+        pruned = _prune_old_screenshots(request.messages)
+        if pruned is not request.messages:
+            request = request.override(messages=pruned)
+        return handler(request)
+
+    async def awrap_model_call(self, request, handler):  # type: ignore[no-untyped-def]
+        if not self.enabled:
+            return await handler(request)
+        pruned = _prune_old_screenshots(request.messages)
+        if pruned is not request.messages:
+            request = request.override(messages=pruned)
+        return await handler(request)
 
 
 def browser_vision_enabled() -> bool:

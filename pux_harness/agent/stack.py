@@ -108,6 +108,8 @@ from pux_harness.context.browser_vision import (
     BrowserVisionMiddleware,
     browser_vision_enabled,
 )
+from pux_harness.context.read_file_vision import ReadFileVisionMiddleware
+from pux_harness.context.interpreter_hints import InterpreterHintsMiddleware
 from pux_harness.context.layer import build_context_layer
 from pux_harness.context.sandbox_routing import RoutingMiddleware
 from pux_harness.context.prepare_warmup import PrepareWarmupMiddleware
@@ -402,6 +404,57 @@ def _build_browser_vision(ctx: StackCtx, scope: Scope) -> AgentMiddleware | None
     )
 
 
+def _build_read_file_vision(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
+    """``ReadFileVisionMiddleware`` — automatic image/binary fallback for
+    non-multimodal drivers on ALL agents. When ``read_file`` (or any tool)
+    returns an image/binary content block, a non-multimodal model cannot
+    consume it → gateway HTTP 400. This middleware intercepts the ToolMessage
+    and AUTO-DESCRIBES the image by calling the ``multimodal`` role model
+    (e.g. mimo-v2.5) — a transparent one-shot vision call on the calling
+    model's behalf. The calling model sees a TEXT DESCRIPTION, not an image
+    block, so it never crashes. Falls back to a text pointer to
+    ``describe_image`` when the vision model is unavailable or the call fails.
+
+    No-op when the driver IS multimodal (the image passes through natively).
+    Mounted on BOTH supervisor and subagent scopes — unlike ``browser_vision``
+    (which gates on ``has_browser_tools``), this applies to every agent because
+    ``read_file`` is available everywhere (FilesystemMiddleware is universal).
+
+    MODE is selected by the driver's per-scope capability
+    (``model.driver_multimodal``): SUPERVISOR checks the ``base`` role, SUBAGENT
+    the ``worker`` role — identical to ``_build_browser_vision``. The
+    ``vision_model`` (``multimodal`` role) is always threaded so auto-describe
+    works even on subagents where the driver IS multimodal (no-op there since
+    ``multimodal_driver=True`` short-circuits before the vision call)."""
+    role = "base" if scope is Scope.SUPERVISOR else "worker"
+    # Resolve the vision model for auto-describe. ``None`` if model init fails
+    # (dev stubs, missing API key) — the middleware falls back to text pointer.
+    try:
+        vision_model = get_model(role="multimodal", org=ctx.org)
+    except Exception:
+        vision_model = None
+    return ReadFileVisionMiddleware(
+        multimodal_driver=driver_multimodal(role=role, org=ctx.org),
+        vision_model=vision_model,
+    )
+
+
+def _build_interpreter_hints(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware:
+    """``InterpreterHintsMiddleware`` — the diagnostic layer for the ``eval``
+    tool (CodeInterpreterMiddleware). When ``eval`` returns an
+    ``<error type="...">`` result, appends a companion ``HumanMessage`` that
+    classifies the failure (syntax/timeout/oom/ptc-budget/deadlock/runtime),
+    explains the root cause, and names the fallback (call glob/grep/ls/
+    read_file/task directly) so a strong orchestrator can either fix the
+    dispatch script or abandon ``eval`` and drive the individual tools.
+
+    Paired 1:1 with ``interpreter`` (armed iff interpreter is armed — see
+    ``_resolve_toggles``). Zero happy-path cost: one regex scan on eval
+    results only; success results and non-eval tools pass through untouched.
+    See ``context/interpreter_hints.py`` for the full rationale."""
+    return InterpreterHintsMiddleware()
+
+
 def _log_rubric_evaluation(ev: dict) -> None:
     """``on_evaluation`` hook for ``RubricMiddleware`` — print each grader
     verdict so the gate is OBSERVABLE in the run trace.
@@ -617,7 +670,7 @@ def _build_prompt_caching(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware | No
     Anthropic's 4-breakpoint limit.
 
     ``unsupported_model_behavior="ignore"`` makes this a NO-OP for non-Anthropic
-    models (our OpenAI-compat path: mimo-v2.5 via opencode-go).  The OpenAI path
+    models (our OpenAI-compat path: mimo-v2.5 via OpenRouter).  The OpenAI path
     gets its own caching via ``prompt_cache_key`` in ``model.py``'s
     ``extra_body`` — server-side prefix caching with a routing hint.  The two
     mechanisms are complementary, not redundant."""
@@ -749,7 +802,20 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
     MiddlewareSpec("rubric", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_rubric),
     MiddlewareSpec("model_retry", frozenset({Scope.SUPERVISOR}), _build_model_retry),
     MiddlewareSpec("tool_retry", frozenset({Scope.SUPERVISOR}), _build_tool_retry),
+    # read_file_vision mounts BEFORE browser_vision so it wraps just outside the
+    # browser-vision layer. They handle DIFFERENT tools (read_file vs browser_*),
+    # so ordering between them doesn't affect correctness — but read_file_vision
+    # is the more general layer (covers ALL agents, not just browser orgs), so it
+    # sits just outside. Covers ANY ToolMessage with image/binary content blocks.
+    MiddlewareSpec("read_file_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_read_file_vision),
     MiddlewareSpec("browser_vision", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_browser_vision),
+    # ``interpreter_hints`` wraps eval tool results to append a classified-
+    # failure hint + fallback. Paired with ``interpreter`` (armed iff the
+    # interpreter is armed — see ``_resolve_toggles``). Acts ONLY on eval
+    # results (regex scan for ``<error type=``); every other tool name
+    # short-circuits, so it costs nothing on the rest of the surface. Mounted
+    # next to browser_vision — both use the Command([text_tm, human]) pattern.
+    MiddlewareSpec("interpreter_hints", frozenset({Scope.SUPERVISOR}), _build_interpreter_hints),
     # ``prompt_caching`` tags the system prompt + tools with cache_control for
     # Anthropic models (no-op for OpenAI-compat). Listed AFTER everything else
     # so it sees the FINAL tools list (after context adds ctx_recall/ctx_search,
@@ -795,12 +861,12 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
 # (default-on, removable via ``middleware.supervisor.remove``) — the user's
 # "selectively remove/add middleware" request, applied uniformly to the
 # formerly-non-toggleable layers too.
-DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "prompt_capture", "model_retry", "browser_vision", "prompt_caching", "prepare"]
+DEFAULT_SUPERVISOR: list[str] = ["context", "routing", "session_guide", "prompt_capture", "model_retry", "read_file_vision", "browser_vision", "prompt_caching", "prepare"]
 
 # Subagents get the context layer + browser_vision by default; routing /
 # session_guide / rubric are supervisor concerns. An org MAY add a subagent
 # middleware via ``middleware.subagent.add``.
-DEFAULT_SUBAGENT: list[str] = ["context", "browser_vision", "prompt_caching"]
+DEFAULT_SUBAGENT: list[str] = ["context", "read_file_vision", "browser_vision", "prompt_caching"]
 
 
 def middleware_names() -> list[str]:
@@ -874,6 +940,12 @@ def _resolve_toggles(
     on = set(_apply_rules(ctx.facts, scope, list(on)))
     on -= set(removes)
     on |= set(adds)
+    # Pair interpreter_hints with interpreter — the diagnostic layer mounts
+    # iff the eval tool is armed (add wins, so ``add:[interpreter]`` also
+    # pulls in hints; ``remove:[interpreter]`` drops both). This runs AFTER
+    # rules/adds/removes so the pairing tracks the FINAL interpreter state.
+    if "interpreter" in on and "interpreter_hints" not in removes:
+        on.add("interpreter_hints")
 
     # Validate the FULL on-set — fail loud on an unknown add, a rule typo, or a
     # scope mismatch. (Remove-name typos are caught offline by validate_overrides.)

@@ -137,6 +137,80 @@ def test_substitute_spec_github_none_unchanged():
     assert _substitute_spec(spec, env={}).github is None
 
 
+# --- command/args ${VAR} expansion (sandbox-browser MCP wiring) ---------------
+
+def test_substitute_spec_expands_command_placeholder():
+    """``command`` field expands ``${VAR}`` from env — same rule as ``url``.
+    Required so a catalog entry can name a path resolved at runtime."""
+    spec = _parse_spec("custom", {
+        "kind": "mcp", "transport": "stdio",
+        "command": "${HOME}/.local/bin/my-server",
+    })
+    resolved = _substitute_spec(spec, env={"HOME": "/root"})
+    assert resolved.command == "/root/.local/bin/my-server"
+
+
+def test_substitute_spec_expands_args_placeholders():
+    """Every ``args`` entry is a separate expansion scope — each ``${VAR}`` is
+    resolved against the env independently. This is what lets the
+    sandbox-browser entry use::
+
+        args: [exec, -i, "${PUX_SANDBOX_CONTAINER}", mc_browser.py]
+
+    where ``PUX_SANDBOX_CONTAINER`` is the dynamic container name
+    (``orchestrator-sandbox-p<hash>``)."""
+    spec = _parse_spec("sandbox_browser", {
+        "kind": "mcp", "transport": "stdio",
+        "command": "docker",
+        "args": ["exec", "-i", "${PUX_SANDBOX_CONTAINER}", "mc_browser.py"],
+    })
+    resolved = _substitute_spec(
+        spec, env={"PUX_SANDBOX_CONTAINER": "orchestrator-sandbox-pabc123"},
+    )
+    assert resolved.command == "docker"
+    assert resolved.args == [
+        "exec", "-i", "orchestrator-sandbox-pabc123", "mc_browser.py",
+    ]
+
+
+def test_substitute_spec_permissive_leaves_args_placeholder_as_is():
+    """In permissive (offline contract) mode, unresolved ``${VAR}`` in args is
+    LEFT AS-IS — same behavior as url/headers/env. Lets the catalog ship a
+    git-safe structural placeholder that fails loud at load time if the
+    operator forgot to set the env var."""
+    spec = _parse_spec("sandbox_browser", {
+        "kind": "mcp", "transport": "stdio",
+        "command": "docker",
+        "args": ["exec", "-i", "${PUX_SANDBOX_CONTAINER}", "mc_browser.py"],
+    })
+    resolved = _substitute_spec(spec, env={}, permissive=True)
+    assert resolved.args == [
+        "exec", "-i", "${PUX_SANDBOX_CONTAINER}", "mc_browser.py",
+    ]
+
+
+def test_substitute_spec_raises_on_unresolved_args_placeholder():
+    """Non-permissive mode raises on any unresolved ``${VAR}`` in args —
+    fail-loud at load time rather than spawning ``docker exec -i`` with a
+    literal ``${VAR}`` argument."""
+    spec = _parse_spec("sandbox_browser", {
+        "kind": "mcp", "transport": "stdio",
+        "command": "docker",
+        "args": ["exec", "-i", "${PUX_SANDBOX_CONTAINER}", "mc_browser.py"],
+    })
+    with pytest.raises(ValueError, match="PUX_SANDBOX_CONTAINER"):
+        _substitute_spec(spec, env={})
+
+
+def test_substitute_spec_args_with_no_placeholder_unchanged():
+    """Args without placeholders pass through verbatim (no behavior change
+    for existing catalog entries like the github-mcp-server one)."""
+    spec = _parse_spec("github", _stdio_entry())
+    resolved = _substitute_spec(spec, env={"GITHUB_TOKEN": "tok"})
+    # The github entry uses args: ["stdio"] — no placeholder, unchanged
+    assert resolved.args == ["stdio"]
+
+
 def test_catalog_ref_copy_preserves_github_block():
     """The catalog-ref copy path (``ToolServerSpec(**{**ref.__dict__})``) must
     carry github forward — proven by constructing via the same spread the

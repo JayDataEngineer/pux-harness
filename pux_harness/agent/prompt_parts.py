@@ -34,7 +34,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Sequence
+from pathlib import Path
+from typing import Any, Callable, Sequence
 
 from pux_harness.agent.hitl import ASK_USER_PROMPT_SUFFIX
 
@@ -76,9 +77,12 @@ class PromptCtx:
 
     # --- supervisor ---
     agents_md_base: str = ""  # chain-inherited org overlay (base org `general` + own; from orgs.build_system_prompt)
+    harness_addendum: str = ""  # orgs/_shared/harness_addendum.md body; empty = no file → builder falls back to _ADDENDUM
     system_prompt_suffix: str | None = None  # org-wide suffix (supervisor + subagent)
     ask_user_active: bool = False
+    ask_user_text: str = ""  # orgs/_shared/ask_user_suffix.md body; empty = no file → builder falls back to ASK_USER_PROMPT_SUFFIX
     interpreter_mounted: bool = False
+    dynamic_dispatch_text: str = ""  # orgs/_shared/dynamic_dispatch_suffix.md body; empty = no file → builder falls back to _DYNAMIC_DISPATCH_SUFFIX
     # --- subagent ---
     agent_body: str = ""
     agent_system_prompt_suffix: str | None = None  # per-agent suffix
@@ -134,6 +138,107 @@ conflicts with the org docs above, THIS ADDENDUM wins.
   the sandbox container — the project root, bind-mounted. You and every
   subagent share this same surface.
 """
+
+
+def resolve_harness_addendum(body: str) -> str:
+    """Normalize a frontmatter-stripped body into the addendum WITH the leading
+    ``"\\n"`` seam (the single-newline join to the AGENTS.md overlay — the
+    ``"\\n\\n"`` joiner cannot reproduce it without a spurious blank line) and a
+    single trailing newline (byte-identical to the embedded ``_ADDENDUM``).
+    Falls back to ``_ADDENDUM`` when ``body`` is empty (file absent — minimal
+    fixtures / packed archives that omit ``_shared/``)."""
+    return f"\n{body}\n" if body else _ADDENDUM
+
+
+def load_harness_addendum(project_root: Path) -> str:
+    """Read ``orgs/_shared/harness_addendum.md`` -> the addendum string WITH the
+    leading ``"\\n"`` seam (ready for ``ctx.harness_addendum``). Falls back to
+    the embedded ``_ADDENDUM`` when the file is absent. This is the ONE function
+    both the runtime (``stack.build_stack``) and the introspection view
+    (``prompt_show``) call to populate ``ctx.harness_addendum`` — CWD-independent
+    (takes ``project_root`` explicitly)."""
+    from pux_harness.kit.loaders import load_shared_prompt_body
+
+    return resolve_harness_addendum(load_shared_prompt_body("harness_addendum.md", project_root))
+
+
+def load_ask_user_suffix(project_root: Path) -> str:
+    """Read ``orgs/_shared/ask_user_suffix.md`` -> the ask-user turn-ending
+    suffix (ready for ``ctx.ask_user_text``). Falls back to the embedded
+    ``ASK_USER_PROMPT_SUFFIX`` when the file is absent. Same pattern as
+    ``load_harness_addendum`` — CWD-independent."""
+    from pux_harness.kit.loaders import load_shared_prompt_body
+
+    body = load_shared_prompt_body("ask_user_suffix.md", project_root)
+    return body or ASK_USER_PROMPT_SUFFIX
+
+
+def load_dynamic_dispatch_suffix(project_root: Path) -> str:
+    """Read ``orgs/_shared/dynamic_dispatch_suffix.md`` -> the eval-tool dispatch
+    strategy (ready for ``ctx.dynamic_dispatch_text``). Falls back to the
+    embedded ``_DYNAMIC_DISPATCH_SUFFIX`` when the file is absent. Same pattern
+    as ``load_harness_addendum`` — CWD-independent."""
+    from pux_harness.kit.loaders import load_shared_prompt_body
+
+    body = load_shared_prompt_body("dynamic_dispatch_suffix.md", project_root)
+    return body or _DYNAMIC_DISPATCH_SUFFIX
+
+
+def build_extra_parts(
+    entries: Sequence[Any],
+    org: str,
+    org_dir: Path,
+    scope: "PromptScope",
+) -> tuple["PromptPartSpec", ...]:
+    """Build always-on ``PromptPartSpec`` instances from a profile.yaml
+    ``extra_prompt_parts:`` list, filtered to ``scope``. Each entry:
+
+    ``{name: <str>, file: <rel-path>, scope: [supervisor, subagent]}``
+
+    * ``name`` — unique provenance label (appears in ``pux prompt show``).
+    * ``file`` — path relative to the org's own directory (e.g.
+      ``extra/my_section.md`` -> ``orgs/specialists/<org>/extra/my_section.md``).
+    * ``scope`` — optional list of ``"supervisor"`` and/or ``"subagent"``
+      (default: both). Controls which prompt(s) the part appears in.
+
+    Content is the file body, read ONCE at build time and captured in a closure
+    (always-on — conditional logic still requires Python; this is the
+    file-injection escape hatch for experimenters who need a named, ordered,
+    scope-targeted section without touching code). Returns ``()`` when
+    ``entries`` is empty / no entry matches ``scope``.
+
+    THIS function owns only the list->specs transform; the CALLER resolves the
+    chain-merged ``extra_prompt_parts`` list (runtime: ``_resolved_profile_yaml``;
+    introspection: chain walk) and the org directory path.
+    """
+    scope_name = scope.value  # "supervisor" | "subagent"
+    out: list[PromptPartSpec] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            msg = f"{org}: extra_prompt_parts: entry must be a mapping, got {type(entry).__name__}"
+            raise TypeError(msg)
+        name = entry.get("name")
+        file_rel = entry.get("file")
+        if not name or not file_rel:
+            msg = (f"{org}: extra_prompt_parts: each entry needs `name` and `file`, "
+                   f"got {entry!r}")
+            raise ValueError(msg)
+        scopes = entry.get("scope", ["supervisor", "subagent"])
+        if scope_name not in scopes:
+            continue
+        file_path = org_dir / file_rel
+        if not file_path.is_file():
+            msg = (f"{org}: extra_prompt_parts: `file: {file_rel}` not found "
+                   f"(resolved to {file_path})")
+            raise FileNotFoundError(msg)
+        body = file_path.read_text()
+        # Capture body in the default arg (closure-safe across loop iterations).
+        out.append(PromptPartSpec(
+            name=name,
+            scope=frozenset({scope}),
+            build=lambda ctx, b=body: b,
+        ))
+    return tuple(out)
 
 
 # --- the dynamic-dispatch upgrade notice + its mount detector ----------------
@@ -204,7 +309,7 @@ SUPERVISOR_PROMPT_PARTS: tuple[PromptPartSpec, ...] = (
     PromptPartSpec(
         name="agents_md_core",
         scope=_SUPER,
-        build=lambda ctx: f"{ctx.agents_md_base}{_ADDENDUM}",
+        build=lambda ctx: f"{ctx.agents_md_base}{ctx.harness_addendum or _ADDENDUM}",
     ),
     PromptPartSpec(
         name="org_system_prompt_suffix",
@@ -214,12 +319,12 @@ SUPERVISOR_PROMPT_PARTS: tuple[PromptPartSpec, ...] = (
     PromptPartSpec(
         name="ask_user_suffix",
         scope=_SUPER,
-        build=lambda ctx: ASK_USER_PROMPT_SUFFIX if ctx.ask_user_active else None,
+        build=lambda ctx: (ctx.ask_user_text or ASK_USER_PROMPT_SUFFIX) if ctx.ask_user_active else None,
     ),
     PromptPartSpec(
         name="dynamic_dispatch_suffix",
         scope=_SUPER,
-        build=lambda ctx: _DYNAMIC_DISPATCH_SUFFIX if ctx.interpreter_mounted else None,
+        build=lambda ctx: (ctx.dynamic_dispatch_text or _DYNAMIC_DISPATCH_SUFFIX) if ctx.interpreter_mounted else None,
     ),
 )
 
@@ -256,4 +361,9 @@ __all__ = [
     "_DYNAMIC_DISPATCH_SUFFIX",
     "_interpreter_mounted",
     "assemble_prompt",
+    "build_extra_parts",
+    "load_ask_user_suffix",
+    "load_dynamic_dispatch_suffix",
+    "load_harness_addendum",
+    "resolve_harness_addendum",
 ]

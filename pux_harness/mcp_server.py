@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import mimetypes
 import os
 import re
 import sys
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -290,9 +293,9 @@ class OrgConnection:
             for attempt in range(3):
                 try:
                     self.client.reset(session_id)
-                    # acp.py:prompt(self, prompt, session_id) — prompt (content
-                    # blocks) FIRST, session_id SECOND (see commit d897336).
-                    resp = await self.conn.prompt(blocks, session_id)
+                    # Use keyword args to bypass @param_model reordering
+                    # of positional args to match PromptRequest field order.
+                    resp = await self.conn.prompt(prompt=blocks, session_id=session_id)
                     msgs = self.client.messages(session_id)
                     text = "\n".join(msgs) if msgs else ""
                     thoughts = "\n".join(self.client.thoughts(session_id))
@@ -886,6 +889,203 @@ async def read_file(path: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# multimodal_read — direct image→text tool for non-visual clients.
+#
+# The host-side twin of the in-sandbox `describe_image` tool. The outer Claude
+# Code drives a TEXT-ONLY model that cannot ingest image bytes; this tool hands
+# the image to the configured multimodal model (mimo-v2.5 via OpenRouter) and
+# returns its textual report. ONE model call, in-process — no org, no subagent,
+# no sandbox, no media server. Rides this `pux` MCP server (already in
+# ~/.claude.json), so it is auto-granted to the outer Claude Code exactly the
+# way deploy_browser_agent is: adding the tool here IS the grant.
+#
+# Accepts MULTIPLE image formats, not just base64: host file path, HTTP(S) URL,
+# or data: URI. Reuses the harness's own `_invoke_primary_media` so the wire
+# format + non-answer vetting stay byte-identical to what the agents send.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_VISION_MODELS: dict[str, Any] = {}
+_MAX_IMAGE_BYTES = _MAX_STAGE_BYTES  # 50 MB — shared with stage_file/read_file
+_MAX_IMAGES_PER_CALL = 8  # comparative panels, not a bulk-import path
+
+
+# Specialty prompts — bake in an OBJECTIVE rubric so vision judgments are
+# repeatable instead of the free-form prose that made mimo-v2.5 wobble on
+# near-identical textures (7.5 vs 3 on byte-identical inputs). An explicit
+# caller ``prompt`` always wins over a mode; the mode is the fallback default.
+_MEDIA_MODE_PROMPTS: dict[str, str] = {
+    "texture_quality": (
+        "You are a 3D mesh/texture quality auditor. Score on OBJECTIVE, "
+        "REPEATABLE criteria — no free-form prose. For each axis give a 0–10 "
+        "score and a one-sentence, evidence-grounded justification:\n"
+        "1. Sharpness/detail — high-frequency content, edge crispness (blurry? aliased?).\n"
+        "2. Seam/artifact visibility — UV seams, texture stretching, mip seams, color bleed.\n"
+        "3. Color/uniformity — per-region variance, banding, lighting inconsistency across the surface.\n"
+        "4. Overall fidelity — does it read as the intended material at a glance?\n"
+        "If multiple images are attached, score EACH independently, then rank them.\n"
+        "End with exactly one line: OVERALL: <n>/10\n"
+        "Be deterministic: byte-identical inputs MUST yield identical scores."
+    ),
+    "which_panel": (
+        "You are given one or more image panels. Answer ONLY the caller's "
+        "question about which panel(s) match the stated criterion. Reply with "
+        "the panel label and a one-sentence reason. If none match, say so "
+        "explicitly. Do not describe unrelated content."
+    ),
+}
+
+
+def _get_vision_model(model_id: str | None = None) -> Any:
+    """Lazy multimodal model, cached per id (default ``mimo-v2.5``).
+    ``ChatOpenAI`` construction is pure config (no network), so caching the
+    client per id is safe and avoids rebuilding on every call."""
+    mid = model_id or "mimo-v2.5"
+    m = _VISION_MODELS.get(mid)
+    if m is None:
+        from pux_harness.agent.model import get_model  # noqa: PLC0415 — lazy
+        m = get_model(model=mid)
+        _VISION_MODELS[mid] = m
+    return m
+
+
+def _resolve_prompt(prompt: str | None, mode: str | None) -> str:
+    """Explicit ``prompt`` wins; else the mode's rubric; else the generic default."""
+    if prompt:
+        return prompt
+    if mode:
+        if mode not in _MEDIA_MODE_PROMPTS:
+            raise ValueError(
+                f"unknown mode {mode!r}; available: {sorted(_MEDIA_MODE_PROMPTS)}")
+        return _MEDIA_MODE_PROMPTS[mode]
+    return ("Describe this image concisely. Focus on text, key "
+            "elements, and notable features.")
+
+
+def _invoke_multi_image(
+    model: object, blocks: list[tuple[str, str]], prompt: str,
+) -> str:
+    """Send 1..N images to the multimodal model in ONE message and return its
+    text. Reuses ``_media_content_block`` + ``_model_text_or_raise`` so the wire
+    format and non-answer vetting stay identical to the single-image path."""
+    from langchain_core.messages import HumanMessage  # noqa: PLC0415 — lazy
+    from pux_harness.sandbox.tools._media import (  # noqa: PLC0415 — lazy
+        _media_content_block, _model_text_or_raise,
+    )
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for b64, mime in blocks:
+        content.append(_media_content_block("image", b64, mime))
+    resp = model.invoke([HumanMessage(content=content)])
+    return _model_text_or_raise(resp, "image")
+
+
+def _guess_image_mime(path: str) -> str:
+    return mimetypes.guess_type(path)[0] or "image/png"
+
+
+def _acquire_image(image: str) -> tuple[str, str]:
+    """Resolve an image reference to ``(base64, mime)``. Accepts a host file
+    path, an HTTP(S) URL, or a ``data:`` URI — the "multiple image formats, not
+    just base64" surface. Raises on fetch failure / missing file / oversize."""
+    if image.startswith("data:"):
+        m = re.match(r"data:([^;,]+)(?:;[^;,]*)*;base64,(.+)", image, re.DOTALL)
+        if not m:
+            raise ValueError("malformed data: URI (expected data:<mime>;base64,<...>)")
+        return m.group(2), m.group(1)
+    if image.startswith(("http://", "https://")):
+        with urllib.request.urlopen(image, timeout=60) as r:  # noqa: S310 — operator-supplied URL
+            raw = r.read()
+        if len(raw) > _MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"image too large ({len(raw):,} bytes; "
+                f"cap {_MAX_IMAGE_BYTES // (1024 * 1024)} MB)")
+        mime = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+        return base64.b64encode(raw).decode("ascii"), mime or _guess_image_mime(image)
+    # host file path
+    p = Path(image)
+    if not p.is_file():
+        raise FileNotFoundError(f"no such image file: {image!r}")
+    raw = p.read_bytes()
+    if len(raw) > _MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"image too large ({len(raw):,} bytes; "
+            f"cap {_MAX_IMAGE_BYTES // (1024 * 1024)} MB)")
+    return base64.b64encode(raw).decode("ascii"), _guess_image_mime(image)
+
+
+@MCP.tool()
+async def multimodal_read(
+    image: str = "",
+    prompt: str = "",
+    images: list[str] | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    mode: str | None = None,
+) -> str:  # noqa: ANN201
+    """Read one or more images and return a text description — for clients whose
+    driving model cannot see images (text-only orchestrators like the outer Claude Code).
+
+    This is the multimodal-read wrapper: it hands the image(s) to the configured
+    multimodal model (default mimo-v2.5) and returns the model's textual report.
+    No browser, no subagent — a single model call in-process.
+
+    Each image reference accepts multiple formats, not just base64:
+      - a host file path (e.g. /home/user/pics/foo.png)
+      - an HTTP(S) URL — point this straight at ComfyUI's /view endpoint to skip
+        the docker-cp container→host copy, e.g.
+        http://127.0.0.1:18465/view?filename=render.png
+      - a data: URI (e.g. data:image/png;base64,iVBOR...)
+
+    Args:
+        image: A single image reference (path / URL / data-URI). Optional when
+            ``images`` is supplied.
+        prompt: Optional question or instruction for the model. Wins over ``mode``.
+        images: Optional list of references for multi-image / comparative calls
+            (panel sheets, A/B texture comparisons). If given with ``image``,
+            ``image`` is prepended. Cap 8 per call.
+        model: Override the vision model id (default ``mimo-v2.5``). Route to a
+            steadier model when one is available for repeatable judgments.
+        temperature: Override sampling temperature (e.g. ``0`` for determinism).
+        mode: Specialty prompt mode. ``"texture_quality"`` forces an objective
+            0–10 rubric (sharpness, seams, color uniformity) so scores are
+            repeatable instead of free-form prose; ``"which_panel"`` constrains
+            answers to panel selection. Ignored when ``prompt`` is set.
+
+    Returns:
+        The model's text, or ``Error: ...`` on failure (fetch error, model error).
+    """
+    refs: list[str] = list(images) if images else []
+    if image:
+        refs.insert(0, image)
+    if not refs:
+        return ("Error: no image supplied. Pass `image` (single) or `images` "
+                "(a list of path / URL / data-URI references).")
+    if len(refs) > _MAX_IMAGES_PER_CALL:
+        return (f"Error: too many images ({len(refs)}; cap "
+                f"{_MAX_IMAGES_PER_CALL}). Send fewer, or tile them.")
+
+    try:
+        blocks = [_acquire_image(r) for r in refs]
+    except Exception as exc:  # noqa: BLE001 — surface a useful string to the caller
+        return f"Error acquiring image(s): {exc}"
+    try:
+        text = _resolve_prompt(prompt, mode)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    try:
+        m = _get_vision_model(model)
+        if temperature is not None:
+            m = m.bind(temperature=temperature)
+        via = model or "mimo-v2.5"
+        n = len(blocks)
+        label = f"{n} image{'s' if n != 1 else ''}"
+        desc = await asyncio.to_thread(_invoke_multi_image, m, blocks, text)
+        return f"[multimodal_read via {via} — {label}]\n{desc}"
+    except Exception as exc:  # noqa: BLE001 — never crash the MCP client
+        return f"Error reading image(s) (model call failed): {exc}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # deploy_browser_agent — the one-function browser/multimedia entry point.
 # No session management: Claude Code (or any MCP client) calls this with a
 # natural-language task; a fresh browser-agent session runs it to completion
@@ -895,22 +1095,77 @@ async def read_file(path: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# deploy_browser_agent — non-blocking fire + browser_status poll pattern.
+#
+# WHY NON-BLOCKING: the previous synchronous version blocked the MCP caller
+# for 30-90+ seconds with zero visibility. Outer agents (Claude Code) could
+# not tell whether the task was running, hung, or silently failing — they
+# hallucinated "let me check its status" with no tool to actually do so,
+# then wandered into dead-end "verify the deployment" plans. The fire-and-
+# status split gives the caller a real progress probe (browser_status)
+# instead of a black-box wait. This is the durable fix for the recurring
+# "browser agent isn't producing traffic" symptom.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# In-memory progress tracker for deploy_browser_agent tasks. Keyed by sid.
+# State machine: running → done | error. Lost on server restart — the
+# underlying session persists in the agent-protocol store regardless and
+# can be resumed via load_session + prompt. Entries are NOT TTL-evicted:
+# a browser task's progress is small and the operator may poll minutes
+# later to read the result.
+_BROWSER_TASKS: dict[str, dict] = {}
+
+# Strong refs to background asyncio tasks so the scheduler doesn't GC them
+# mid-run (CPython drops tasks with no external reference). The task
+# removes itself via add_done_callback on completion.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+async def _run_browser_task(sid: str, oc: "OrgConnection", task: str) -> None:
+    """Background runner for deploy_browser_agent. Updates ``_BROWSER_TASKS[sid]``
+    as the agent works. Fire-and-forget: the caller already got the sid and
+    will poll ``browser_status``.
+
+    Captures any exception (mid-turn crash, stream stall, provider 5xx, sandbox
+    hiccup) into the progress dict so the caller sees ``state=error`` with a
+    resume hint — the session persists in the agent-protocol store regardless
+    of whether THIS turn completed.
+    """
+    progress = _BROWSER_TASKS[sid]
+    try:
+        text, _thoughts, stop, agent_images = await oc.prompt(sid, task)
+        progress["state"] = "done"
+        progress["text"] = text or "(no response)"
+        progress["stop_reason"] = stop
+        progress["images"] = agent_images
+        progress["finished_at"] = time.time()
+    except Exception as exc:  # noqa: BLE001 — record + keep session recoverable
+        progress["state"] = "error"
+        progress["error"] = f"{type(exc).__name__}: {exc}"
+        progress["finished_at"] = time.time()
+
+
 @MCP.tool()
 async def deploy_browser_agent(task: str):  # noqa: ANN201
     """Deploy a one-shot browser/multimedia task to the browser-agent.
 
+    NON-BLOCKING (fire-and-forget): returns immediately with a session_id
+    after launching the task in the background. Poll progress with
+    ``browser_status(session_id=<sid>)`` every 5-15 seconds — typical
+    browser tasks take 30-90s. When status returns ``state=done``, the
+    response includes the agent's text plus any screenshots (as native
+    MCP image content blocks you can SEE, not just paths).
+
     The browser-agent drives a persistent SeleniumBase Chrome session inside
     an isolated sandbox — it can navigate, click, type, scroll, screenshot,
-    fill forms, download files, and describe images (vision). Hand it a goal
-    in natural language; it browses the live web to complete it and returns
-    the result text plus any screenshots it captured (as inline image content
-    you can SEE, not just paths).
+    fill forms, download files, and describe images (vision).
 
-    This is the single-function browser entry point — no ``new_session`` /
-    ``prompt`` / session-id bookkeeping. Each call spins a fresh agent
-    session on the ``browser-agent`` org, runs to completion, and returns.
-    The underlying Chrome + sandbox container persist across calls (warm
-    boot), so repeated calls are fast.
+    The session_id is durable — it persists in the agent-protocol store even
+    if this MCP server restarts mid-task. On any failure (mid-turn crash,
+    stream stall, provider 5xx), ``browser_status`` returns ``state=error``
+    with a resume hint; the conversation still exists and can be continued
+    via ``load_session`` + ``prompt``.
 
     Examples of good tasks:
       - "Go to https://example.com and tell me what the page offers."
@@ -923,44 +1178,128 @@ async def deploy_browser_agent(task: str):  # noqa: ANN201
             and the desired outcome.
 
     Returns:
-        The agent's text response, plus any images it produced (returned as
-        native MCP image content blocks AND persisted to data/staged/ so they
-        survive across calls). On an infrastructure error, returns an
-        ``Error: ...`` string.
+        Confirmation text with the session_id. Poll
+        ``browser_status(session_id=<sid>)`` for the actual result. On
+        infra errors before session creation, returns an ``Error: ...``
+        string.
     """
-    # Capture sid BEFORE the call that can raise, so a transient mid-turn
-    # failure (model stream stall, provider 5xx, sandbox hiccup) NEVER costs
-    # the whole subagent conversation. The session and its prior checkpoints
-    # persist in the agent-protocol store regardless of whether THIS turn
-    # completed; surfacing the id lets the caller resume instead of losing
-    # everything. This is the fix for "it breaks the subagent, then I lose
-    # the entire conversation."
-    sid: str | None = None
     try:
         oc = await _get_org("browser-agent")
         sid = await oc.new_session()
-        text, _thoughts, stop, agent_images = await oc.prompt(sid, task)
-    except Exception as exc:  # noqa: BLE001 — surface infra failures, KEEP the session recoverable
-        if sid:
-            return (
-                f"Error deploying browser-agent (session {sid} — RECOVERABLE): {exc}\n\n"
-                f"The subagent turn failed mid-flight but the conversation still exists. "
-                f"Resume it with load_session(session_id={sid!r}) then "
-                f"prompt(session_id={sid!r}, message=\"...\")."
-            )
+    except Exception as exc:  # noqa: BLE001 — infra errors before session exists
         return f"Error deploying browser-agent (no session was created): {exc}"
 
-    parts: list[str] = [text or "(no response)", f"\n*[{stop}]*"]
+    # Register the progress tracker BEFORE the background task starts so a
+    # quick browser_status call can't race the dict update.
+    _BROWSER_TASKS[sid] = {
+        "state": "running",
+        "started_at": time.time(),
+        "finished_at": None,
+        "task": task,
+        "text": None,
+        "stop_reason": None,
+        "images": [],
+        "error": None,
+    }
 
-    # Persist + inline images (mirrors the prompt() tool's asset passthrough:
-    # files are the durable copy, MCP image blocks are the zero-friction
-    # display path so the client sees screenshots without a read_file round-trip).
-    if agent_images:
+    # Fire the prompt as a background task. Hold a strong ref in _BG_TASKS
+    # so the asyncio scheduler doesn't GC it mid-run (CPython drops tasks
+    # with no external reference — see asyncio docs).
+    bg = asyncio.create_task(_run_browser_task(sid, oc, task))
+    _BG_TASKS.add(bg)
+    bg.add_done_callback(_BG_TASKS.discard)
+
+    return (
+        f"Browser task started (running in background).\n"
+        f"  session_id: `{sid}`\n"
+        f"  task: {task[:200]}\n"
+        f"\n"
+        f"Poll progress with browser_status(session_id={sid!r}). "
+        f"Returns state=running while working, state=done with the result + "
+        f"screenshots when complete, state=error with a resume hint on "
+        f"failure. Typical tasks take 30-90s; poll every 5-15s."
+    )
+
+
+@MCP.tool()
+async def browser_status(session_id: str):  # noqa: ANN201
+    """Check the status of a ``deploy_browser_agent`` task.
+
+    The real status probe the outer agent was missing. Poll every 5-15
+    seconds. Stop polling once ``state`` is ``done`` or ``error``.
+
+    Args:
+        session_id: From ``deploy_browser_agent``'s return value.
+
+    Returns:
+        On ``running``: state + elapsed seconds + the original task.
+        On ``done``: state + the agent's text + image content blocks for
+            any screenshots (also persisted to ``data/staged/``).
+        On ``error``: state + the exception + a resume hint (load_session +
+            prompt) — the conversation still exists in the store.
+        If the session_id isn't a deploy_browser_agent task (e.g. created
+            via new_session, or the server restarted): explains the mismatch
+            and lists currently-active tasks.
+    """
+    progress = _BROWSER_TASKS.get(session_id)
+    if progress is None:
+        # In-memory tracker has no entry. Causes:
+        #   - server restarted (progress wiped; session persists in store)
+        #   - created via new_session + prompt (not deploy_browser_agent)
+        #   - typo
+        active = [s for s, p in _BROWSER_TASKS.items() if p["state"] == "running"]
+        return (
+            f"No deploy_browser_agent task found for `{session_id}`. This can "
+            f"happen if the server restarted (in-memory progress is wiped, but "
+            f"the session persists in the store — use list_sessions + "
+            f"load_session + prompt to continue), or if the session was "
+            f"created via new_session instead of deploy_browser_agent.\n"
+            f"Active browser tasks: {active or 'none'}."
+        )
+
+    elapsed = (progress["finished_at"] or time.time()) - progress["started_at"]
+    state = progress["state"]
+    task_preview = progress["task"][:200]
+
+    if state == "running":
+        return (
+            f"**Browser task `{session_id}`** — running, {elapsed:.1f}s elapsed\n"
+            f"task: {task_preview}\n"
+            f"\nStill working. Poll again in 5-15s."
+        )
+
+    if state == "error":
+        return (
+            f"**Browser task `{session_id}`** — error after {elapsed:.1f}s\n"
+            f"task: {task_preview}\n"
+            f"\n**Error:** {progress['error']}\n"
+            f"\nThe subagent turn failed mid-flight but the conversation still "
+            f"exists. Resume it with load_session(session_id={session_id!r}, "
+            f"org='browser-agent') then prompt(session_id={session_id!r}, "
+            f"message='...')."
+        )
+
+    # state == "done"
+    text = progress["text"]
+    images = progress["images"] or []
+    stop = progress["stop_reason"]
+
+    parts: list[str] = [
+        f"**Browser task `{session_id}`** — done in {elapsed:.1f}s",
+        f"task: {task_preview}",
+        f"\n*[{stop}]*",
+        f"\n**Result:**",
+        text or "(no response)",
+    ]
+
+    # Persist + surface images as MCP image content blocks (so the client
+    # sees screenshots natively, not just file paths). Mirrors the original
+    # synchronous deploy_browser_agent asset-passthrough behavior.
+    if images:
         _STAGED_HOST_DIR.mkdir(parents=True, exist_ok=True)
-        import time  # noqa: PLC0415
         ts = int(time.time())
         saved_paths: list[str] = []
-        for i, img in enumerate(agent_images):
+        for i, img in enumerate(images):
             ext = "png" if "png" in img["mime_type"] else "jpg"
             fname = f"browser_agent_{ts}_{i}.{ext}"
             try:
@@ -974,7 +1313,7 @@ async def deploy_browser_agent(task: str):  # noqa: ANN201
             for p in saved_paths:
                 parts.append(f"  `{p}`")
         content: list = [MCPTextContent(type="text", text="\n".join(parts))]
-        for img in agent_images:
+        for img in images:
             content.append(MCPImageContent(
                 type="image",
                 data=img["data"],
@@ -982,6 +1321,7 @@ async def deploy_browser_agent(task: str):  # noqa: ANN201
             ))
         return content
     return "\n".join(parts)
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════

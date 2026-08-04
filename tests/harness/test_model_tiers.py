@@ -218,9 +218,9 @@ def test_dcode_model_ref_default(monkeypatch):
     """The TUI forwards the resolved base model as ``<provider>:<id>`` so dcode
     never falls back to its own default (deepseek-v4-flash drift)."""
     monkeypatch.delenv("PUX_TIER", raising=False)
-    assert model.dcode_model_ref(role="base") == "opencode-go-openai:glm-5.2"
+    assert model.dcode_model_ref(role="base") == "pux-openai:glm-5.2"
     monkeypatch.setenv("PUX_TIER", "fast")
-    assert model.dcode_model_ref(role="base") == "opencode-go-openai:mimo-v2.5"
+    assert model.dcode_model_ref(role="base") == "pux-openai:mimo-v2.5"
 
 
 def test_dcode_model_ref_none_when_no_provider(tmp_path, monkeypatch, _spec_cleared):
@@ -244,4 +244,4 @@ def test_dcode_model_ref_literal_override(monkeypatch):
     monkeypatch.delenv("PUX_TIER", raising=False)
     assert model.dcode_model_ref(
         role="base", model="kimi-k2.7-code",
-    ) == "opencode-go-openai:kimi-k2.7-code"
+    ) == "pux-openai:kimi-k2.7-code"

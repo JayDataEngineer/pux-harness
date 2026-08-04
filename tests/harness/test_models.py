@@ -8,7 +8,7 @@ typo fails ``--check-contract``.
 
 Token- and Docker-free: ``resolve_model_id`` never builds a ``ChatOpenAI``.
 ``get_model`` IS exercised (it builds one) — tests set a throwaway
-``OPENCODE_API_KEY``; no real chat happens.
+``OPENROUTER_API_KEY``; no real chat happens.
 """
 from __future__ import annotations
 
@@ -203,20 +203,18 @@ def test_models_block_peeled_from_harness_config(fake_org_tree):
 def test_get_model_builds_on_resolved_id(monkeypatch):
     """``get_model`` builds a ChatOpenAI whose ``model_name`` is the resolved
     role id (proves the provider-config wiring without a real chat)."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     m = model.get_model(role="grader")
     assert isinstance(m, ChatOpenAI)
-    assert m.model_name == "mimo-v2.5"
+    assert m.model_name == "xiaomi/mimo-v2.5"  # wire_id remaps the short id on the wire
 
 
 def test_get_model_literal_override(monkeypatch):
     """``get_model(model=...)`` builds on the literal id (the subagent-
     frontmatter override path). Covers BOTH provider kinds: glm-5.2 (anthropic)
     and mimo-v2.5 (openai) — each builds on its own profile's protocol."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     assert _model_id(model.get_model(model="glm-5.2")) == "glm-5.2"
-    assert _model_id(model.get_model(model="mimo-v2.5")) == "mimo-v2.5"
+    assert _model_id(model.get_model(model="mimo-v2.5")) == "xiaomi/mimo-v2.5"  # wire_id
 
 
 # --- per-role declared fallback chains -------------------------------------
@@ -238,7 +236,7 @@ def test_fallback_keys_align_with_roles():
 
 def test_shipped_default_base_has_fallback_chain():
     """The shipped default tier declares a base fallback chain (cross-provider
-    escape: glm-5.2 zai-coding → mimo-v2.5-pro opencode-go)."""
+    escape: glm-5.2 zai-coding → mimo-v2.5-pro openrouter)."""
     assert model.resolve_fallback_ids(role="base") == ["mimo-v2.5-pro"]
 
 
@@ -294,7 +292,6 @@ def test_get_model_attaches_fallback_chain(monkeypatch):
     ``deepagents.resolve_model``). The primary id is still the resolved role id;
     the chain ids are the declared fallbacks. Proves the rely-on-upstream wiring
     (LangChain ``with_fallbacks``) without a live call."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     m = model.get_model(role="base")
     # MUST be a BaseChatModel — deepagents' resolve_model fast-path requires it.
@@ -302,7 +299,7 @@ def test_get_model_attaches_fallback_chain(monkeypatch):
     # And NOT a RunnableWithFallbacks (the pre-fix shape that crashed serve startup).
     assert not isinstance(m, RunnableWithFallbacks)
     assert _model_id(m) == "glm-5.2"
-    assert [_model_id(fb) for fb in m._fallback_models] == ["mimo-v2.5-pro"]
+    assert [_model_id(fb) for fb in m._fallback_models] == ["xiaomi/mimo-v2.5-pro"]  # wire_id
 
 
 def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
@@ -314,7 +311,6 @@ def test_fallback_model_passes_deepagents_resolve_model_seam(monkeypatch):
     ('ReasoningChatOpenAI' object has no attribute 'count') → Aegra
     startup crash. This is the EXACT gap that let the regression ship: bind_tools
     was proven but the model was never driven through the real deepagents seam."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     from deepagents._models import resolve_model
     m = model.get_model(role="base")
@@ -329,7 +325,6 @@ def test_fallback_model_builds_in_real_deepagent_factory(monkeypatch):
     AttributeError). Building binds tools internally; proving the factory accepts
     the model is the strongest guarantee that Aegra boots. No network —
     the model is never invoked, only assembled."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     from deepagents import create_deep_agent
     m = model.get_model(role="base")
@@ -345,7 +340,6 @@ def test_fallback_model_builds_in_real_deepagent_factory(monkeypatch):
 def test_get_model_without_fallbacks_is_plain_chat(monkeypatch):
     """A role with no declared chain returns a plain ChatOpenAI (no wrapper) —
     zero behavior change for non-fallback roles."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     m = model.get_model(role="grader")
     assert not isinstance(m, RunnableWithFallbacks)
     assert isinstance(m, ChatOpenAI)
@@ -355,7 +349,6 @@ def test_get_model_override_skips_fallback_chain(monkeypatch):
     """An explicit ``model=`` literal returns a plain model on that id — the
     tier chain is NOT attached (a hard pin has no failover). glm-5.2 is served
     via the anthropic profile, so the plain model is a ``ChatAnthropic``."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-key")
     m = model.get_model(role="base", model="glm-5.2")
     assert not isinstance(m, RunnableWithFallbacks)
@@ -366,7 +359,6 @@ def test_bind_tools_flows_through_fallback_chain(monkeypatch):
     """``with_fallbacks`` propagates ``.bind_tools`` to every model in the chain
     — the load-bearing precondition for deepagents, which binds tools AFTER
     ``get_model`` returns. If this breaks, the supervisor's tool surface vanishes."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
     m = model.get_model(role="base")
     bound = m.bind_tools([{"name": "t", "description": "d", "input_schema": {}}])
     assert isinstance(bound, RunnableWithFallbacks)

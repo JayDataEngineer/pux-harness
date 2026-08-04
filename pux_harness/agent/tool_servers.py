@@ -101,7 +101,7 @@ def _substitute_spec(
     permissive: bool = False,
 ) -> ToolServerSpec:
     """Return a copy of ``spec`` with ``${VAR}`` placeholders resolved in
-    ``url``, ``headers`` values, and ``env`` values.
+    ``url``, ``headers`` values, ``env`` values, ``command``, and ``args``.
 
     Raises ``ValueError`` on any unresolved placeholder or missing credential.
     When ``permissive=True`` (the offline-contract path), unresolved
@@ -112,7 +112,12 @@ def _substitute_spec(
     ``--check-contract`` offline while still failing loud at load time if the
     operator forgot to set the var. Credential checks still raise in both modes
     (a declared credential absent from env is reported as its own contract
-    error, not swallowed)."""
+    error, not swallowed).
+
+    ``command`` and ``args`` expansion supports stdio servers that need to
+    reference dynamic state — the sandbox-browser MCP server uses
+    ``${PUX_SANDBOX_CONTAINER}`` so the same catalog works across sandbox
+    boots (the container name changes per session: ``orchestrator-sandbox-p<hash>``)."""
     e = os.environ if env is None else dict(env)
     missing_creds = [c for c in spec.credentials if not e.get(c, "")]
     if missing_creds:
@@ -137,14 +142,16 @@ def _substitute_spec(
     url = _resolve(spec.url, "url")
     headers = {k: _resolve(v, f"header {k}") for k, v in spec.headers.items()}
     env_resolved = {k: _resolve(v, f"env {k}") for k, v in spec.env.items()}
+    command = _resolve(spec.command, "command")
+    args = [_resolve(a, "args") for a in spec.args]
     return ToolServerSpec(
         name=spec.name,
         kind=spec.kind,
         transport=spec.transport,
         url=url,
         headers=headers,
-        command=spec.command,
-        args=list(spec.args),
+        command=command,
+        args=args,
         env=env_resolved,
         tools=list(spec.tools) if spec.tools is not None else None,
         credentials=list(spec.credentials),

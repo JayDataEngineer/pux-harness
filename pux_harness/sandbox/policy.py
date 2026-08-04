@@ -110,6 +110,70 @@ class Rule:
 
 
 @dataclass
+class LlmEndpoint:
+    """The resolved LLM endpoint for ``sandbox.llm: <role>``. The harness
+    resolves this from the single source of truth (``pux_harness/agent/
+    models.yaml``) and PASSES it directly into the sandbox env — sandbox
+    scripts (entity_extract, content_cluster, context_engine, …) are dumb
+    consumers that read ``LLM_API_URL`` / ``LLM_MODEL`` / ``LLM_API_KEY`` and
+    NEVER re-resolve the provider, model, or key. One shared pattern for every
+    org that needs LLM access in its sandbox scripts; the org declares a ROLE
+    (``worker`` / ``base`` / ``multimodal`` / ``grader``) and the harness does
+    the rest — models.yaml is the only place provider URLs, model ids, and
+    key-env names live."""
+    model_id: str        # e.g. "mimo-v2.5"
+    api_url: str         # e.g. "https://openrouter.ai/api/v1/chat/completions"
+    api_key_env: str     # the env var NAME holding the key, e.g. "OPENROUTER_API_KEY"
+    egress_host: str     # the provider hostname, for egress auto-allowance
+    egress_port: int     # 443 for https, 80 for http
+
+
+def _resolve_llm_endpoint(role: str) -> LlmEndpoint:
+    """Resolve ``sandbox.llm: <role>`` to a concrete ``LlmEndpoint`` via the
+    harness model tier (``models.yaml``).
+
+    This is the ONLY ``pux_harness.sandbox`` → ``pux_harness.agent`` seam, and
+    it is a FUNCTION-LOCAL (lazy) import — the sandbox layer has ZERO
+    module-level dependency on the agent layer. The import fires ONLY when an
+    org declares ``sandbox.llm``, so orgs that don't (coder, browser-agent,
+    …) never pay the cost and the layer boundary stays intact for them.
+
+    Raises ``PolicyError`` loudly when the role resolves to a non-OpenAI-
+    compatible provider (sandbox scripts speak ``/chat/completions``; an
+    anthropic-kind endpoint can't serve them) or when the provider base_url
+    can't be parsed."""
+    from urllib.parse import urlparse  # noqa: PLC0415
+    from pux_harness.agent import model as _model  # noqa: PLC0415
+    model_id = _model.resolve_model_id(role=role)
+    prof = _model._provider_for_model(model_id)
+    base_url = prof["base_url"]
+    api_key_env = prof["api_key_env"]
+    kind = prof.get("kind", "openai")
+    if kind != "openai":
+        raise PolicyError(
+            f"sandbox.llm: role {role!r} resolves to {model_id!r} served by "
+            f"provider kind {kind!r}; sandbox scripts require an OpenAI-compatible "
+            f"endpoint (/chat/completions). Repoint the model to an openai-kind "
+            f"provider in models.yaml."
+        )
+    api_url = f"{base_url}/chat/completions"
+    parsed = urlparse(base_url)
+    egress_host = parsed.hostname or ""
+    if not egress_host:
+        raise PolicyError(
+            f"sandbox.llm: could not parse hostname from provider base_url {base_url!r}"
+        )
+    egress_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return LlmEndpoint(
+        model_id=_model.wire_id_for(model_id),  # wire name sent to provider (e.g. xiaomi/mimo-v2.5)
+        api_url=api_url,
+        api_key_env=api_key_env,
+        egress_host=egress_host,
+        egress_port=egress_port,
+    )
+
+
+@dataclass
 class Egress:
     allow: list[Rule] = field(default_factory=list)
 
@@ -195,6 +259,15 @@ class SandboxSpec:
     # pulls from the operator's env, not the policy file). Absent/empty -> no
     # static env (today's behavior).
     env: dict[str, str] = field(default_factory=dict)
+    # ``sandbox.llm`` — opt-in LLM injection for sandbox scripts. A ROLE name
+    # (``worker`` / ``base`` / ``multimodal`` / ``grader``) resolved via the
+    # harness model tier (``models.yaml``) into ``LLM_API_URL`` / ``LLM_MODEL``
+    # / ``LLM_API_KEY`` env vars + an auto-allowed egress rule for the provider
+    # host. Lets sandbox scripts (entity_extract, content_cluster,
+    # context_engine, …) be DUMB CONSUMERS — they read the three vars and never
+    # re-resolve the provider. Single source of truth: models.yaml. Empty -> no
+    # injection (today's behavior; orgs whose scripts don't call an LLM skip it).
+    llm: str = ""
 
 
 @dataclass
@@ -205,14 +278,15 @@ class BrowserSpec:
 
 @dataclass
 class ToolSurfaceSpec:
-    """``tool_surface`` — scope the SUPERVISOR's specialist tool surface by
-    capability group. ``groups`` is an ALLOWLIST of group names (``code`` /
-    ``skills`` / ``media`` / ``browser`` / ``desktop``) and/or bare specialist
-    slugs (``python``); anything not listed is dropped from the supervisor's
-    own tool list (NOT from subagents — they resolve their own ``tools:``
-    allowlist against the FULL surface). Absent/empty -> the supervisor carries
-    EVERY specialist (byte-identical to today). See ``registry.resolve_tool_allowlist``
-    for the resolution + validation semantics."""
+    """``tool_surface`` — OPT-IN scoping of the SUPERVISOR's specialist tool
+    surface by capability group. ``groups`` is an ALLOWLIST of group names
+    (``code`` / ``skills`` / ``media`` / ``browser`` / ``desktop``) and/or bare
+    specialist slugs (``python``); anything not listed is dropped from the
+    supervisor's own tool list (NOT from subagents — they resolve their own
+    ``tools:`` allowlist against the FULL surface). Absent/empty -> the
+    supervisor carries NO specialist (the opt-in default; they still reach them
+    via subagents). See ``registry.resolve_tool_allowlist`` for the resolution
+    + validation semantics."""
 
     groups: list[str] = field(default_factory=list)
 
@@ -389,16 +463,19 @@ def _policy_from_dict(d: Mapping) -> Policy:
         memory_mb=int(sb.get("memory_mb", 0) or 0),
         cpu_cores=float(sb.get("cpu_cores", 0.0) or 0.0),
         env={str(k): str(v) for k, v in (sb.get("env") or {}).items()},
+        llm=str(sb.get("llm", "") or ""),
     )
     br = _section("browser")
     pol.browser = BrowserSpec(
         cookies_env=str(br.get("cookies_env", "") or ""),
         proxy=str(br.get("proxy", "") or ""),
     )
-    # tool_surface: scope the supervisor's specialist tools by capability group.
-    # Absent/empty -> ToolSurfaceSpec() (all groups) -> byte-identical to today.
-    # Entries are validated by registry.resolve_tool_allowlist (raises on an
-    # unknown group/slug) so a typo fails loud at load time, not silently.
+    # tool_surface: OPT-IN scoping of the supervisor's specialist tools by
+    # capability group. Absent/empty -> ToolSurfaceSpec() (NO groups) -> the
+    # supervisor carries NO specialist tools (the opt-in default; subagents
+    # still resolve their own tools against the FULL surface). Entries are
+    # validated by registry.resolve_tool_allowlist (raises on an unknown
+    # group/slug) so a typo fails loud at load time, not silently.
     ts = _section("tool_surface")
     groups_raw = ts.get("groups") or []
     if not isinstance(groups_raw, list):
@@ -553,6 +630,20 @@ def env_vars(p: Policy | None, env: Mapping[str, str] | None = None) -> list[str
             out.append(f"SEED_COOKIES_ENV={p.browser.cookies_env}")
     if p.browser.proxy:
         out.append(f"SB_SERVER_PROXY={p.browser.proxy}")
+    # ``sandbox.llm``: resolve the model tier (models.yaml) and inject
+    # ``LLM_API_URL`` / ``LLM_MODEL`` / ``LLM_API_KEY`` so sandbox scripts are
+    # dumb consumers. The key is looked up from the provider's ``api_key_env``
+    # in the host env — the org does NOT declare the credential (the harness
+    # resolves the env-var NAME from models.yaml too). Appended BEFORE
+    # ``sandbox.env`` so an explicit ``LLM_API_URL`` override in the env block
+    # still wins (the escape hatch).
+    if p.sandbox.llm:
+        r = _resolve_llm_endpoint(p.sandbox.llm)
+        out.append(f"LLM_API_URL={r.api_url}")
+        out.append(f"LLM_MODEL={r.model_id}")
+        api_key = e.get(r.api_key_env, "")
+        if api_key:
+            out.append(f"LLM_API_KEY={api_key}")
     # Static (non-secret) config values from ``sandbox.env``. These are the
     # service URLs / config knobs the sandbox needs to reach host-side infra
     # (SurrealDB, media-mcp, etc.). Not credentials — they live in the policy
@@ -662,12 +753,24 @@ def egress_rules(p: Policy | None) -> str:
     first (for the periodic DNS refresh script); literal IPs + container-
     resolved names get none. Empty/None policy → ``""`` (no conf staged).
 
+    When ``sandbox.llm`` is declared, the resolved provider host is auto-
+    allowed (appended to the org's explicit rules) so the org never has to
+    mirror the provider hostname in its egress list — one ``sandbox.llm``
+    declaration handles env injection AND egress.
+
     Raises ``PolicyError`` on DNS failure, a rule with no port, or an
     out-of-range port."""
-    if p is None or not p.egress.allow:
+    if p is None or (not p.egress.allow and not p.sandbox.llm):
         return ""
+    rules = list(p.egress.allow)
+    # ``sandbox.llm``: auto-allow the resolved provider host so the org's
+    # egress list doesn't have to mirror the provider hostname. The rule is
+    # computed (not stored on the policy) so the policy object stays immutable.
+    if p.sandbox.llm:
+        r = _resolve_llm_endpoint(p.sandbox.llm)
+        rules.append(Rule(host=r.egress_host, port=r.egress_port))
     lines: list[str] = []
-    for rule in p.egress.allow:
+    for rule in rules:
         if _is_container_resolved(rule.host):
             ips = [rule.host]
         else:
@@ -774,15 +877,16 @@ def job_specs(p: Policy | None) -> list[JobSpec]:
 # --- tool surface (supervisor specialist scoping) --------------------------
 
 
-def resolve_tool_allowlist(p: Policy | None) -> frozenset[str] | None:
-    """The specialist slugs the org's SUPERVISOR may carry, or ``None`` for
-    "all specialists" (byte-identical to today). Driven by
+def resolve_tool_allowlist(p: Policy | None) -> frozenset[str]:
+    """The specialist slugs the org's SUPERVISOR may carry. OPT-IN: ``None``
+    policy or empty ``groups`` -> ``frozenset()`` (NO specialists on the
+    supervisor — they still reach them via subagents). Driven by
     ``p.tool_surface.groups``; delegates the real resolution + validation to
     ``registry.resolve_tool_allowlist`` (a typo'd group/slug raises
     ``ValueError`` there, re-raised as ``PolicyError`` so the contract checker
-    reports it cleanly). ``None`` policy or empty ``groups`` -> ``None`` (all)."""
+    reports it cleanly)."""
     if p is None or not p.tool_surface.groups:
-        return None
+        return frozenset()
     from pux_harness.sandbox.tools.registry import resolve_tool_allowlist as _resolve
 
     try:

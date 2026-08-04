@@ -734,7 +734,13 @@ def main() -> None:
     """Legacy CLI entry point (argparse). Replaced by ``pux_harness.cli.main``."""
     ap = argparse.ArgumentParser(description="deepagents Pux harness")
     ap.add_argument("--org", default="general", help="org to run (default: general)")
-    ap.add_argument("--task", help="task string (required when running an agent)")
+    ap.add_argument("--task", help="the objective ONLY — never embed data paths here; "
+                                   "use --data for the data folder")
+    ap.add_argument("--data", default=None, metavar="DIR",
+                    help="data folder for the org to process. Sets DATA_DIR "
+                         "(absolute) in the agent's environment so the org's "
+                         "pipeline can preprocess it — the path never enters "
+                         "the task/prompt. This is the structural input hand-off.")
     ap.add_argument("--rubric", default=None,
                     help="override the org's shipped rubric (arms the RubricMiddleware "
                          "verify-gate for an opted-in org). Default: the org's "
@@ -797,6 +803,31 @@ def main() -> None:
     if args.check:
         run_check_smoke(args.org)
         return
+
+    # --data: the structural data-folder hand-off. Sets DATA_DIR in the
+    # agent's environment. The org's AGENTS.md references ``$DATA_DIR``
+    # — the path NEVER enters the task/prompt string. The objective is
+    # --task; the input folder is --data. They are separate concerns.
+    #
+    # Path form: RELATIVE to the project root when possible. The agent runs
+    # inside a Docker sandbox where the project is at /sandbox/workspace,
+    # not the host path. A relative path (data/telegram-dump/...) resolves
+    # correctly in BOTH contexts (host CWD = repo root, container CWD =
+    # /sandbox/workspace). An absolute host path would be invisible inside
+    # the container.
+    data_dir = getattr(args, "data", None)
+    if data_dir:
+        abs_path = os.path.abspath(data_dir)
+        project_root = os.getcwd()
+        try:
+            rel = os.path.relpath(abs_path, project_root)
+            # If the data is under the project (normal case), use relative.
+            # If it's outside (../../tmp/foo), still relative — the container
+            # bind-mount may cover it.
+            os.environ["DATA_DIR"] = rel
+        except ValueError:
+            # Cross-drive (Windows) — fall back to absolute.
+            os.environ["DATA_DIR"] = abs_path
 
     run_direct(args.org, args.task, args.rubric, args.recursion_limit, args.thread)
 

@@ -39,7 +39,7 @@ def _convert(model: ReasoningChatOpenAI, delta: dict, **chunk_extra: object):
 
 
 def test_captures_delta_reasoning_content() -> None:
-    """The proven shape: DeepSeek / MiMo / OpenRouter / OpenCode Zen Go stream
+    """The proven shape: DeepSeek / MiMo / OpenRouter stream
     ``delta.reasoning_content``. The adapter preserves it onto the canonical
     ``additional_kwargs["reasoning_content"]`` field."""
     gen = _convert(_model(), {"reasoning_content": "Thinking hard…"})
