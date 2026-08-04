@@ -63,6 +63,14 @@ def _to_connection(spec: ToolServerSpec) -> dict:
             "url": spec.url,
             "headers": dict(spec.headers),
             "transport": "streamable_http",
+            # The MCP streamable_http transport defaults to a 30-second general
+            # timeout (streamablehttp_client signature).  Tool calls that block
+            # longer than that — e.g. Ray generate() for H3 video or TRELLIS 3D,
+            # which take minutes — see the httpx client closed mid-request and
+            # fail with "Cannot send a request, as the client has been closed."
+            # Bump to 600 s (10 min) for both the general and SSE-read timers.
+            "timeout": 600,
+            "sse_read_timeout": 600,
         }
     else:
         raise ValueError(f"unsupported transport {spec.transport!r}")
