@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "deepagents-based Pux harness — the org+skill compiler (slim kit) + the Docker sandbox runtimes."
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "deepagents-context",
     "deepagents>=0.7.3",
     "deepagents-acp>=0.0.9",
     "docker>=7.1.0",
@@ -74,3 +75,13 @@ line-length = 100
 
 [tool.mypy]
 python_version = "3.12"
+
+# uv workspace — the ``deepagents-context`` sub-package is a standalone,
+# independently-publishable distribution extracted from the context cluster.
+# pux depends on it via the workspace; when published to PyPI, replace
+# ``"deepagents-context"`` above with ``"deepagents-context>=0.1.0"``.
+[tool.uv.workspace]
+members = ["packages/deepagents-context"]
+
+[tool.uv.sources]
+deepagents-context = { workspace = true }

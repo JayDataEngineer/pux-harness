@@ -6,6 +6,12 @@ resolution-markers = [
     "python_full_version < '3.13'",
 ]
 
+[manifest]
+members = [
+    "deepagents-context",
+    "pux-harness",
+]
+
 [[package]]
 name = "aegra-api"
 version = "0.9.24"
@@ -592,6 +598,25 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5f/ce/a9a57d233747784d01b8689b965b9757cb0fbaca42e822d178b4f04a89f9/deepagents_code-0.0.1.tar.gz", hash = "sha256:146144870584697354fa4fdc5765f8b43a9a2f816f59f32a79942febe84d7187", size = 48552, upload-time = "2026-04-30T00:21:11.045Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/5c/1f832ab2fd0af635b072deefa21b7b063515be37ba00782a6fa133f32305/deepagents_code-0.0.1-py3-none-any.whl", hash = "sha256:ddc5201f08e9601ca07eeeb0202bbbfbb7e28820f39e7de116a7c0d1e860c565", size = 1951, upload-time = "2026-04-30T00:21:09.845Z" },
+]
+
+[[package]]
+name = "deepagents-context"
+version = "0.1.0"
+source = { editable = "packages/deepagents-context" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
 ]
 
 [[package]]
@@ -2198,6 +2223,7 @@ dependencies = [
     { name = "deepagents" },
     { name = "deepagents-acp" },
     { name = "deepagents-code" },
+    { name = "deepagents-context" },
     { name = "docker" },
     { name = "fastapi" },
     { name = "fastmcp" },
@@ -2239,6 +2265,7 @@ requires-dist = [
     { name = "deepagents", specifier = ">=0.7.3" },
     { name = "deepagents-acp", specifier = ">=0.0.9" },
     { name = "deepagents-code" },
+    { name = "deepagents-context", editable = "packages/deepagents-context" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "fastapi", specifier = ">=0.139.0" },
     { name = "fastmcp", specifier = ">=3.4.2" },

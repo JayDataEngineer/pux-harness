@@ -31,3 +31,4 @@ __pycache__/
 # langgraph-api inmem runtime local state (checkpoints/store/ops) from `langgraph dev`
 .langgraph_api/
 downloaded_files/
+.deepagents-context/
