@@ -66,23 +66,18 @@ def _ctx(facts: RuntimeFacts) -> StackCtx:
 
 
 @pytest.fixture
-def record_prepare(monkeypatch):
-    """Replace ``prepare`` with a recording stub.
-
-    The middleware imports ``prepare`` lazily inside ``_run_prepare`` via
-    ``from pux_harness.sandbox.container import prepare``, so patching the
-    attribute on the SOURCE module is what each call re-imports.
+def record_prepare():
+    """Return ``(calls, prepare_fn)`` — the middleware receives ``prepare_fn``
+    via constructor injection (no lazy import, upstream-portable), so tests
+    pass it explicitly instead of monkeypatching the source module.
     """
-    import pux_harness.sandbox.container as container
-
     calls: list[dict[str, Any]] = []
 
     def _fake_prepare(org, project_path=None, exec_client=None, universal_warmup=False):
         calls.append({"org": org, "universal_warmup": universal_warmup})
         return [{"name": "warmup_browser", "status": "ok", "error": None, "duration": 0.1}]
 
-    monkeypatch.setattr(container, "prepare", _fake_prepare)
-    return calls
+    return calls, _fake_prepare
 
 
 # ------------------------------------------------------------------------------------
@@ -110,24 +105,27 @@ def test_prepare_registered_gate_driven_supervisor_only():
 # ------------------------------------------------------------------------------------
 
 async def test_abefore_agent_fires_prepare_once(record_prepare):
-    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
+    calls, prepare_fn = record_prepare
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True, prepare_fn=prepare_fn)
     ret = await mw.abefore_agent(SimpleNamespace(), SimpleNamespace())
     assert ret is None, "before_agent must not mutate state"
-    assert len(record_prepare) == 1, f"prepare called {len(record_prepare)}x, want 1"
-    assert record_prepare[0]["org"] == "coder"
-    assert record_prepare[0]["universal_warmup"] is True
+    assert len(calls) == 1, f"prepare called {len(calls)}x, want 1"
+    assert calls[0]["org"] == "coder"
+    assert calls[0]["universal_warmup"] is True
 
 
 def test_before_agent_sync_fires_prepare_once(record_prepare):
-    mw = PrepareWarmupMiddleware(org="dre", universal_warmup=True)
+    calls, prepare_fn = record_prepare
+    mw = PrepareWarmupMiddleware(org="dre", universal_warmup=True, prepare_fn=prepare_fn)
     ret = mw.before_agent(SimpleNamespace(), SimpleNamespace())
     assert ret is None
-    assert len(record_prepare) == 1
-    assert record_prepare[0]["org"] == "dre"
+    assert len(calls) == 1
+    assert calls[0]["org"] == "dre"
 
 
 async def test_abefore_agent_offloads_to_thread(monkeypatch, record_prepare):
     """The prod path must NOT run prepare on the event loop (would stall /events)."""
+    calls, prepare_fn = record_prepare
     import pux_harness.context.prepare_warmup as pwm
 
     seen: list[bool] = []
@@ -138,10 +136,10 @@ async def test_abefore_agent_offloads_to_thread(monkeypatch, record_prepare):
         return await real_to_thread(fn, *a, **kw)
 
     monkeypatch.setattr(pwm.asyncio, "to_thread", _capture_to_thread)
-    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True, prepare_fn=prepare_fn)
     await mw.abefore_agent(SimpleNamespace(), SimpleNamespace())
     assert seen == [True], "abefore_agent must offload via asyncio.to_thread"
-    assert len(record_prepare) == 1
+    assert len(calls) == 1
 
 
 # ------------------------------------------------------------------------------------
@@ -157,20 +155,21 @@ async def test_abefore_agent_offloads_to_thread(monkeypatch, record_prepare):
 # is the verify-or-die contract test for the invocation arity.
 
 async def test_abefore_agent_fires_via_real_runnable_callable_wrap(record_prepare):
+    calls, prepare_fn = record_prepare
     from langgraph._internal._runnable import (  # mirror factory.py's import
         CONF,
         CONFIG_KEY_RUNTIME,
         RunnableCallable,
     )
 
-    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True, prepare_fn=prepare_fn)
     # EXACTLY what factory.py does: RunnableCallable(sync_before_agent, async_before_agent, trace=False)
     node = RunnableCallable(mw.before_agent, mw.abefore_agent, trace=False)
     runtime = object()  # opaque — the hook ignores it; the framework injects it by name
     config = {CONF: {CONFIG_KEY_RUNTIME: runtime}}
     ret = await node.ainvoke({"messages": []}, config)
     assert ret is None, "before_agent must not mutate state"
-    assert len(record_prepare) == 1, "prepare must fire through the real wrap"
+    assert len(calls) == 1, "prepare must fire through the real wrap"
 
 
 # ------------------------------------------------------------------------------------
@@ -199,14 +198,11 @@ def test_build_prepare_direct_transport_universal_warmup_false():
 # 3. never breaks the run (prepare raises -> swallowed)
 # ------------------------------------------------------------------------------------
 
-async def test_prepare_exception_is_swallowed(monkeypatch):
-    import pux_harness.sandbox.container as container
-
+async def test_prepare_exception_is_swallowed():
     def _boom(*a, **kw):
         raise RuntimeError("docker daemon down")
 
-    monkeypatch.setattr(container, "prepare", _boom)
-    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True)
+    mw = PrepareWarmupMiddleware(org="coder", universal_warmup=True, prepare_fn=_boom)
     # Must NOT raise — prep failures are warn-and-continue, never block the run.
     ret = await mw.abefore_agent(SimpleNamespace(), SimpleNamespace())
     assert ret is None

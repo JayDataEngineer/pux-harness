@@ -359,9 +359,11 @@ def _build_prepare(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     not. See ``context/prepare_warmup.py``."""
     if not ctx.facts.prepare_warmup:
         return None
+    from pux_harness.sandbox.container import prepare as _prepare  # noqa: PLC0415
     return PrepareWarmupMiddleware(
         org=ctx.org,
         universal_warmup=ctx.facts.transport != "direct",
+        prepare_fn=_prepare,
     )
 
 

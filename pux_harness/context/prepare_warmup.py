@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from langchain.agents.middleware.types import AgentMiddleware
 
@@ -66,23 +66,24 @@ _log = logging.getLogger(__name__)
 class PrepareWarmupMiddleware(AgentMiddleware):
     """Run ``prepare()`` once at agent start (the ``before_agent`` hook).
 
-    Construct with the org name and whether to run the universal
-    ``warmup_webhook`` probe (serve-class transports only). The hook itself is
+    Construct with the org name, whether to run the universal
+    ``warmup_webhook`` probe (serve-class transports only), and the
+    ``prepare_fn`` callable (injected by the pux-side builder so this module
+    has zero ``pux_harness.*`` imports — upstream-portable). The hook itself is
     best-effort: any exception from ``prepare()`` is swallowed so a prep
     failure can NEVER break the agent run — matching ``prepare()``'s own
     warn-and-continue contract for the jobs it runs internally.
     """
 
-    def __init__(self, org: str, *, universal_warmup: bool) -> None:
+    def __init__(self, org: str, *, universal_warmup: bool, prepare_fn: Callable[..., Any]) -> None:
         self.org = org
         self.universal_warmup = universal_warmup
+        self._prepare = prepare_fn
 
     def _run_prepare(self) -> None:
         """One ``prepare()`` call; never raises into the agent run."""
-        from pux_harness.sandbox.container import prepare  # noqa: PLC0415
-
         try:
-            results = prepare(self.org, universal_warmup=self.universal_warmup)
+            results = self._prepare(self.org, universal_warmup=self.universal_warmup)
         except Exception:  # noqa: BLE001 — prep must never block the agent run
             _log.warning(
                 "prepare(%s) raised; continuing to agent", self.org, exc_info=True

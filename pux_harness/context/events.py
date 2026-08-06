@@ -26,19 +26,17 @@ FTS5 powers BM25-ranked retrieval across both events + blobs so the agent pulls
 back only the relevant slice — fewer tokens recalled = lower cost per call.
 
 Layering note: ``context/`` is LOWER-level than ``agent/`` (``agent/`` depends
-on ``context/``, never the reverse). ``PROJECT_ROOT`` used to be computed
-locally from ``__file__`` to avoid importing ``agent.orgs`` (a cycle, since
-``agent.orgs`` imports the context layer for subagents). It is now sourced from
-the kit's location-independent resolver (:func:`pux_harness.kit._paths.project_root`)
-— the kit is the slim, import-pinned core (kit → ``context`` is forbidden and
-tripwired), so this lower-level layer can depend on it with no cycle, AND the
-root no longer shatters when ``pux_harness`` is installed outside the
-orchestrator repo.
+on ``context/``, never the reverse). This module has **zero ``pux_harness.*``
+imports** — it reads ``$PUX_PROJECT_ROOT`` directly (the same env the kit's
+``project_root()`` reads) so the whole ``context/`` cluster is upstream-portable:
+pure langchain/langgraph/deepagents + stdlib ``sqlite3``. The
+``context-import-isolation`` tripwire (``tests/harness/``) keeps it that way.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -48,14 +46,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pux_harness.kit._paths import project_root
 
-# The app root (where ``.pux/`` lives) is injected, not derived from the
-# install path — resolved LIVE (no import-time snapshot) via the kit's
-# ``_paths.project_root`` so a late ``$PUX_PROJECT_ROOT`` is still honored.
 def _events_db() -> Path:
-    """``<project>/.pux/events.sqlite`` — the events store path, live-resolved."""
-    return project_root() / ".pux" / "events.sqlite"
+    """``<root>/.pux/events.sqlite`` — live-resolved, zero ``pux_harness`` import.
+
+    Reads ``$PUX_PROJECT_ROOT`` directly (the same env var the kit's
+    ``project_root()`` reads) and falls back to the resolved CWD — byte-identical
+    to ``kit._paths.project_root() / '.pux' / 'events.sqlite'``. The direct env
+    read keeps this module free of any ``pux_harness.*`` import so the entire
+    ``context/`` cluster is upstream-portable.
+    """
+    root = Path(os.environ.get("PUX_PROJECT_ROOT", ".")).resolve()
+    return root / ".pux" / "events.sqlite"
 
 # Path-safe blob handle: ``ctx:<hex>``. Hex-only, fixed-ish length range — no
 # path separators, no dots — so a handle can never escape the blob lookup.
