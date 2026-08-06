@@ -1,24 +1,17 @@
-"""The single context-layer wiring seam.
+"""Pux adapter for ``build_context_layer`` — injects Docker exec tools.
 
-``build_context_layer()`` returns ``(middleware, retrieval_tools)`` — the one
-tuple both the MAIN agent (``agent.graph.build_graph``) and EVERY subagent
-(``agent.orgs._build_sub``) import, so capture + offload + retrieval reach the
-whole agent tree with zero duplication. Both bind to the same process-wide
-``EventStore`` (``shared_event_store``), so a blob offloaded by any agent is
-recallable by any other via ``ctx_recall`` / ``ctx_search``.
-
-Why a seam object (not two free functions called independently): it guarantees
-the middleware and the tools share ONE store instance — building them apart
-would let a test pass different stores to each and silently split the layer.
+The real implementation lives in ``deepagents_context.layer``. This adapter
+keeps the pux-facing ``exec_client`` parameter (a ``DockerExecClient``) and
+converts it to ``extra_tools`` for the package version, keeping all existing
+pux call sites unchanged.
 """
 from __future__ import annotations
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import BaseTool
 
-from pux_harness.context.events import EventStore, shared_event_store
-from pux_harness.context.middleware import ContextMiddleware
-from pux_harness.context.tools import build_context_tools
+from deepagents_context import EventStore, shared_event_store
+from deepagents_context.layer import build_context_layer as _build_context_layer
 
 
 def build_context_layer(
@@ -29,23 +22,21 @@ def build_context_layer(
     enabled: bool = True,
     exec_client: object | None = None,
 ) -> tuple[list[AgentMiddleware], list[BaseTool]]:
-    """Build the context layer: one ``ContextMiddleware`` + the
-    ``ctx_recall``/``ctx_search`` retrieval tools, both bound to ``store``
-    (default: the shared event store).
+    """Pux-facing ``build_context_layer`` — same signature as before.
 
-    ``threshold``/``preview``/``enabled`` forward to the middleware; ``None``
-    means "the middleware default" (8000 / 1500 / True). ``exec_client`` (a
-    ``DockerExecClient``) adds the 4 exec-dependent tools
-    (ctx_execute/ctx_execute_file/ctx_batch_execute/ctx_fetch_and_index); None
-    omits them (tests stay offline-cheap). Returns a fresh tuple each call so
-    callers can mutate the lists (e.g. append more middleware) without aliasing
-    across the main agent and every subagent."""
-    s = store or shared_event_store()
-    mw_kwargs: dict[str, object] = {"enabled": enabled}
-    if threshold is not None:
-        mw_kwargs["threshold"] = threshold
-    if preview is not None:
-        mw_kwargs["preview"] = preview
-    middleware: list[AgentMiddleware] = [ContextMiddleware(s, **mw_kwargs)]
-    tools = build_context_tools(s, exec_client=exec_client)
-    return middleware, tools
+    When ``exec_client`` is provided, the 4 Docker exec tools
+    (ctx_execute/ctx_execute_file/ctx_batch_execute/ctx_fetch_and_index) are
+    built and passed as ``extra_tools`` to the package version.
+    """
+    extra_tools: list[BaseTool] | None = None
+    if exec_client is not None:
+        from pux_harness.context.exec_tools import build_exec_tools  # noqa: PLC0415
+        s = store or shared_event_store()
+        extra_tools = build_exec_tools(s, exec_client)
+    return _build_context_layer(
+        store,
+        threshold=threshold,
+        preview=preview,
+        enabled=enabled,
+        extra_tools=extra_tools,
+    )

@@ -57,11 +57,6 @@ import httpx
 from deepagents import RubricMiddleware
 from langchain.agents.middleware import ModelRetryMiddleware, ToolRetryMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
-from langchain_anthropic.middleware.prompt_caching import (
-    AnthropicPromptCachingMiddleware,
-    _tag_system_message,
-    _tag_tools,
-)
 from langchain_core.tools import BaseTool
 
 from pux_harness.agent.hitl import (
@@ -105,6 +100,7 @@ from pux_harness.agent.profile_apply import (
     apply_profile_to_tools,
     merge_profile_excluded_middleware,
 )
+from deepagents_context.prefix_caching import FullPrefixCachingMiddleware
 from pux_harness.context.audit import AuditMiddleware
 from pux_harness.context.browser_vision import (
     BrowserVisionMiddleware,
@@ -611,77 +607,8 @@ def _build_tool_retry(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     )
 
 
-class _FullPrefixCachingMiddleware(AnthropicPromptCachingMiddleware):
-    """Caches EVERY resent token — system prompt, tools, AND the rolling
-    conversation history.
-
-    Stock ``AnthropicPromptCachingMiddleware`` tags the system prompt (breakpoint
-    1) and last tool (breakpoint 2), then passes ``cache_control`` in
-    ``model_settings`` expecting the transport to expand it into a third
-    breakpoint on the message tail.  BUT ``ChatAnthropic``'s DIRECT API path
-    (``_llm_type == "anthropic-chat"`` — what we use via ``zai-anthropic``) does
-    NOT expand that kwarg: ``_apply_cache_control_to_last_eligible_block`` is
-    gated behind ``if not _is_direct_anthropic_llm_type(...)`` and never fires.
-    The kwarg stays as a top-level parameter whose effect is undefined.  Result:
-    the growing message history — the BULK of resent tokens — was never cached.
-
-    This subclass overrides ``_apply_caching`` to EXPLICITLY tag the last
-    message's final content block with ``cache_control`` (breakpoint 3),
-    guaranteeing the entire prefix is cached regardless of transport behavior:
-
-    1.  System prompt last content block  — static prefix (~3.7K tokens)
-    2.  Last tool definition              — static tools (~10.3K tokens)
-    3.  Last message last content block   — rolling prefix (all prior turns)
-
-    On turn N+1 the prefix up to turn N's last message is a cache READ (90%
-    discount); only the 2 newest messages (latest AI response + tool result) are
-    at full price.  3 of Anthropic's 4 allowed breakpoints — well within limits.
-
-    No-op for non-``ChatAnthropic`` models (``_should_apply_caching`` returns
-    ``False``); OpenAI-compat path has its own ``prompt_cache_key`` routing hint
-    in ``model.py``.
-    """
-
-    def _apply_caching(self, request: ModelRequest) -> ModelRequest:  # type: ignore[name-defined]  # noqa: F821
-        overrides: dict[str, Any] = {}
-        cc = self._cache_control
-
-        # Breakpoint 1: system message's last content block.
-        system_message = _tag_system_message(request.system_message, cc)
-        if system_message is not request.system_message:
-            overrides["system_message"] = system_message
-
-        # Breakpoint 2: last tool definition.
-        tools = _tag_tools(request.tools, cc)
-        if tools is not request.tools:
-            overrides["tools"] = tools
-
-        # Breakpoint 3: last message's last content block — THE addition that
-        # caches the rolling conversation history.  Without this the message
-        # tail (the bulk of resent tokens) is re-billed at full price every turn.
-        messages = list(request.messages)
-        if messages:
-            last = messages[-1]
-            content = last.content
-            if isinstance(content, str):
-                if content:
-                    messages[-1] = last.model_copy(
-                        update={"content": [{"type": "text", "text": content, "cache_control": cc}]}
-                    )
-                    overrides["messages"] = messages
-            elif isinstance(content, list) and content:
-                new_content = list(content)
-                last_block = new_content[-1]
-                base = last_block if isinstance(last_block, dict) else {}
-                new_content[-1] = {**base, "cache_control": cc}
-                messages[-1] = last.model_copy(update={"content": new_content})
-                overrides["messages"] = messages
-
-        return request.override(**overrides)
-
-
 def _build_prompt_caching(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
-    """``_FullPrefixCachingMiddleware`` — caches EVERY resent token across
+    """``FullPrefixCachingMiddleware`` — caches EVERY resent token across
     turns, not just the static prefix.
 
     Three explicit ``cache_control`` breakpoints on the Anthropic Messages API:
@@ -700,7 +627,7 @@ def _build_prompt_caching(_ctx: StackCtx, _scope: Scope) -> AgentMiddleware | No
     gets its own caching via ``prompt_cache_key`` in ``model.py``'s
     ``extra_body`` — server-side prefix caching with a routing hint.  The two
     mechanisms are complementary, not redundant."""
-    return _FullPrefixCachingMiddleware(
+    return FullPrefixCachingMiddleware(
         type="ephemeral",
         ttl="5m",
         min_messages_to_cache=0,
@@ -951,14 +878,12 @@ MIDDLEWARE_REGISTRY: list[MiddlewareSpec] = [
         "interpreter_hints", frozenset({Scope.SUPERVISOR}), _build_interpreter_hints,
         gate=_gate_interpreter_hints,
     ),
-    # ``prompt_caching`` tags the system prompt + tools with cache_control for
-    # Anthropic models (no-op for OpenAI-compat). Listed AFTER everything else
-    # so it sees the FINAL tools list (after context adds ctx_recall/ctx_search,
-    # interpreter adds eval, etc.) and tags the genuinely-last tool. It only
-    # modifies the ModelRequest (system_message + tools + model_settings) — it
-    # does NOT touch messages, so mount position relative to other wrap_model_call
-    # layers doesn't affect correctness, only which tools are in the list when
-    # the tag is applied.
+    # ``prompt_caching`` tags the system prompt + tools + last message's final
+    # content block with cache_control for Anthropic models (no-op for
+    # OpenAI-compat). Listed AFTER everything else so it sees the FINAL tools list
+    # (after context adds ctx_recall/ctx_search, interpreter adds eval, etc.) and
+    # tags the genuinely-last tool. See ``FullPrefixCachingMiddleware`` in
+    # ``deepagents_context.prefix_caching`` for the three-breakpoint rationale.
     MiddlewareSpec(
         "prompt_caching", frozenset({Scope.SUPERVISOR, Scope.SUBAGENT}), _build_prompt_caching,
         gate=None,

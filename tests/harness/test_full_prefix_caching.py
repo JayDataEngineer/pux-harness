@@ -1,4 +1,4 @@
-"""Unit tests for ``_FullPrefixCachingMiddleware``.
+"""Unit tests for ``FullPrefixCachingMiddleware``.
 
 The stock ``AnthropicPromptCachingMiddleware`` tags only the system prompt +
 last tool and passes ``cache_control`` via ``model_settings``, which
@@ -19,7 +19,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
-from pux_harness.agent.stack import _FullPrefixCachingMiddleware
+from deepagents_context.prefix_caching import FullPrefixCachingMiddleware
 
 
 # --------------------------------------------------------------------------- #
@@ -61,26 +61,6 @@ class _FakeTool(BaseTool):
         pass
 
 
-def _patch_isinstance(monkeypatch):
-    """Make isinstance(_, ChatAnthropic) return True for our mock model."""
-    import langchain_anthropic.middleware.prompt_caching as pc_mod
-
-    real_isinstance = isinstance
-
-    def _fake_isinstance(obj, classinfo):
-        # The ONLY isinstance check in _should_apply_caching is against
-        # ChatAnthropic.  If classinfo is ChatAnthropic, check by class name
-        # so our MagicMock passes.
-        if classinfo is pc_mod.ChatAnthropic:
-            return getattr(obj, "_is_anthropic", False)
-        return real_isinstance(obj, classinfo)
-
-    monkeypatch.setattr(
-        "pux_harness.agent.stack._FullPrefixCachingMiddleware",
-        _FullPrefixCachingMiddleware,  # ensure still importable
-    )
-
-
 # --------------------------------------------------------------------------- #
 # tests
 # --------------------------------------------------------------------------- #
@@ -90,7 +70,7 @@ class TestFullPrefixCachingBreakpoints:
 
     def test_tags_system_message_last_block(self):
         """Breakpoint 1: system message's last content block gets cache_control."""
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         system = SystemMessage(content="You are an agent.")
         req = _make_request(system=system, messages=[HumanMessage(content="hi")])
         req.model._is_anthropic = True
@@ -108,7 +88,7 @@ class TestFullPrefixCachingBreakpoints:
 
     def test_tags_last_tool_extras(self):
         """Breakpoint 2: last tool's extras get cache_control."""
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         tools = [_FakeTool(name="tool_a"), _FakeTool(name="tool_b")]
         req = _make_request(
             tools=tools,
@@ -132,7 +112,7 @@ class TestFullPrefixCachingBreakpoints:
         This is THE critical addition — the stock middleware does NOT do this.
         The rolling conversation prefix is the bulk of resent tokens.
         """
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         messages = [
             HumanMessage(content="what is 2+2?"),
             AIMessage(content="4"),
@@ -155,7 +135,7 @@ class TestFullPrefixCachingBreakpoints:
 
     def test_tags_last_message_list_content(self):
         """Breakpoint 3: last message with LIST content — last block tagged."""
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         messages = [
             HumanMessage(content="hello"),
             AIMessage(content=[
@@ -178,7 +158,7 @@ class TestFullPrefixCachingBreakpoints:
     def test_does_not_mutate_original_request(self):
         """The override pattern is immutable — original messages/tools/system
         must be unchanged."""
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         original_system = SystemMessage(content="system")
         original_msgs = [HumanMessage(content="hi")]
         original_tools = [_FakeTool()]
@@ -199,7 +179,7 @@ class TestFullPrefixCachingBreakpoints:
 
     def test_all_three_breakpoints_in_one_request(self):
         """Integration: a single _apply_caching call places all 3 breakpoints."""
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         req = _make_request(
             system=SystemMessage(content="system prompt"),
             tools=[_FakeTool()],
@@ -226,7 +206,7 @@ class TestFullPrefixCachingBreakpoints:
         breakpoint, so passing it is ambiguous — the 3 explicit breakpoints
         above are sufficient and unambiguous.
         """
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         req = _make_request(
             system=SystemMessage(content="s"),
             messages=[HumanMessage(content="m")],
@@ -245,7 +225,7 @@ class TestShouldApplyCaching:
 
     def test_skip_non_anthropic_model(self):
         """For non-ChatAnthropic models, wrap_model_call is a clean no-op."""
-        mw = _FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
+        mw = FullPrefixCachingMiddleware(unsupported_model_behavior="ignore")
         # Use a plain object that's not ChatAnthropic
         mock_model = MagicMock()
         req = _make_request(

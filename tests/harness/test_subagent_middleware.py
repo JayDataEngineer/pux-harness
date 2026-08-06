@@ -55,7 +55,7 @@ def test_builder_baseline_is_context_only():
     assert names == [
         "ContextMiddleware",
         "ReadFileVisionMiddleware",
-        "_FullPrefixCachingMiddleware",
+        "FullPrefixCachingMiddleware",
     ], names
 
 
@@ -72,7 +72,7 @@ def test_builder_adds_audit_outermost():
         "AuditMiddleware",
         "ContextMiddleware",
         "ReadFileVisionMiddleware",
-        "_FullPrefixCachingMiddleware",
+        "FullPrefixCachingMiddleware",
     ], names
     assert isinstance(mw[0], AuditMiddleware)
     assert mw[0].scope == "subagent"
@@ -90,7 +90,7 @@ def test_builder_rubric_name_resolves_on_subagent_without_gate():
     assert [type(m).__name__ for m in mw] == [
         "ContextMiddleware",
         "ReadFileVisionMiddleware",
-        "_FullPrefixCachingMiddleware",
+        "FullPrefixCachingMiddleware",
     ]
 
 
@@ -123,7 +123,7 @@ def test_builder_adds_rubric_on_subagent_when_gate_armed(monkeypatch):
         "ContextMiddleware",
         "RubricMiddleware",
         "ReadFileVisionMiddleware",
-        "_FullPrefixCachingMiddleware",
+        "FullPrefixCachingMiddleware",
     ], names
     assert isinstance(mw[1], RubricMiddleware)
     assert mw[1].max_iterations == 3

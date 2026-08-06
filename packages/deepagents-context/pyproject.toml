@@ -3,9 +3,11 @@ name = "deepagents-context"
 version = "0.1.0"
 description = "Context-saving middleware for deepagents — proactive capture, offload, and retrieval. Pure langchain/langgraph + stdlib sqlite3, zero pux coupling."
 requires-python = ">=3.12,<3.14"
-# store.py is pure stdlib (sqlite3, hashlib, threading). Deps grow as middleware
-# files migrate in (langchain, deepagents, anthropic).
-dependencies = []
+dependencies = [
+    "langchain>=0.3",
+    "langgraph>=0.6",
+    "langchain-anthropic>=1.5.3",
+]
 
 [build-system]
 requires = ["hatchling"]

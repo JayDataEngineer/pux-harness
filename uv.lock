@@ -604,6 +604,11 @@ wheels = [
 name = "deepagents-context"
 version = "0.1.0"
 source = { editable = "packages/deepagents-context" }
+dependencies = [
+    { name = "langchain" },
+    { name = "langchain-anthropic" },
+    { name = "langgraph" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -612,6 +617,11 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "langchain", specifier = ">=0.3" },
+    { name = "langchain-anthropic", specifier = ">=1.5.3" },
+    { name = "langgraph", specifier = ">=0.6" },
+]
 
 [package.metadata.requires-dev]
 dev = [

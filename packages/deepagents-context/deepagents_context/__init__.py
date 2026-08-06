@@ -1,16 +1,41 @@
 """deepagents-context — proactive context management for deepagents.
 
-A standalone package extracted from the Pux harness. Provides:
-
-- ``EventStore`` — unified SQLite store for structured events + offloaded blobs,
-  behind a single FTS5 (BM25) search surface.
-- ``shared_event_store()`` — process-wide singleton accessor.
-- ``ContextMiddleware`` — capture + offload in one ``wrap_tool_call`` pass
-  (coming as files migrate in).
-- ``build_context_layer()`` — the one-stop wiring seam (coming).
+A standalone package extracted from the Pux harness. Provides capture, offload,
+and retrieval middleware that keeps large tool results out of the context window
+BEFORE they accumulate (proactive), complementing deepagents' reactive
+SummarizationMiddleware.
 
 Zero ``pux_harness.*`` imports — pure stdlib + langchain/langgraph/deepagents.
+
+Quick start (native deepagents, no pux required):
+
+    from deepagents_context import (
+        EventStore, ContextMiddleware, build_context_layer,
+    )
+
+    store = EventStore(".myapp/events.sqlite")
+    middleware, tools = build_context_layer(store=store, threshold=8000)
+    agent = create_deep_agent(tools=[*my_tools, *tools], middleware=middleware)
 """
 from deepagents_context.store import EventStore, shared_event_store
+from deepagents_context.snapshot import build_snapshot
+from deepagents_context.middleware import ContextMiddleware
+from deepagents_context.prompt_capture import PromptCaptureMiddleware
+from deepagents_context.session_guide import SessionGuideMiddleware
+from deepagents_context.tools import build_context_tools
+from deepagents_context.layer import build_context_layer
+from deepagents_context.prefix_caching import FullPrefixCachingMiddleware
+from deepagents_context.audit import AuditMiddleware
 
-__all__ = ["EventStore", "shared_event_store"]
+__all__ = [
+    "EventStore",
+    "shared_event_store",
+    "build_snapshot",
+    "ContextMiddleware",
+    "PromptCaptureMiddleware",
+    "SessionGuideMiddleware",
+    "build_context_tools",
+    "build_context_layer",
+    "FullPrefixCachingMiddleware",
+    "AuditMiddleware",
+]
