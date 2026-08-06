@@ -77,6 +77,32 @@ That's it. Every tool call is now captured as a structured event, oversized resu
 | `build_context_layer(store, *, threshold, preview, enabled, extra_tools)` | Returns `(middleware_list, tools_list)` — the single wiring seam. |
 | `build_snapshot(events, *, thread_id, search_tool)` | Builds a structured XML snapshot from recent events for session rehydration. |
 
+### Web tools (optional)
+
+`build_web_tools(searxng_url=None)` returns `[search, fetch]` — two agent-callable web tools:
+
+```bash
+pip install 'deepagents-context[web]'
+```
+
+```python
+from deepagents_context import build_web_tools
+
+# DuckDuckGo backend — zero config, no API key, no infrastructure
+tools = build_web_tools()
+
+# SearXNG backend — self-hosted, VPN-proof, multi-engine aggregation
+tools = build_web_tools(searxng_url="http://localhost:8080")
+```
+
+| Tool | Description |
+|---|---|
+| `search` | Search the web. Returns titles, URLs, and snippets. |
+| `fetch` | Fetch and read a web page. Returns the content as text. |
+
+Search backend: DuckDuckGo (default, zero-config) or SearXNG (self-hosted).
+Fetch backend: httpx + trafilatura (lightweight content extraction), stdlib HTML-strip fallback.
+
 ## Configuration
 
 ### Offload threshold
@@ -136,6 +162,7 @@ deepagents_context/
 ├── prefix_caching.py   # FullPrefixCachingMiddleware — 3-breakpoint Anthropic caching
 ├── audit.py            # AuditMiddleware — observe-only tool-call audit
 ├── tools.py            # ctx_recall, ctx_search, ctx_index, ctx_stats, ctx_doctor, ctx_purge
+├── web_tools.py        # search + fetch — swappable DuckDuckGo / SearXNG backends
 ├── layer.py            # build_context_layer — the wiring seam
 ├── interpreter_hints.py
 ├── read_file_vision.py
@@ -148,6 +175,8 @@ deepagents_context/
 - langchain ≥0.3
 - langgraph ≥0.6
 - langchain-anthropic ≥1.5.3
+- httpx ≥0.27
+- Optional web: `pip install 'deepagents-context[web]'` (duckduckgo-search, trafilatura)
 
 ## License
 

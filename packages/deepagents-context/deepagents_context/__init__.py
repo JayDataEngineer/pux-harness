@@ -26,6 +26,7 @@ from deepagents_context.tools import build_context_tools
 from deepagents_context.layer import build_context_layer
 from deepagents_context.prefix_caching import FullPrefixCachingMiddleware
 from deepagents_context.audit import AuditMiddleware
+from deepagents_context.web_tools import build_web_tools
 
 __all__ = [
     "EventStore",
@@ -38,4 +39,5 @@ __all__ = [
     "build_context_layer",
     "FullPrefixCachingMiddleware",
     "AuditMiddleware",
+    "build_web_tools",
 ]
