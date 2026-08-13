@@ -8,6 +8,8 @@ route to the process's ephemeral instance on a unique port pair.
 
 from __future__ import annotations
 
+from deepagents.backends.sandbox import BaseSandbox
+
 import hashlib
 import json
 import os
@@ -19,8 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.exec import ExecClient, ExecTimeout
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result, _NoArgs
+from ._shared import _tail, _result, _NoArgs, _exec
 
 
 # --- ephemeral per-process browser isolation --------------------------------
@@ -45,7 +46,7 @@ _process_http_port: int | None = None  # cached for this process lifetime
 _SUPERVISORD_SB_PORT = 9876
 
 
-def _supervisord_browser_ready(exec_client: ExecClient) -> bool:
+def _supervisord_browser_ready(sandbox: BaseSandbox) -> bool:
     """Is the supervisord-managed default sb_server up AND Chrome alive?
 
     Checks BOTH ``ok`` (sb_server process) AND ``alive`` (Chrome attached) in
@@ -53,7 +54,7 @@ def _supervisord_browser_ready(exec_client: ExecClient) -> bool:
     candidate. If the server is up but Chrome cold, hit /warmup once and
     re-check (Chrome cold-start is ~10s, bounded by the server's own
     /warmup handler)."""
-    out, _ = exec_client.exec(
+    out, _ = _exec(sandbox, 
         f"curl -sS --max-time 3 http://127.0.0.1:{_SUPERVISORD_SB_PORT}/status "
         f"2>/dev/null || true"
     )
@@ -63,11 +64,11 @@ def _supervisord_browser_ready(exec_client: ExecClient) -> bool:
         # the fallback isn't usable.
         if '"ok": true' not in out and '"ok":true' not in out:
             return False  # sb_server itself is down — no fallback possible
-        exec_client.exec(
+        _exec(sandbox, 
             f"curl -sS --max-time 20 http://127.0.0.1:{_SUPERVISORD_SB_PORT}/warmup "
             f">/dev/null 2>&1 || true"
         )
-        out, _ = exec_client.exec(
+        out, _ = _exec(sandbox, 
             f"curl -sS --max-time 3 http://127.0.0.1:{_SUPERVISORD_SB_PORT}/status "
             f"2>/dev/null || true"
         )
@@ -109,8 +110,8 @@ def _alloc_port_pair() -> tuple[int, int]:
     return _EPHEMERAL_HTTP_BASE + offset, _EPHEMERAL_CDP_BASE + offset
 
 
-def _is_server_alive(exec_client: ExecClient, http_port: int) -> bool:
-    out, _ = exec_client.exec(
+def _is_server_alive(sandbox: BaseSandbox, http_port: int) -> bool:
+    out, _ = _exec(sandbox, 
         f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 "
         f"http://127.0.0.1:{http_port}/status 2>/dev/null || true"
     )
@@ -136,7 +137,7 @@ _KILL_STALE_TEMPLATE = (
 )
 
 
-def _spawn_one_attempt(exec_client: ExecClient, http_port: int, cdp_port: int) -> bool:
+def _spawn_one_attempt(sandbox: BaseSandbox, http_port: int, cdp_port: int) -> bool:
     """One spawn attempt: kill stale, launch sb_server, poll for ready.
 
     Returns True on ready, False on timeout. Single-attempt; the caller
@@ -157,7 +158,7 @@ def _spawn_one_attempt(exec_client: ExecClient, http_port: int, cdp_port: int) -
     #      them from the spawner's process group. ``kill -9 -PGID`` therefore
     #      misses them. Only a recursive descendant walk by PPID reaches
     #      every Chrome helper (renderer, GPU process, zygote, crashpad).
-    exec_client.exec(_KILL_STALE_TEMPLATE % (http_port, cdp_port))
+    _exec(sandbox, _KILL_STALE_TEMPLATE % (http_port, cdp_port))
 
     # Spawn ephemeral sb_server: own Chrome, own CDP port, own profile dir.
     # The --cdp-port flag makes sb_server NOT kill other instances' Chrome.
@@ -168,12 +169,12 @@ def _spawn_one_attempt(exec_client: ExecClient, http_port: int, cdp_port: int) -
         f"python3 /usr/local/bin/sb_server.py --stealth --use-chromium "
         f"> /tmp/sb_ephemeral_{http_port}.log 2>&1 &"
     )
-    exec_client.exec(cmd)
+    _exec(sandbox, cmd)
 
     # Wait for Chrome cold start + sb_server ready (capped at _BROWSER_SPAWN_TIMEOUT)
     deadline = time.monotonic() + _BROWSER_SPAWN_TIMEOUT
     while time.monotonic() < deadline:
-        if _is_server_alive(exec_client, http_port):
+        if _is_server_alive(sandbox, http_port):
             return True
         time.sleep(0.5)
     return False
@@ -187,7 +188,7 @@ def _spawn_one_attempt(exec_client: ExecClient, http_port: int, cdp_port: int) -
 _BROWSER_SPAWN_ATTEMPTS = int(os.environ.get("PUX_BROWSER_SPAWN_ATTEMPTS", "3"))
 
 
-def _ensure_ephemeral_server(exec_client: ExecClient) -> int:
+def _ensure_ephemeral_server(sandbox: BaseSandbox) -> int:
     """Ensure THIS PROCESS has its own ephemeral sb_server running. Returns HTTP port.
 
     On first browser tool call in the process:
@@ -208,7 +209,7 @@ def _ensure_ephemeral_server(exec_client: ExecClient) -> int:
     global _process_http_port
 
     if _process_http_port is not None:
-        if _is_server_alive(exec_client, _process_http_port):
+        if _is_server_alive(sandbox, _process_http_port):
             return _process_http_port
         # Dead — fall through to respawn
 
@@ -216,13 +217,13 @@ def _ensure_ephemeral_server(exec_client: ExecClient) -> int:
 
     last_log = ""
     for attempt in range(_BROWSER_SPAWN_ATTEMPTS):
-        if _spawn_one_attempt(exec_client, http_port, cdp_port):
+        if _spawn_one_attempt(sandbox, http_port, cdp_port):
             _process_http_port = http_port
             # Restore saved cookies so the ephemeral browser has the org's session
-            _restore_session_cookies(exec_client, http_port)
+            _restore_session_cookies(sandbox, http_port)
             return http_port
         # Capture log for the final error; keep latest.
-        log_out, _ = exec_client.exec(
+        log_out, _ = _exec(sandbox, 
             f"tail -5 /tmp/sb_ephemeral_{http_port}.log 2>/dev/null || true"
         )
         last_log = _tail(log_out, 200)
@@ -234,11 +235,11 @@ def _ensure_ephemeral_server(exec_client: ExecClient) -> int:
     # returns a working browser. The fallback path is logged so operators
     # can see ephemeral is broken (and fix the root cause) without the agent
     # ever seeing a failure.
-    if _supervisord_browser_ready(exec_client):
+    if _supervisord_browser_ready(sandbox):
         # Use stderr-style logging via the exec client (module-level `log`
         # isn't imported here; the tail of the ephemeral log already shows
         # the failure for diagnosis).
-        exec_client.exec(
+        _exec(sandbox, 
             f"echo '[pux browser] ephemeral spawn failed ({_BROWSER_SPAWN_ATTEMPTS} "
             f"attempts); falling back to supervisord sb_server on port "
             f"{_SUPERVISORD_SB_PORT}' >> /tmp/pux_browser_fallback.log 2>&1 || true"
@@ -261,7 +262,7 @@ def _ensure_ephemeral_server(exec_client: ExecClient) -> int:
     )
 
 
-def warmup_ephemeral_browser(exec_client: ExecClient) -> None:
+def warmup_ephemeral_browser(sandbox: BaseSandbox) -> None:
     """Kick off the ephemeral browser spawn in a BACKGROUND thread.
 
     Called at graph-build time (before the agent loop starts) so Chrome is
@@ -285,7 +286,7 @@ def warmup_ephemeral_browser(exec_client: ExecClient) -> None:
 
     def _warm():
         try:
-            _ensure_ephemeral_server(exec_client)
+            _ensure_ephemeral_server(sandbox)
         except Exception:  # noqa: BLE001 — background warmup must never crash the agent
             pass
 
@@ -293,7 +294,7 @@ def warmup_ephemeral_browser(exec_client: ExecClient) -> None:
     t.start()
 
 
-def _restore_session_cookies(exec_client: ExecClient, http_port: int) -> None:
+def _restore_session_cookies(sandbox: BaseSandbox, http_port: int) -> None:
     """Restore saved session cookies to the ephemeral browser if a file exists.
 
     Ephemeral browsers start with a fresh profile — no cookies. If the org
@@ -303,9 +304,9 @@ def _restore_session_cookies(exec_client: ExecClient, http_port: int) -> None:
         "/sandbox/workspace/data/.twitter-session.json",
         "/sandbox/workspace/data/.browser-session.json",
     ):
-        out, _ = exec_client.exec(f"test -f {session_file} && echo exists || echo missing")
+        out, _ = _exec(sandbox, f"test -f {session_file} && echo exists || echo missing")
         if "exists" in out:
-            exec_client.exec(
+            _exec(sandbox, 
                 f"curl -s -X POST http://127.0.0.1:{http_port}/restore_session "
                 f"-H 'Content-Type: application/json' "
                 f"-d '{{\"path\":\"{session_file}\"}}' --max-time 10 2>/dev/null || true"
@@ -313,7 +314,7 @@ def _restore_session_cookies(exec_client: ExecClient, http_port: int) -> None:
             break  # one session file per browser
 
 
-def _sb_post(exec_client: ExecClient, endpoint: str, body_obj: dict | None,
+def _sb_post(sandbox: BaseSandbox, endpoint: str, body_obj: dict | None,
              *, timeout: int = _BROWSER_TIMEOUT) -> str:
     """POST ``body_obj`` to THIS PROCESS's ephemeral sb_server endpoint, return the
     parsed JSON re-serialized via ``_result``.
@@ -324,7 +325,7 @@ def _sb_post(exec_client: ExecClient, endpoint: str, body_obj: dict | None,
     _pace()
     # Ensure we have our own isolated browser instance
     try:
-        http_port = _ensure_ephemeral_server(exec_client)
+        http_port = _ensure_ephemeral_server(sandbox)
     except Exception as exc:
         # Transient spawn failure for THIS call only — agent can retry.
         return _result({"success": False, "reason": "browser_spawn_failed",
@@ -344,10 +345,7 @@ def _sb_post(exec_client: ExecClient, endpoint: str, body_obj: dict | None,
         parts += ["-d", shlex.quote(body)]
     cmd = " ".join(parts)
     try:
-        out, exit_code = exec_client.exec(cmd, timeout=timeout)
-    except ExecTimeout:
-        return _result({"success": False, "reason": "timeout",
-                        "error": f"browser {endpoint}: timed out after {timeout}s"})
+        out, exit_code = _exec(sandbox, cmd, timeout=timeout)
     except Exception as exc:
         return _result({"success": False, "reason": "exec_failed",
                         "error": f"browser {endpoint}: {exc}"})
@@ -375,14 +373,14 @@ class _BrowserNavigateArgs(BaseModel):
     url: str = Field(..., description="Absolute URL including scheme (https://example.com)")
 
 
-def _browser_navigate_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_navigate_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(url: str) -> str:
         if not url:
             return _result({"success": False, "error": "url is required"})
-        return _sb_post(exec_client, "/navigate", {"url": url})
+        return _sb_post(sandbox, "/navigate", {"url": url})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_navigate", description=_BROWSER_NAVIGATE_DESC,
+        name="browser_navigate", description=_BROWSER_NAVIGATE_DESC,
         args_schema=_BrowserNavigateArgs, func=_run,
     )
 
@@ -400,7 +398,7 @@ class _BrowserClickArgs(BaseModel):
     trusted: bool = Field(False, description="Drive the real cursor via CDP (isTrusted=true). Use when a normal click silently no-ops on anti-bot sites.")
 
 
-def _browser_click_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_click_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None,
              trusted: bool = False) -> str:
         body: dict = {}
@@ -410,10 +408,10 @@ def _browser_click_tool(exec_client: ExecClient) -> StructuredTool:
             body["selector"] = selector
         if trusted:
             body["trusted"] = True
-        return _sb_post(exec_client, "/click", body)
+        return _sb_post(sandbox, "/click", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_click", description=_BROWSER_CLICK_DESC,
+        name="browser_click", description=_BROWSER_CLICK_DESC,
         args_schema=_BrowserClickArgs, func=_run,
     )
 
@@ -432,7 +430,7 @@ class _BrowserTypeArgs(BaseModel):
     trusted: bool = Field(False, description="Type via CDP Input.insertText (isTrusted events). Use for keystroke-fingerprinting defenses.")
 
 
-def _browser_type_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_type_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(text: str, index: int | None = None, selector: str | None = None,
              trusted: bool = False) -> str:
         if not text:
@@ -446,10 +444,10 @@ def _browser_type_tool(exec_client: ExecClient) -> StructuredTool:
             body["selector"] = selector
         if trusted:
             body["trusted"] = True
-        return _sb_post(exec_client, "/type", body)
+        return _sb_post(sandbox, "/type", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_type", description=_BROWSER_TYPE_DESC,
+        name="browser_type", description=_BROWSER_TYPE_DESC,
         args_schema=_BrowserTypeArgs, func=_run,
     )
 
@@ -461,12 +459,12 @@ _BROWSER_SCREENSHOT_DESC = (
 )
 
 
-def _browser_screenshot_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_screenshot_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/read", {})
+        return _sb_post(sandbox, "/read", {})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_screenshot", description=_BROWSER_SCREENSHOT_DESC,
+        name="browser_screenshot", description=_BROWSER_SCREENSHOT_DESC,
         args_schema=_NoArgs, func=_run,
     )
 
@@ -485,14 +483,14 @@ class _BrowserEvaluateArgs(BaseModel):
     )
 
 
-def _browser_evaluate_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_evaluate_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(code: str) -> str:
         if not code:
             return _result({"success": False, "error": "code is required"})
-        return _sb_post(exec_client, "/evaluate", {"code": code})
+        return _sb_post(sandbox, "/evaluate", {"code": code})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_evaluate", description=_BROWSER_EVALUATE_DESC,
+        name="browser_evaluate", description=_BROWSER_EVALUATE_DESC,
         args_schema=_BrowserEvaluateArgs, func=_run,
     )
 
@@ -508,14 +506,14 @@ class _BrowserSearchArgs(BaseModel):
     query: str = Field(..., description="Natural-language search query (the engine URL-encodes it)")
 
 
-def _browser_search_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_search_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(query: str) -> str:
         if not query:
             return _result({"success": False, "error": "query is required"})
-        return _sb_post(exec_client, "/search", {"query": query})
+        return _sb_post(sandbox, "/search", {"query": query})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_search", description=_BROWSER_SEARCH_DESC,
+        name="browser_search", description=_BROWSER_SEARCH_DESC,
         args_schema=_BrowserSearchArgs, func=_run,
     )
 
@@ -532,12 +530,12 @@ class _BrowserScrollArgs(BaseModel):
     amount: int = Field(0, description="Pixel count to scroll (sign follows direction). 0 = use direction for a viewport jump.")
 
 
-def _browser_scroll_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_scroll_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(direction: str = "down", amount: int = 0) -> str:
-        return _sb_post(exec_client, "/scroll", {"direction": direction, "amount": amount})
+        return _sb_post(sandbox, "/scroll", {"direction": direction, "amount": amount})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_scroll", description=_BROWSER_SCROLL_DESC,
+        name="browser_scroll", description=_BROWSER_SCROLL_DESC,
         args_schema=_BrowserScrollArgs, func=_run,
     )
 
@@ -549,12 +547,12 @@ _BROWSER_GO_BACK_DESC = (
 )
 
 
-def _browser_go_back_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_go_back_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/go_back", {})
+        return _sb_post(sandbox, "/go_back", {})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_go_back", description=_BROWSER_GO_BACK_DESC,
+        name="browser_go_back", description=_BROWSER_GO_BACK_DESC,
         args_schema=_NoArgs, func=_run,
     )
 
@@ -570,12 +568,12 @@ class _BrowserWaitArgs(BaseModel):
     seconds: int = Field(2, description="How long to wait; server clamps to 30")
 
 
-def _browser_wait_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_wait_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(seconds: int = 2) -> str:
-        return _sb_post(exec_client, "/wait", {"seconds": seconds})
+        return _sb_post(sandbox, "/wait", {"seconds": seconds})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_wait", description=_BROWSER_WAIT_DESC,
+        name="browser_wait", description=_BROWSER_WAIT_DESC,
         args_schema=_BrowserWaitArgs, func=_run,
     )
 
@@ -591,14 +589,14 @@ class _BrowserFindTextArgs(BaseModel):
     text: str = Field(..., description="Substring to locate on the page")
 
 
-def _browser_find_text_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_find_text_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(text: str) -> str:
         if not text:
             return _result({"success": False, "error": "text is required"})
-        return _sb_post(exec_client, "/find_text", {"text": text})
+        return _sb_post(sandbox, "/find_text", {"text": text})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_find_text", description=_BROWSER_FIND_TEXT_DESC,
+        name="browser_find_text", description=_BROWSER_FIND_TEXT_DESC,
         args_schema=_BrowserFindTextArgs, func=_run,
     )
 
@@ -614,12 +612,12 @@ class _BrowserExtractArgs(BaseModel):
     query: str = Field("extract all text content", description="Free-text note of what you want (the engine extracts the same DOM structures regardless)")
 
 
-def _browser_extract_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_extract_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(query: str = "extract all text content") -> str:
-        return _sb_post(exec_client, "/extract", {"query": query})
+        return _sb_post(sandbox, "/extract", {"query": query})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_extract", description=_BROWSER_EXTRACT_DESC,
+        name="browser_extract", description=_BROWSER_EXTRACT_DESC,
         args_schema=_BrowserExtractArgs, func=_run,
     )
 
@@ -631,12 +629,12 @@ _BROWSER_EXTRACT_IMAGES_DESC = (
 )
 
 
-def _browser_extract_images_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_extract_images_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/extract_images", {})
+        return _sb_post(sandbox, "/extract_images", {})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_extract_images", description=_BROWSER_EXTRACT_IMAGES_DESC,
+        name="browser_extract_images", description=_BROWSER_EXTRACT_IMAGES_DESC,
         args_schema=_NoArgs, func=_run,
     )
 
@@ -652,15 +650,15 @@ class _BrowserSaveScreenshotArgs(BaseModel):
     path: str | None = Field(None, description="Absolute sandbox path incl. .png extension. If omitted the engine generates one and returns it.")
 
 
-def _browser_save_screenshot_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_save_screenshot_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(path: str | None = None) -> str:
         body: dict = {}
         if path:
             body["path"] = path
-        return _sb_post(exec_client, "/screenshot", body)
+        return _sb_post(sandbox, "/screenshot", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_save_screenshot", description=_BROWSER_SAVE_SCREENSHOT_DESC,
+        name="browser_save_screenshot", description=_BROWSER_SAVE_SCREENSHOT_DESC,
         args_schema=_BrowserSaveScreenshotArgs, func=_run,
     )
 
@@ -677,14 +675,14 @@ class _BrowserDownloadArgs(BaseModel):
     path: str = Field(..., description="Absolute sandbox output path (incl. extension)")
 
 
-def _browser_download_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_download_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(url: str, path: str) -> str:
         if not url or not path:
             return _result({"success": False, "error": "url and path are both required"})
-        return _sb_post(exec_client, "/download", {"url": url, "path": path})
+        return _sb_post(sandbox, "/download", {"url": url, "path": path})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_download", description=_BROWSER_DOWNLOAD_DESC,
+        name="browser_download", description=_BROWSER_DOWNLOAD_DESC,
         args_schema=_BrowserDownloadArgs, func=_run,
     )
 
@@ -701,14 +699,14 @@ class _BrowserUploadArgs(BaseModel):
     file_path: str = Field(..., description="Absolute sandbox path of the file to upload (must exist)")
 
 
-def _browser_upload_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_upload_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(selector: str, file_path: str) -> str:
         if not selector or not file_path:
             return _result({"success": False, "error": "selector and file_path are both required"})
-        return _sb_post(exec_client, "/upload", {"selector": selector, "file_path": file_path})
+        return _sb_post(sandbox, "/upload", {"selector": selector, "file_path": file_path})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_upload", description=_BROWSER_UPLOAD_DESC,
+        name="browser_upload", description=_BROWSER_UPLOAD_DESC,
         args_schema=_BrowserUploadArgs, func=_run,
     )
 
@@ -720,12 +718,12 @@ _BROWSER_TABS_DESC = (
 )
 
 
-def _browser_tabs_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_tabs_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/tabs", {})
+        return _sb_post(sandbox, "/tabs", {})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_tabs", description=_BROWSER_TABS_DESC,
+        name="browser_tabs", description=_BROWSER_TABS_DESC,
         args_schema=_NoArgs, func=_run,
     )
 
@@ -741,12 +739,12 @@ class _BrowserNewTabArgs(BaseModel):
     url: str = Field("about:blank", description="URL to open in the new tab")
 
 
-def _browser_new_tab_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_new_tab_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(url: str = "about:blank") -> str:
-        return _sb_post(exec_client, "/new_tab", {"url": url})
+        return _sb_post(sandbox, "/new_tab", {"url": url})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_new_tab", description=_BROWSER_NEW_TAB_DESC,
+        name="browser_new_tab", description=_BROWSER_NEW_TAB_DESC,
         args_schema=_BrowserNewTabArgs, func=_run,
     )
 
@@ -762,12 +760,12 @@ class _BrowserSwitchTabArgs(BaseModel):
     index: int = Field(0, description="0-based tab index (see browser_tabs)")
 
 
-def _browser_switch_tab_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_switch_tab_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(index: int = 0) -> str:
-        return _sb_post(exec_client, "/switch_tab", {"index": index})
+        return _sb_post(sandbox, "/switch_tab", {"index": index})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_switch_tab", description=_BROWSER_SWITCH_TAB_DESC,
+        name="browser_switch_tab", description=_BROWSER_SWITCH_TAB_DESC,
         args_schema=_BrowserSwitchTabArgs, func=_run,
     )
 
@@ -779,12 +777,12 @@ _BROWSER_CLOSE_TAB_DESC = (
 )
 
 
-def _browser_close_tab_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_close_tab_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/close_tab", {})
+        return _sb_post(sandbox, "/close_tab", {})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_close_tab", description=_BROWSER_CLOSE_TAB_DESC,
+        name="browser_close_tab", description=_BROWSER_CLOSE_TAB_DESC,
         args_schema=_NoArgs, func=_run,
     )
 
@@ -801,7 +799,7 @@ class _BrowserDropdownOptionsArgs(BaseModel):
     selector: str | None = Field(None, description="CSS selector of the <select> element")
 
 
-def _browser_dropdown_options_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_dropdown_options_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None) -> str:
         if index is None and not selector:
             return _result({"success": False, "error": "either index or selector is required"})
@@ -810,10 +808,10 @@ def _browser_dropdown_options_tool(exec_client: ExecClient) -> StructuredTool:
             body["index"] = index
         if selector is not None:
             body["selector"] = selector
-        return _sb_post(exec_client, "/dropdown_options", body)
+        return _sb_post(sandbox, "/dropdown_options", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_dropdown_options", description=_BROWSER_DROPDOWN_OPTIONS_DESC,
+        name="browser_dropdown_options", description=_BROWSER_DROPDOWN_OPTIONS_DESC,
         args_schema=_BrowserDropdownOptionsArgs, func=_run,
     )
 
@@ -832,7 +830,7 @@ class _BrowserSelectDropdownArgs(BaseModel):
     text: str | None = Field(None, description="Visible text of the option to select (use XOR with value)")
 
 
-def _browser_select_dropdown_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_select_dropdown_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None,
              value: str | None = None, text: str | None = None) -> str:
         if index is None and not selector:
@@ -848,10 +846,10 @@ def _browser_select_dropdown_tool(exec_client: ExecClient) -> StructuredTool:
             body["value"] = value
         if text is not None:
             body["text"] = text
-        return _sb_post(exec_client, "/select_dropdown", body)
+        return _sb_post(sandbox, "/select_dropdown", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_select_dropdown", description=_BROWSER_SELECT_DROPDOWN_DESC,
+        name="browser_select_dropdown", description=_BROWSER_SELECT_DROPDOWN_DESC,
         args_schema=_BrowserSelectDropdownArgs, func=_run,
     )
 
@@ -867,12 +865,12 @@ class _BrowserSaveSessionArgs(BaseModel):
     path: str = Field("/tmp/browser-session.json", description="Absolute sandbox path to write the session JSON")
 
 
-def _browser_save_session_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_save_session_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(path: str = "/tmp/browser-session.json") -> str:
-        return _sb_post(exec_client, "/save_session", {"path": path})
+        return _sb_post(sandbox, "/save_session", {"path": path})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_save_session", description=_BROWSER_SAVE_SESSION_DESC,
+        name="browser_save_session", description=_BROWSER_SAVE_SESSION_DESC,
         args_schema=_BrowserSaveSessionArgs, func=_run,
     )
 
@@ -888,12 +886,12 @@ class _BrowserRestoreSessionArgs(BaseModel):
     path: str = Field("/tmp/browser-session.json", description="Absolute sandbox path of a session JSON written by browser_save_session")
 
 
-def _browser_restore_session_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_restore_session_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(path: str = "/tmp/browser-session.json") -> str:
-        return _sb_post(exec_client, "/restore_session", {"path": path})
+        return _sb_post(sandbox, "/restore_session", {"path": path})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_restore_session", description=_BROWSER_RESTORE_SESSION_DESC,
+        name="browser_restore_session", description=_BROWSER_RESTORE_SESSION_DESC,
         args_schema=_BrowserRestoreSessionArgs, func=_run,
     )
 
@@ -920,7 +918,7 @@ class _BrowserDragArgs(BaseModel):
     steps: int = Field(25, description="mouse-move interpolation steps for the physics path (ignored by html5)")
 
 
-def _browser_drag_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_drag_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(from_index: int | None = None, from_selector: str | None = None,
              from_x: float | None = None, from_y: float | None = None,
              to_index: int | None = None, to_selector: str | None = None,
@@ -955,10 +953,10 @@ def _browser_drag_tool(exec_client: ExecClient) -> StructuredTool:
             body["dx"] = dx
         if dy is not None:
             body["dy"] = dy
-        return _sb_post(exec_client, "/drag", body)
+        return _sb_post(sandbox, "/drag", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_drag", description=_BROWSER_DRAG_DESC,
+        name="browser_drag", description=_BROWSER_DRAG_DESC,
         args_schema=_BrowserDragArgs, func=_run,
     )
 
@@ -977,7 +975,7 @@ class _BrowserHoverArgs(BaseModel):
     y: float | None = Field(None, description="y coord to hover")
 
 
-def _browser_hover_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_hover_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None,
              x: float | None = None, y: float | None = None) -> str:
         has_el = index is not None or selector
@@ -992,10 +990,10 @@ def _browser_hover_tool(exec_client: ExecClient) -> StructuredTool:
             body["x"] = x
         if y is not None:
             body["y"] = y
-        return _sb_post(exec_client, "/hover", body)
+        return _sb_post(sandbox, "/hover", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_hover", description=_BROWSER_HOVER_DESC,
+        name="browser_hover", description=_BROWSER_HOVER_DESC,
         args_schema=_BrowserHoverArgs, func=_run,
     )
 
@@ -1013,7 +1011,7 @@ class _BrowserPressArgs(BaseModel):
     selector: str | None = Field(None, description="CSS selector of the element to focus before pressing")
 
 
-def _browser_press_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_press_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(keys: str, index: int | None = None, selector: str | None = None) -> str:
         if not keys:
             return _result({"success": False, "error": "keys is required"})
@@ -1022,10 +1020,10 @@ def _browser_press_tool(exec_client: ExecClient) -> StructuredTool:
             body["index"] = index
         if selector:
             body["selector"] = selector
-        return _sb_post(exec_client, "/press", body)
+        return _sb_post(sandbox, "/press", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_press", description=_BROWSER_PRESS_DESC,
+        name="browser_press", description=_BROWSER_PRESS_DESC,
         args_schema=_BrowserPressArgs, func=_run,
     )
 
@@ -1048,7 +1046,7 @@ class _BrowserClickAtArgs(BaseModel):
     trusted: bool = Field(False, description="Drive the real cursor via CDP (isTrusted=true). Use for anti-bot sites.")
 
 
-def _browser_click_at_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_click_at_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(x: float | None = None, y: float | None = None,
              index: int | None = None, selector: str | None = None,
              button: int = 0, double: bool = False, right: bool = False,
@@ -1067,10 +1065,10 @@ def _browser_click_at_tool(exec_client: ExecClient) -> StructuredTool:
             body["selector"] = selector
         if trusted:
             body["trusted"] = True
-        return _sb_post(exec_client, "/click_at", body)
+        return _sb_post(sandbox, "/click_at", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_click_at", description=_BROWSER_CLICK_AT_DESC,
+        name="browser_click_at", description=_BROWSER_CLICK_AT_DESC,
         args_schema=_BrowserClickAtArgs, func=_run,
     )
 
@@ -1087,7 +1085,7 @@ class _BrowserScrollIntoViewArgs(BaseModel):
     selector: str | None = Field(None, description="CSS selector of the element to bring into view")
 
 
-def _browser_scroll_into_view_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_scroll_into_view_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None) -> str:
         if index is None and not selector:
             return _result({"success": False, "error": "either index or selector is required"})
@@ -1096,10 +1094,10 @@ def _browser_scroll_into_view_tool(exec_client: ExecClient) -> StructuredTool:
             body["index"] = index
         if selector:
             body["selector"] = selector
-        return _sb_post(exec_client, "/scroll_into_view", body)
+        return _sb_post(sandbox, "/scroll_into_view", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_scroll_into_view", description=_BROWSER_SCROLL_INTO_VIEW_DESC,
+        name="browser_scroll_into_view", description=_BROWSER_SCROLL_INTO_VIEW_DESC,
         args_schema=_BrowserScrollIntoViewArgs, func=_run,
     )
 
@@ -1111,12 +1109,12 @@ _BROWSER_A11Y_DESC = (
 )
 
 
-def _browser_a11y_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_a11y_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/a11y", {})
+        return _sb_post(sandbox, "/a11y", {})
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_a11y", description=_BROWSER_A11Y_DESC,
+        name="browser_a11y", description=_BROWSER_A11Y_DESC,
         args_schema=_NoArgs, func=_run,
     )
 
@@ -1136,7 +1134,7 @@ class _BrowserIframeArgs(BaseModel):
     code: str | None = Field(None, description="action='evaluate': JS to run inside the iframe (use 'return' for a value)")
 
 
-def _browser_iframe_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_iframe_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(action: str = "list", index: int | None = None, selector: str | None = None,
              inner_selector: str | None = None, code: str | None = None) -> str:
         body: dict = {"action": action}
@@ -1148,10 +1146,10 @@ def _browser_iframe_tool(exec_client: ExecClient) -> StructuredTool:
             body["inner_selector"] = inner_selector
         if code:
             body["code"] = code
-        return _sb_post(exec_client, "/iframe", body)
+        return _sb_post(sandbox, "/iframe", body)
 
     return StructuredTool(
-        name=PUX_PREFIX + "browser_iframe", description=_BROWSER_IFRAME_DESC,
+        name="browser_iframe", description=_BROWSER_IFRAME_DESC,
         args_schema=_BrowserIframeArgs, func=_run,
     )
 
@@ -1177,7 +1175,7 @@ class _BrowserUcArgs(BaseModel):
     cookie_action: str | None = Field("get", description="action=cookies: get|inject_persistent")
 
 
-def _browser_uc_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_uc_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(action: str = "open", url: str | None = None, click_captcha: bool | None = True,
              handoff: bool | None = True, selector: str | None = None, text: str | None = None,
              by: str | None = "css", submit: bool | None = False, clear: bool | None = True,
@@ -1206,9 +1204,9 @@ def _browser_uc_tool(exec_client: ExecClient) -> StructuredTool:
         # UC open can take ~30-60s (spawns Chrome + captcha click). read/click
         # are fast. Scale the curl max-time to the action.
         timeout = 150 if action == "open" else _BROWSER_TIMEOUT
-        return _sb_post(exec_client, "/uc", body, timeout=timeout)
+        return _sb_post(sandbox, "/uc", body, timeout=timeout)
     return StructuredTool(
-        name=PUX_PREFIX + "browser_uc", description=_BROWSER_UC_DESC,
+        name="browser_uc", description=_BROWSER_UC_DESC,
         args_schema=_BrowserUcArgs, func=_run,
     )
 
@@ -1224,11 +1222,11 @@ class _BrowserAcceptCookiesArgs(BaseModel):
     pass
 
 
-def _browser_accept_cookies_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_accept_cookies_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/accept_cookies", {})
+        return _sb_post(sandbox, "/accept_cookies", {})
     return StructuredTool(
-        name=PUX_PREFIX + "browser_accept_cookies", description=_BROWSER_ACCEPT_COOKIES_DESC,
+        name="browser_accept_cookies", description=_BROWSER_ACCEPT_COOKIES_DESC,
         args_schema=_BrowserAcceptCookiesArgs, func=_run,
     )
 
@@ -1269,7 +1267,7 @@ class _BrowserWarmupHistoryArgs(BaseModel):
         return out or None
 
 
-def _browser_warmup_history_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_warmup_history_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(urls: list[str] | None = None, dwell: float | None = 3.0) -> str:
         body: dict = {}
         if urls is not None:
@@ -1278,9 +1276,9 @@ def _browser_warmup_history_tool(exec_client: ExecClient) -> StructuredTool:
             body["dwell"] = dwell
         # 6 sites × ~4s dwell = ~30s budget
         timeout = max(_BROWSER_TIMEOUT, int((len(urls) if urls else 6) * (dwell or 3) + 20))
-        return _sb_post(exec_client, "/warmup_history", body, timeout=timeout)
+        return _sb_post(sandbox, "/warmup_history", body, timeout=timeout)
     return StructuredTool(
-        name=PUX_PREFIX + "browser_warmup_history", description=_BROWSER_WARMUP_HISTORY_DESC,
+        name="browser_warmup_history", description=_BROWSER_WARMUP_HISTORY_DESC,
         args_schema=_BrowserWarmupHistoryArgs, func=_run,
     )
 
@@ -1296,11 +1294,11 @@ class _BrowserSolveCaptchaArgs(BaseModel):
     pass
 
 
-def _browser_solve_captcha_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_solve_captcha_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/solve_captcha", {})
+        return _sb_post(sandbox, "/solve_captcha", {})
     return StructuredTool(
-        name=PUX_PREFIX + "browser_solve_captcha", description=_BROWSER_SOLVE_CAPTCHA_DESC,
+        name="browser_solve_captcha", description=_BROWSER_SOLVE_CAPTCHA_DESC,
         args_schema=_BrowserSolveCaptchaArgs, func=_run,
     )
 
@@ -1317,10 +1315,10 @@ class _BrowserResetArgs(BaseModel):
     pass
 
 
-def _browser_reset_tool(exec_client: ExecClient) -> StructuredTool:
+def _browser_reset_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run() -> str:
-        return _sb_post(exec_client, "/reset", {})
+        return _sb_post(sandbox, "/reset", {})
     return StructuredTool(
-        name=PUX_PREFIX + "browser_reset", description=_BROWSER_RESET_DESC,
+        name="browser_reset", description=_BROWSER_RESET_DESC,
         args_schema=_BrowserResetArgs, func=_run,
     )

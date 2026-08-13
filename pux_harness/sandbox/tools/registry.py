@@ -15,8 +15,8 @@ reference fails loud (the contract and the runtime resolver share
 ``classify_slug`` / ``prefixed``, so they can no longer drift — see
 ``agent/org_validation.py`` rule 4 and ``agent/orgs.py`` ``_resolve_tools``).
 
-Per-tool ``Requirements`` (which Docker client / backend / vision model / org
-scope a factory needs, and which sandbox capabilities — ffmpeg, xdotool — it
+Per-tool ``Requirements`` (which optional kwargs — vision model / org
+scope — a factory needs, and which sandbox capabilities — ffmpeg, xdotool — it
 expects) are DECLARED here but NOT acted on: a tool whose capability is
 unsatisfied is still registered and reports an honest error at call time (the
 multimodal philosophy — present + honest, never a silent drop).
@@ -26,18 +26,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.exec import ExecClient
 from deepagents.backends.sandbox import BaseSandbox
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, PUX_GRADER_PREFIX
-from pux_harness.sandbox.tools.python import _python_tool
-from pux_harness.sandbox.tools.skills import _list_skills_tool
-from pux_harness.sandbox.tools.describe_image import _describe_image_tool
-from pux_harness.sandbox.tools.multimodal import _multimodal_tool, _multimodal_mega_tool
-from pux_harness.sandbox.tools.browser import (
+from ._pux import PUX_PREFIX, PUX_GRADER_PREFIX
+from .python import _python_tool
+from .skills import _list_skills_tool
+from .describe_image import _describe_image_tool
+from .multimodal import _multimodal_tool, _multimodal_mega_tool
+from .browser import (
     _browser_navigate_tool,
     _browser_click_tool,
     _browser_type_tool,
@@ -74,13 +73,13 @@ from pux_harness.sandbox.tools.browser import (
     _browser_solve_captcha_tool,
     _browser_reset_tool,
 )
-from pux_harness.sandbox.tools.desktop import (
+from .desktop import (
     _desktop_screenshot_tool,
     _desktop_click_tool,
     _desktop_type_tool,
     _desktop_key_tool,
 )
-from pux_harness.sandbox.tools.grader import (
+from .grader import (
     _grader_execute_tool,
     _grader_read_file_tool,
     _grader_grep_tool,
@@ -102,24 +101,20 @@ class Category(Enum):
 
 @dataclass(frozen=True)
 class Requirements:
-    """What a tool's factory needs to bind, and what it expects at call time.
+    """What a tool's factory needs beyond the standard ``sandbox: BaseSandbox``.
 
-    The first four fields select which ``ToolDeps`` members ``build_tools``
-    threads into the factory as keyword args (the factory param names match
-    these exactly: ``exec_client`` / ``backend`` / ``vision_model`` / ``org``).
+    Every specialist factory takes ``sandbox`` as its first param — that's the
+    portable BaseSandbox contract. ``vision`` and ``org`` flag the two OPTIONAL
+    kwargs ``make_specialist_tools`` threads in (``vision_model`` / ``org``).
     ``caps`` is DECLARE-ONLY metadata — sandbox binaries (ffmpeg, xdotool) the
     tool expects to find at call time; never gated on, surfaced for grep + a
     future informational contract warning."""
 
-    exec_client: bool = False
-    backend: bool = False
     vision: bool = False
     org: bool = False
     caps: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
-        # Accept a plain set literal (``caps={"ffmpeg"}``) and coerce — frozen
-        # dataclass, so assign through object.__setattr__.
         if not isinstance(self.caps, frozenset):
             object.__setattr__(self, "caps", frozenset(self.caps))
 
@@ -140,86 +135,76 @@ class ToolSpec:
     group: str | None = None
 
 
-@dataclass(frozen=True)
-class ToolDeps:
-    """The dependency bundle ``build_tools`` fans out to factories by need."""
-
-    exec_client: Any = None
-    backend: Any = None
-    vision_model: Any = None
-    org: str | None = None
-
-
 # --- THE registry ---------------------------------------------------------
-# Order is preserved by build_tools → matches the historical build order.
+# Order is preserved by make_specialist_tools → matches the historical build order.
 
 REGISTRY: list[ToolSpec] = [
     # python + skills. Note: there is no ``load_skill`` — skill bodies
     # are peeked via the native ``read_file`` (SkillsMiddleware advertises each
     # skill's name + description). The ``skills-peek-via-read-file`` contract
     # tripwire makes a re-introduction a HARD failure.
-    ToolSpec("python", Category.SPECIALIST, Requirements(exec_client=True), _python_tool, "code"),
+    ToolSpec("python", Category.SPECIALIST, Requirements(), _python_tool, "code"),
     ToolSpec("list_skills", Category.SPECIALIST, Requirements(org=True), _list_skills_tool, "skills"),
 
     # media (model-primary, declare their caps)
     ToolSpec("describe_image", Category.SPECIALIST,
-             Requirements(backend=True, exec_client=True, vision=True, caps={"onnx"}),
+             Requirements(vision=True, caps={"onnx"}),
              _describe_image_tool, "media"),
     ToolSpec("multimodal", Category.SPECIALIST,
-             Requirements(backend=True, exec_client=True, vision=True),
+             Requirements(vision=True),
              _multimodal_tool, "media"),
     ToolSpec("multimodal_mega", Category.SPECIALIST,
-             Requirements(backend=True, exec_client=True, vision=True, caps={"ffmpeg"}),
+             Requirements(vision=True, caps={"ffmpeg"}),
              _multimodal_mega_tool, "media"),
 
     # browser (SeleniumBase Chrome via sb_server)
-    ToolSpec("browser_navigate", Category.SPECIALIST, Requirements(exec_client=True), _browser_navigate_tool, "browser"),
-    ToolSpec("browser_click", Category.SPECIALIST, Requirements(exec_client=True), _browser_click_tool, "browser"),
-    ToolSpec("browser_type", Category.SPECIALIST, Requirements(exec_client=True), _browser_type_tool, "browser"),
-    ToolSpec("browser_screenshot", Category.SPECIALIST, Requirements(exec_client=True), _browser_screenshot_tool, "browser"),
-    ToolSpec("browser_evaluate", Category.SPECIALIST, Requirements(exec_client=True), _browser_evaluate_tool, "browser"),
-    ToolSpec("browser_search", Category.SPECIALIST, Requirements(exec_client=True), _browser_search_tool, "browser"),
-    ToolSpec("browser_scroll", Category.SPECIALIST, Requirements(exec_client=True), _browser_scroll_tool, "browser"),
-    ToolSpec("browser_go_back", Category.SPECIALIST, Requirements(exec_client=True), _browser_go_back_tool, "browser"),
-    ToolSpec("browser_wait", Category.SPECIALIST, Requirements(exec_client=True), _browser_wait_tool, "browser"),
-    ToolSpec("browser_find_text", Category.SPECIALIST, Requirements(exec_client=True), _browser_find_text_tool, "browser"),
-    ToolSpec("browser_extract", Category.SPECIALIST, Requirements(exec_client=True), _browser_extract_tool, "browser"),
-    ToolSpec("browser_extract_images", Category.SPECIALIST, Requirements(exec_client=True), _browser_extract_images_tool, "browser"),
-    ToolSpec("browser_save_screenshot", Category.SPECIALIST, Requirements(exec_client=True), _browser_save_screenshot_tool, "browser"),
-    ToolSpec("browser_download", Category.SPECIALIST, Requirements(exec_client=True), _browser_download_tool, "browser"),
-    ToolSpec("browser_upload", Category.SPECIALIST, Requirements(exec_client=True), _browser_upload_tool, "browser"),
-    ToolSpec("browser_tabs", Category.SPECIALIST, Requirements(exec_client=True), _browser_tabs_tool, "browser"),
-    ToolSpec("browser_new_tab", Category.SPECIALIST, Requirements(exec_client=True), _browser_new_tab_tool, "browser"),
-    ToolSpec("browser_switch_tab", Category.SPECIALIST, Requirements(exec_client=True), _browser_switch_tab_tool, "browser"),
-    ToolSpec("browser_close_tab", Category.SPECIALIST, Requirements(exec_client=True), _browser_close_tab_tool, "browser"),
-    ToolSpec("browser_dropdown_options", Category.SPECIALIST, Requirements(exec_client=True), _browser_dropdown_options_tool, "browser"),
-    ToolSpec("browser_select_dropdown", Category.SPECIALIST, Requirements(exec_client=True), _browser_select_dropdown_tool, "browser"),
-    ToolSpec("browser_save_session", Category.SPECIALIST, Requirements(exec_client=True), _browser_save_session_tool, "browser"),
-    ToolSpec("browser_restore_session", Category.SPECIALIST, Requirements(exec_client=True), _browser_restore_session_tool, "browser"),
+    ToolSpec("browser_navigate", Category.SPECIALIST, Requirements(), _browser_navigate_tool, "browser"),
+    ToolSpec("browser_click", Category.SPECIALIST, Requirements(), _browser_click_tool, "browser"),
+    ToolSpec("browser_type", Category.SPECIALIST, Requirements(), _browser_type_tool, "browser"),
+    ToolSpec("browser_screenshot", Category.SPECIALIST, Requirements(), _browser_screenshot_tool, "browser"),
+    ToolSpec("browser_evaluate", Category.SPECIALIST, Requirements(), _browser_evaluate_tool, "browser"),
+    ToolSpec("browser_search", Category.SPECIALIST, Requirements(), _browser_search_tool, "browser"),
+    ToolSpec("browser_scroll", Category.SPECIALIST, Requirements(), _browser_scroll_tool, "browser"),
+    ToolSpec("browser_go_back", Category.SPECIALIST, Requirements(), _browser_go_back_tool, "browser"),
+    ToolSpec("browser_wait", Category.SPECIALIST, Requirements(), _browser_wait_tool, "browser"),
+    ToolSpec("browser_find_text", Category.SPECIALIST, Requirements(), _browser_find_text_tool, "browser"),
+    ToolSpec("browser_extract", Category.SPECIALIST, Requirements(), _browser_extract_tool, "browser"),
+    ToolSpec("browser_extract_images", Category.SPECIALIST, Requirements(), _browser_extract_images_tool, "browser"),
+    ToolSpec("browser_save_screenshot", Category.SPECIALIST, Requirements(), _browser_save_screenshot_tool, "browser"),
+    ToolSpec("browser_download", Category.SPECIALIST, Requirements(), _browser_download_tool, "browser"),
+    ToolSpec("browser_upload", Category.SPECIALIST, Requirements(), _browser_upload_tool, "browser"),
+    ToolSpec("browser_tabs", Category.SPECIALIST, Requirements(), _browser_tabs_tool, "browser"),
+    ToolSpec("browser_new_tab", Category.SPECIALIST, Requirements(), _browser_new_tab_tool, "browser"),
+    ToolSpec("browser_switch_tab", Category.SPECIALIST, Requirements(), _browser_switch_tab_tool, "browser"),
+    ToolSpec("browser_close_tab", Category.SPECIALIST, Requirements(), _browser_close_tab_tool, "browser"),
+    ToolSpec("browser_dropdown_options", Category.SPECIALIST, Requirements(), _browser_dropdown_options_tool, "browser"),
+    ToolSpec("browser_select_dropdown", Category.SPECIALIST, Requirements(), _browser_select_dropdown_tool, "browser"),
+    ToolSpec("browser_save_session", Category.SPECIALIST, Requirements(), _browser_save_session_tool, "browser"),
+    ToolSpec("browser_restore_session", Category.SPECIALIST, Requirements(), _browser_restore_session_tool, "browser"),
     # SOTA mouse/keyboard/DnD (still pure-CDP SeleniumBase, no new deps)
-    ToolSpec("browser_drag", Category.SPECIALIST, Requirements(exec_client=True), _browser_drag_tool, "browser"),
-    ToolSpec("browser_hover", Category.SPECIALIST, Requirements(exec_client=True), _browser_hover_tool, "browser"),
-    ToolSpec("browser_press", Category.SPECIALIST, Requirements(exec_client=True), _browser_press_tool, "browser"),
-    ToolSpec("browser_click_at", Category.SPECIALIST, Requirements(exec_client=True), _browser_click_at_tool, "browser"),
-    ToolSpec("browser_scroll_into_view", Category.SPECIALIST, Requirements(exec_client=True), _browser_scroll_into_view_tool, "browser"),
-    ToolSpec("browser_a11y", Category.SPECIALIST, Requirements(exec_client=True), _browser_a11y_tool, "browser"),
-    ToolSpec("browser_iframe", Category.SPECIALIST, Requirements(exec_client=True), _browser_iframe_tool, "browser"),
+    ToolSpec("browser_drag", Category.SPECIALIST, Requirements(), _browser_drag_tool, "browser"),
+    ToolSpec("browser_hover", Category.SPECIALIST, Requirements(), _browser_hover_tool, "browser"),
+    ToolSpec("browser_press", Category.SPECIALIST, Requirements(), _browser_press_tool, "browser"),
+    ToolSpec("browser_click_at", Category.SPECIALIST, Requirements(), _browser_click_at_tool, "browser"),
+    ToolSpec("browser_scroll_into_view", Category.SPECIALIST, Requirements(), _browser_scroll_into_view_tool, "browser"),
+    ToolSpec("browser_a11y", Category.SPECIALIST, Requirements(), _browser_a11y_tool, "browser"),
+    ToolSpec("browser_iframe", Category.SPECIALIST, Requirements(), _browser_iframe_tool, "browser"),
     # Captcha bypass + fingerprint-legitimacy tools (SeleniumBase UC mode + curated consent)
-    ToolSpec("browser_uc", Category.SPECIALIST, Requirements(exec_client=True), _browser_uc_tool, "browser"),
-    ToolSpec("browser_accept_cookies", Category.SPECIALIST, Requirements(exec_client=True), _browser_accept_cookies_tool, "browser"),
-    ToolSpec("browser_warmup_history", Category.SPECIALIST, Requirements(exec_client=True), _browser_warmup_history_tool, "browser"),
-    ToolSpec("browser_solve_captcha", Category.SPECIALIST, Requirements(exec_client=True), _browser_solve_captcha_tool, "browser"),
-    ToolSpec("browser_reset", Category.SPECIALIST, Requirements(exec_client=True), _browser_reset_tool, "browser"),
+    ToolSpec("browser_uc", Category.SPECIALIST, Requirements(), _browser_uc_tool, "browser"),
+    ToolSpec("browser_accept_cookies", Category.SPECIALIST, Requirements(), _browser_accept_cookies_tool, "browser"),
+    ToolSpec("browser_warmup_history", Category.SPECIALIST, Requirements(), _browser_warmup_history_tool, "browser"),
+    ToolSpec("browser_solve_captcha", Category.SPECIALIST, Requirements(), _browser_solve_captcha_tool, "browser"),
+    ToolSpec("browser_reset", Category.SPECIALIST, Requirements(), _browser_reset_tool, "browser"),
 
     # desktop (xdotool + Xvfb)
     ToolSpec("desktop_screenshot", Category.SPECIALIST,
-             Requirements(exec_client=True, caps={"xdotool", "x11"}), _desktop_screenshot_tool, "desktop"),
+             Requirements(caps={"xdotool", "x11"}), _desktop_screenshot_tool, "desktop"),
     ToolSpec("desktop_click", Category.SPECIALIST,
-             Requirements(exec_client=True, caps={"xdotool", "x11"}), _desktop_click_tool, "desktop"),
+             Requirements(caps={"xdotool", "x11"}), _desktop_click_tool, "desktop"),
     ToolSpec("desktop_type", Category.SPECIALIST,
-             Requirements(exec_client=True, caps={"xdotool", "x11"}), _desktop_type_tool, "desktop"),
+             Requirements(caps={"xdotool", "x11"}), _desktop_type_tool, "desktop"),
     ToolSpec("desktop_key", Category.SPECIALIST,
-             Requirements(exec_client=True, caps={"xdotool", "x11"}), _desktop_key_tool, "desktop"),
+             Requirements(caps={"xdotool", "x11"}), _desktop_key_tool, "desktop"),
 
     # native fs/shell — injected by FilesystemMiddleware, no factory here.
     ToolSpec("ls", Category.NATIVE, Requirements(), None),
@@ -235,9 +220,9 @@ REGISTRY: list[ToolSpec] = [
     # classify_slug resolves NATIVE first, which is correct — graders never
     # appear in an agent whitelist. GRADERS/GRADER_TOOL_NAMES stay well-defined
     # because they filter by category before prefixing.
-    ToolSpec("execute", Category.GRADER, Requirements(exec_client=True), _grader_execute_tool),
-    ToolSpec("read_file", Category.GRADER, Requirements(exec_client=True), _grader_read_file_tool),
-    ToolSpec("grep", Category.GRADER, Requirements(exec_client=True), _grader_grep_tool),
+    ToolSpec("execute", Category.GRADER, Requirements(), _grader_execute_tool),
+    ToolSpec("read_file", Category.GRADER, Requirements(), _grader_read_file_tool),
+    ToolSpec("grep", Category.GRADER, Requirements(), _grader_grep_tool),
 ]
 
 
@@ -344,51 +329,51 @@ def classify_slug(slug: str) -> Category | None:
     return None
 
 
-def build_tools(deps: ToolDeps, category: Category) -> list[StructuredTool]:
-    """Instantiate every ``REGISTRY`` tool of ``category``, threading only the
-    deps each tool declared in its ``Requirements`` (by keyword — factory param
-    names match the need fields). Skips NATIVE (factory is None; the deepagents
-    ``FilesystemMiddleware`` injects those)."""
+def make_specialist_tools(
+    sandbox: BaseSandbox, *, vision_model: object | None = None,
+    org: str | None = None, apply_prefix: bool = True,
+) -> list[StructuredTool]:
+    """Build every native ``pux_sandbox_*`` specialist tool.
+
+    Takes a standard ``BaseSandbox`` — the SAME interface any LangChain
+    project provides (OpenShell, LocalShell, E2B, …). The specialist tools
+    (python/browser/desktop/grader/media) are zero-pux-import factories that
+    accept ``BaseSandbox`` directly; they are portable to any langchain project.
+
+    Each factory creates a StructuredTool with a PLAIN name (``python``,
+    ``browser_navigate``, …). When ``apply_prefix`` is True (default), the
+    ``pux_sandbox_`` prefix is applied so org configs and the contract layer
+    (``resolve_tool_allowlist`` / ``prefixed``) continue matching.
+
+    ``vision_model`` threads the multimodal LLM into ``describe_image`` /
+    ``multimodal`` / ``multimodal_mega`` (skipped when None).
+    ``org`` scopes the skills tools (skipped when None)."""
     out: list[StructuredTool] = []
     for spec in REGISTRY:
-        if spec.category is not category or spec.factory is None:
+        if spec.category is not Category.SPECIALIST or spec.factory is None:
             continue
-        kw: dict[str, Any] = {}
-        if spec.needs.exec_client:
-            kw["exec_client"] = deps.exec_client
-        if spec.needs.backend:
-            kw["backend"] = deps.backend
+        kw: dict[str, Any] = {"sandbox": sandbox}
         if spec.needs.vision:
-            kw["vision_model"] = deps.vision_model
+            kw["vision_model"] = vision_model
         if spec.needs.org:
-            kw["org"] = deps.org
+            kw["org"] = org
         out.append(spec.factory(**kw))
+
+    if apply_prefix:
+        for t in out:
+            t.name = PUX_PREFIX + t.name
+
     return out
 
 
-def build_native_specialists(
-    exec_client: ExecClient, vision_model: object | None = None,
-    org: str | None = None, backend: BaseSandbox | None = None,
-) -> list[StructuredTool]:
-    """Every native ``pux_sandbox_*`` specialist. Thin category filter over
-    ``build_tools`` — signature preserved so ``graph.py`` / ``main.py`` and the
-    monkeypatching test sites are untouched.
-
-    ``vision_model`` threads the MULTIMODAL LLM into ``describe_image`` /
-    ``multimodal`` / ``multimodal_mega`` (model-primary, ONNX/ffmpeg fallback).
-    ``org`` scopes the skills tools. ``backend`` is the BaseSandbox the
-    three media tools read sandbox files through. See each tool's
-    ``Requirements`` entry in ``REGISTRY``."""
-    return build_tools(
-        ToolDeps(exec_client=exec_client, backend=backend,
-                 vision_model=vision_model, org=org),
-        Category.SPECIALIST,
-    )
-
-
-def build_grader_tools(exec_client: ExecClient) -> list[StructuredTool]:
+def build_grader_tools(sandbox: BaseSandbox) -> list[StructuredTool]:
     """The three ``pux_grader_*`` evidence tools for ``RubricMiddleware``'s
-    grader. Relocated here from ``grader.py`` so the registry owns every
-    builder (and ``grader.py`` stays a leaf module, avoiding a
-    ``grader -> registry -> grader`` import cycle). Signature preserved."""
-    return build_tools(ToolDeps(exec_client=exec_client), Category.GRADER)
+    grader. Takes a ``BaseSandbox`` — the tools are portable."""
+    out: list[StructuredTool] = []
+    for spec in REGISTRY:
+        if spec.category is not Category.GRADER or spec.factory is None:
+            continue
+        tool = spec.factory(sandbox)
+        tool.name = PUX_GRADER_PREFIX + tool.name
+        out.append(tool)
+    return out

@@ -25,12 +25,12 @@ from pux_harness.sandbox.tools import (
     TOOL_GROUP_TOOLS,
     ToolSpec,
     build_grader_tools,
-    build_native_specialists,
+    make_specialist_tools,
     classify_slug,
     prefixed,
     resolve_tool_allowlist,
 )
-from pux_harness.sandbox.tools._shared import PUX_GRADER_PREFIX, PUX_PREFIX
+from pux_harness.sandbox.tools._pux import PUX_GRADER_PREFIX, PUX_PREFIX
 
 # A sentinel exec_client — factories bind it at build time and only USE it at
 # tool-invocation time, so any object builds fine (mirrors test_browser_tools).
@@ -62,7 +62,7 @@ def test_registry_is_non_empty_and_partitioned():
 
 def test_native_specs_have_no_factory_others_do():
     """NATIVE entries are middleware-provided (factory=None); every SPECIALIST
-    + GRADER entry must carry a callable factory, or build_tools silently
+    + GRADER entry must carry a callable factory, or make_specialist_tools silently
     drops it."""
     for spec in REGISTRY:
         if spec.category is Category.NATIVE:
@@ -131,7 +131,7 @@ def test_build_native_specialists_matches_specialist_tool_names():
     hazard between the old 33-call factory list and the frozenset is now
     machine-enforced. A new ToolSpec that the builder forgets to instantiate
     fails here."""
-    built = {t.name for t in build_native_specialists(exec_client=_EXEC)}
+    built = {t.name for t in make_specialist_tools(_EXEC)}
     assert built == SPECIALIST_TOOL_NAMES, (
         f"drift: built-only={built - SPECIALIST_TOOL_NAMES} "
         f"declared-only={SPECIALIST_TOOL_NAMES - built}"
@@ -140,7 +140,7 @@ def test_build_native_specialists_matches_specialist_tool_names():
 
 def test_build_grader_tools_matches_grader_tool_names():
     """Symmetric derivation proof for the grader surface."""
-    built = {t.name for t in build_grader_tools(exec_client=_EXEC)}
+    built = {t.name for t in build_grader_tools(_EXEC)}
     assert built == GRADER_TOOL_NAMES, (
         f"drift: built-only={built - GRADER_TOOL_NAMES} "
         f"declared-only={GRADER_TOOL_NAMES - built}"

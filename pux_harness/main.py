@@ -34,7 +34,7 @@ from pux_harness.threads import open_thread_store
 from pux_harness.sandbox.tools import (
     LEGACY_TOOL_NAMES,
     NATIVE_FS_TOOLS,
-    build_native_specialists,
+    make_specialist_tools,
 )
 from pux_harness.agent.orgs import (
     discover_orgs,
@@ -573,7 +573,7 @@ def run_check_smoke(org: str = "general") -> None:
     """Shared-backend + native specialist smoke test (no model call)."""
     exec_client = shared_exec()
     backend = shared_backend()
-    specialists = build_native_specialists(exec_client, org=org)
+    specialists = make_specialist_tools(shared_backend(), org=org)
     print(
         f"backend OK: {len(specialists)} native pux_sandbox_* specialists + "
         f"native fs (ls/read_file/write_file/edit_file/glob/grep/execute)"

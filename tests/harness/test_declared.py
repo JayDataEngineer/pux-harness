@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from pux_harness.agent.orgs import _resolve_tools
 from pux_harness.sandbox.tools import declared as D
-from pux_harness.sandbox.tools._shared import PUX_PREFIX
+from pux_harness.sandbox.tools._pux import PUX_PREFIX
 from pux_harness.sandbox.tools.declared import (
     ArgSpec,
     DeclaredToolSpec,
@@ -52,9 +52,11 @@ class _FakeExec:
         self._out = out
         self._exit = exit_code
 
-    def exec(self, command: str, *, timeout: int | None = None) -> tuple[str, int]:
+    def execute(self, command: str, *, timeout: int | None = None):
+        from collections import namedtuple
         self.calls.append((command, timeout))
-        return (self._out, self._exit)
+        _Resp = namedtuple("_Resp", ["output", "exit_code", "truncated"])
+        return _Resp(self._out, self._exit, False)
 
 
 def _spec(
@@ -117,7 +119,7 @@ tools:
 # --- building --------------------------------------------------------------
 
 def test_build_empty_when_no_yaml(tmp_path: Path):
-    assert build_declared_tools(tmp_path, exec_client=_FakeExec()) == []
+    assert build_declared_tools(tmp_path, _FakeExec()) == []
 
 
 def test_build_synthesizes_named_structured_tool(tmp_path: Path, monkeypatch):
@@ -134,7 +136,7 @@ tools:
       - {name: rank, type: integer, required: false, default: 5}
 """)
     monkeypatch.setattr(D, "project_root", lambda: tmp_path)  # tmp_path IS the project root
-    tools = build_declared_tools(tmp_path, exec_client=_FakeExec())
+    tools = build_declared_tools(tmp_path, _FakeExec())
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, StructuredTool)
@@ -366,7 +368,7 @@ def test_exec_guard_contract_rule_fires_only_when_tools_declared_and_routing_rem
     the org declares tools AND removes routing. The other three combos are
     silent — declaring nothing makes the guard a no-op (routing choice is
     free), and keeping routing means the guard is on."""
-    from pux_harness.agent.contract import _declared_exec_guard_violation as rule
+    from pux_harness.agent.org_validation import _declared_exec_guard_violation as rule
 
     v = rule(declares_tools=True, routing_removed=True, org="acme")
     assert len(v) == 1, v

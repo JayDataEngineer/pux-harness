@@ -36,7 +36,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from pux_harness.sandbox.exec import shared_backend, shared_exec
-from pux_harness.sandbox.tools import build_native_specialists
+from pux_harness.sandbox.tools import make_specialist_tools
 
 # ── logging (stderr only) ────────────────────────────────────────────────────
 
@@ -126,13 +126,11 @@ def _wrap_structured_tool(tool: Any) -> Any:
 
 def _register_all() -> int:
     """Build every specialist StructuredTool + register each with FastMCP."""
-    client = shared_exec()
     backend = shared_backend()
     org = os.environ.get("PUX_ORG") or None
 
-    tools = build_native_specialists(
-        exec_client=client,
-        backend=backend,
+    tools = make_specialist_tools(
+        backend,
         vision_model=None,
         org=org,
     )

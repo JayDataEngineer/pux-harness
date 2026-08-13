@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from deepagents.backends.sandbox import BaseSandbox
+
 import shlex
 
 from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.exec import ExecClient
-from pux_harness.sandbox.tools._shared import PUX_GRADER_PREFIX, _result
+from ._shared import _result, _exec
 
 
 class _GraderExecuteArgs(BaseModel):
@@ -28,17 +29,17 @@ _GRADER_EXECUTE_DESC = (
 )
 
 
-def _grader_execute_tool(exec_client: ExecClient) -> StructuredTool:
+def _grader_execute_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(command: str) -> str:
         if not command:
             return _result({"success": False, "error": "no command provided"})
-        out, exit_code = exec_client.exec(command)
+        out, exit_code = _exec(sandbox, command)
         return _result({
             "success": True, "exit_code": exit_code, "output": out,
         })
 
     return StructuredTool(
-        name=PUX_GRADER_PREFIX + "execute", description=_GRADER_EXECUTE_DESC,
+        name="execute", description=_GRADER_EXECUTE_DESC,
         args_schema=_GraderExecuteArgs, func=_run,
     )
 
@@ -59,11 +60,11 @@ _GRADER_READ_FILE_DESC = (
 )
 
 
-def _grader_read_file_tool(exec_client: ExecClient) -> StructuredTool:
+def _grader_read_file_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(path: str) -> str:
         if not path:
             return _result({"success": False, "error": "no path provided"})
-        out, exit_code = exec_client.exec(f"cat {shlex.quote(path)}")
+        out, exit_code = _exec(sandbox, f"cat {shlex.quote(path)}")
         if exit_code != 0:
             return _result({
                 "success": False, "error": f"cat exited {exit_code}", "output": out,
@@ -71,7 +72,7 @@ def _grader_read_file_tool(exec_client: ExecClient) -> StructuredTool:
         return _result({"success": True, "path": path, "content": out})
 
     return StructuredTool(
-        name=PUX_GRADER_PREFIX + "read_file", description=_GRADER_READ_FILE_DESC,
+        name="read_file", description=_GRADER_READ_FILE_DESC,
         args_schema=_GraderReadFileArgs, func=_run,
     )
 
@@ -94,7 +95,7 @@ _GRADER_GREP_DESC = (
 )
 
 
-def _grader_grep_tool(exec_client: ExecClient) -> StructuredTool:
+def _grader_grep_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(pattern: str, path: str = "/sandbox/workspace",
              include: str | None = None) -> str:
         if not pattern:
@@ -102,7 +103,7 @@ def _grader_grep_tool(exec_client: ExecClient) -> StructuredTool:
         cmd = f"grep -rn {shlex.quote(pattern)} {shlex.quote(path)}"
         if include:
             cmd += f" --include={shlex.quote(include)}"
-        out, exit_code = exec_client.exec(cmd)
+        out, exit_code = _exec(sandbox, cmd)
         if exit_code == 2:
             return _result({"success": False, "error": f"grep error: {out or 'bad pattern/path'}"})
         return _result({
@@ -112,7 +113,7 @@ def _grader_grep_tool(exec_client: ExecClient) -> StructuredTool:
         })
 
     return StructuredTool(
-        name=PUX_GRADER_PREFIX + "grep", description=_GRADER_GREP_DESC,
+        name="grep", description=_GRADER_GREP_DESC,
         args_schema=_GraderGrepArgs, func=_run,
     )
 

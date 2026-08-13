@@ -9,10 +9,9 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.exec import ExecClient
 from deepagents.backends.sandbox import BaseSandbox
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result
-from pux_harness.sandbox.tools._media import (
+from ._shared import _tail, _result, _exec
+from ._media import (
     _read_media, _invoke_primary_media, _onnx_describe,
     _media_kind, _extract_video_keyframes, _model_name, _IMAGE_FETCH_TIMEOUT,
     _MediaNonAnswer,
@@ -90,8 +89,7 @@ def _multimodal_unsupported(name: str) -> dict:
 
 
 def _multimodal_tool(
-    backend: BaseSandbox,
-    exec_client: ExecClient,
+    sandbox: BaseSandbox,
     vision_model: object | None = None,
 ) -> StructuredTool:
     def _run(
@@ -115,7 +113,7 @@ def _multimodal_tool(
                     "waterfall, or `describe_image` for an image-only ONNX path."),
             })
         try:
-            b64, mime = _read_media(backend, exec_client, media_path, media_url)
+            b64, mime = _read_media(sandbox, media_path, media_url)
             desc = _invoke_primary_media(vision_model, b64, mime, prompt, kind)
         except _MediaNonAnswer as exc:
             # The model replied but confessed it didn't receive the media (e.g.
@@ -138,14 +136,13 @@ def _multimodal_tool(
         })
 
     return StructuredTool(
-        name=PUX_PREFIX + "multimodal", description=_MULTIMODAL_DESC,
+        name="multimodal", description=_MULTIMODAL_DESC,
         args_schema=_MultimodalArgs, func=_run,
     )
 
 
 def _multimodal_mega_tool(
-    backend: BaseSandbox,
-    exec_client: ExecClient,
+    sandbox: BaseSandbox,
     vision_model: object | None = None,
 ) -> StructuredTool:
     def _run(
@@ -164,7 +161,7 @@ def _multimodal_mega_tool(
         primary_error: str | None = None
         if vision_model is not None:
             try:
-                b64, mime = _read_media(backend, exec_client, media_path, media_url)
+                b64, mime = _read_media(sandbox, media_path, media_url)
                 desc = _invoke_primary_media(vision_model, b64, mime, prompt, kind)
                 return _result({
                     "success": True, "description": desc,
@@ -177,7 +174,7 @@ def _multimodal_mega_tool(
 
         if kind == "image":
             d = _onnx_describe(
-                exec_client, image_path=media_path, image_url=media_url,
+                sandbox, image_path=media_path, image_url=media_url,
                 prompt=prompt, primary_error=primary_error,
             )
             d["media_type"] = "image"
@@ -200,7 +197,7 @@ def _multimodal_mega_tool(
         if media_url and not media_path:
             dl = ("curl -s -L --max-time 60 -o /tmp/pux_mm_video "
                   + shlex.quote(media_url))
-            out, exit_code = exec_client.exec(dl, timeout=_IMAGE_FETCH_TIMEOUT)
+            out, exit_code = _exec(sandbox, dl, timeout=_IMAGE_FETCH_TIMEOUT)
             if exit_code != 0:
                 return _result({"success": False, "media_type": "video",
                                 "reason": "video_download_failed",
@@ -209,7 +206,7 @@ def _multimodal_mega_tool(
         else:
             video_file = media_path or ""
 
-        frames, ferr = _extract_video_keyframes(exec_client, video_file)
+        frames, ferr = _extract_video_keyframes(sandbox, video_file)
         if ferr:
             return _result({"success": False, "media_type": "video",
                             "reason": ferr, **pe})
@@ -219,7 +216,7 @@ def _multimodal_mega_tool(
             frame_error: str | None = None
             if vision_model is not None:
                 try:
-                    b64, _ = _read_media(backend, exec_client, fp, None)
+                    b64, _ = _read_media(sandbox, fp, None)
                     desc = _invoke_primary_media(
                         vision_model, b64, "image/png", prompt, "video_frame")
                     per_frame.append({"frame": fp, "success": True,
@@ -227,7 +224,7 @@ def _multimodal_mega_tool(
                     continue
                 except Exception as exc:
                     frame_error = str(exc)
-            d = _onnx_describe(exec_client, image_path=fp, image_url=None,
+            d = _onnx_describe(sandbox, image_path=fp, image_url=None,
                                prompt=prompt, primary_error=frame_error)
             d["frame"] = fp
             per_frame.append(d)
@@ -244,6 +241,6 @@ def _multimodal_mega_tool(
         })
 
     return StructuredTool(
-        name=PUX_PREFIX + "multimodal_mega", description=_MULTIMODAL_MEGA_DESC,
+        name="multimodal_mega", description=_MULTIMODAL_MEGA_DESC,
         args_schema=_MultimodalArgs, func=_run,
     )

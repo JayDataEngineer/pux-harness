@@ -6,10 +6,9 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.exec import ExecClient
 from deepagents.backends.sandbox import BaseSandbox
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result
-from pux_harness.sandbox.tools._media import _read_media, _invoke_primary_media, _onnx_describe, _model_name
+from ._shared import _tail, _result
+from ._media import _read_media, _invoke_primary_media, _onnx_describe, _model_name
 
 
 class _DescribeImageArgs(BaseModel):
@@ -39,8 +38,7 @@ _DESCRIBE_IMAGE_DESC = (
 
 
 def _describe_image_tool(
-    backend: BaseSandbox,
-    exec_client: ExecClient,
+    sandbox: BaseSandbox,
     vision_model: object | None = None,
 ) -> StructuredTool:
     def _run(
@@ -56,7 +54,7 @@ def _describe_image_tool(
         primary_error: str | None = None
         if vision_model is not None:
             try:
-                b64, mime = _read_media(backend, exec_client, image_path, image_url)
+                b64, mime = _read_media(sandbox, image_path, image_url)
                 desc = _invoke_primary_media(vision_model, b64, mime, prompt, "image")
                 return _result({
                     "success": True,
@@ -69,11 +67,11 @@ def _describe_image_tool(
         {"primary_error": _tail(primary_error, 300)} if primary_error else {}
 
         return _result(_onnx_describe(
-            exec_client, image_path=image_path, image_url=image_url,
+            sandbox, image_path=image_path, image_url=image_url,
             prompt=prompt, primary_error=primary_error,
         ))
 
     return StructuredTool(
-        name=PUX_PREFIX + "describe_image", description=_DESCRIBE_IMAGE_DESC,
+        name="describe_image", description=_DESCRIBE_IMAGE_DESC,
         args_schema=_DescribeImageArgs, func=_run,
     )

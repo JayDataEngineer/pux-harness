@@ -406,21 +406,21 @@ def _reset_catalog_cache() -> None:
 
 
 def _patch_contract_to_scratch(monkeypatch, orgs_dir: Path) -> Path:
-    """Redirect ``check_org``'s resolution at a scratch ``orgs/`` tree.
+    """Redirect ``audit_org``'s resolution at a scratch ``orgs/`` tree.
 
     Mirrors the parent ``fake_orgs_tree`` fixture (``tests/conftest.py``): the
-    contract-test seam is patched at BOTH module sites — ``contract._orgs_dir``
+    contract-test seam is patched at BOTH module sites — ``org_validation._orgs_dir``
     AND ``orgs._orgs_dir`` — so every ``orgs.py`` delegate that reads
     ``orgs._orgs_dir()`` (``_agent_search_dirs`` / ``org_agent_slugs`` / …), not
-    just ``check_org``'s direct ``contract._orgs_dir()`` calls, resolves against
-    the scratch tree. Patching only ``contract._orgs_dir`` leaves those delegates
+    just ``audit_org``'s direct ``org_validation._orgs_dir()`` calls, resolves against
+    the scratch tree. Patching only ``org_validation._orgs_dir`` leaves those delegates
     walking the real tree (``search_org_dir`` → ``FileNotFoundError``).
     ``_shared/agents`` is pre-created (the search-dirs root the roster walk
     touches)."""
-    from pux_harness.agent import contract, orgs
+    from pux_harness.agent import org_validation, orgs
 
     (orgs_dir / "_shared" / "agents").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(contract, "_orgs_dir", lambda: orgs_dir)
+    monkeypatch.setattr(org_validation, "_orgs_dir", lambda: orgs_dir)
     monkeypatch.setattr(orgs, "_orgs_dir", lambda: orgs_dir)
     return orgs_dir
 
@@ -459,7 +459,7 @@ def test_mcp_org_yaml_capabilities_allowlist_no_legacy_union(tmp_path, monkeypat
     """CU-4 (strict one-way): org.yaml mcp capabilities honor an allowlist
     override, and there is NO union with ``policy.yaml tool_servers:`` — that
     legacy block is unread by the resolver (a permanent contract failure in
-    contract.py). Only the org.yaml capability resolves; ``media`` (declared in
+    ``org_validation.py``). Only the org.yaml capability resolves; ``media`` (declared in
     the banned policy block) never surfaces."""
     orgs_dir = tmp_path / "orgs"
     org_dir = _patch_ts_to_scratch(monkeypatch, orgs_dir, _ORG)
@@ -503,12 +503,12 @@ def test_no_legacy_tool_servers_policy_block_is_contract_violation(
 ):
     """CU-4 no-legacy-left-behind gate: a ``policy.yaml tool_servers:`` block is a
     PERMANENT contract failure — ``org.yaml capabilities:`` (kind: mcp) is the one
-    canonical MCP site. The gate BITES: ``check_org`` emits a
+    canonical MCP site. The gate BITES: ``audit_org`` emits a
     ``no-legacy-tool-servers`` error. (The resolver half — that the block is
     unread, declares nothing — is proven by the
     ``test_mcp_org_yaml_capabilities_*`` cases above; this proves the contract
     half that FORBIDS the block outright.)"""
-    from pux_harness.agent import contract as C
+    from pux_harness.agent import org_validation as C
 
     orgs_dir = tmp_path / "orgs"
     _patch_contract_to_scratch(monkeypatch, orgs_dir)
@@ -520,7 +520,7 @@ def test_no_legacy_tool_servers_policy_block_is_contract_violation(
     (org_dir / "org.yaml").write_text("agents: []\n")
     (org_dir / "policy.yaml").write_text("tool_servers:\n  - equibles\n")
 
-    rules = {v.rule for v in C.check_org(_ORG)}
+    rules = {v.rule for v in C.audit_org(_ORG)}
     assert "no-legacy-tool-servers" in rules
 
 
@@ -529,7 +529,7 @@ def test_no_legacy_tool_servers_clean_org_is_silent(tmp_path, monkeypatch):
     ``org.yaml capabilities:`` (kind: mcp) site and NO policy ``tool_servers:``
     block does NOT trip ``no-legacy-tool-servers`` — the rule never false-fires
     on the post-CU-4 form. (All real orgs migrated; this pins the negative.)"""
-    from pux_harness.agent import contract as C
+    from pux_harness.agent import org_validation as C
 
     orgs_dir = tmp_path / "orgs"
     _patch_contract_to_scratch(monkeypatch, orgs_dir)
@@ -542,5 +542,5 @@ def test_no_legacy_tool_servers_clean_org_is_silent(tmp_path, monkeypatch):
     (org_dir / "org.yaml").write_text("agents: []\n")
     (org_dir / "policy.yaml").write_text("credentials: {}\n")
 
-    rules = {v.rule for v in C.check_org(_ORG)}
+    rules = {v.rule for v in C.audit_org(_ORG)}
     assert "no-legacy-tool-servers" not in rules

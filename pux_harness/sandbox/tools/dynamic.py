@@ -9,7 +9,7 @@ result + an index entry, never the function body — the real lever for a
 low-power model. See ``docs/dynamic-tools-and-packaging.md`` Part 1.
 
 Rhymes with ``declared.py``: synthesizes langchain ``StructuredTool``s whose
-``func`` exec's IN-CONTAINER via the same ``ExecClient``. The split that
+``func`` exec's IN-CONTAINER via the same ``BaseSandbox``. The split that
 matters:
 
 * **Authoring is HOST-side** (``pathlib`` writes to
@@ -65,7 +65,7 @@ from pydantic import Field, create_model
 
 from pux_harness.kit._paths import project_root
 from pux_harness.sandbox.exec import WORKSPACE_ROOT
-from pux_harness.sandbox.tools._shared import _NoArgs, _result, _tail
+from ._shared import _NoArgs, _result, _tail, _exec
 
 log = logging.getLogger(__name__)
 
@@ -446,7 +446,7 @@ def _call_args_model() -> type:
     )
 
 
-# --- tool closures (each closes over org_lib_dir [+ exec_client]) -----------
+# --- tool closures (each closes over org_lib_dir [+ sandbox]) -----------
 
 def _make_make(org_lib_dir: Path, label: str):
     def _run(name: str, description: str, code: str) -> str:
@@ -563,7 +563,7 @@ def _make_list(org_lib_dir: Path):
     return _run
 
 
-def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
+def _make_call(org_lib_dir: Path, sandbox: Any, label: str):
     def _run(name: str, arguments: dict | None = None) -> str:
         root = _resolve_root(org_lib_dir, name)
         if root is None:
@@ -598,7 +598,7 @@ def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
             f"python3 -c {shlex.quote(runner)}"
         )
         try:
-            out, exit_code = exec_client.exec(cmd, timeout=DEFAULT_DYN_TIMEOUT)
+            out, exit_code = _exec(sandbox, cmd, timeout=DEFAULT_DYN_TIMEOUT)
         except Exception as exc:  # exec infra failure, not the function's fault
             _bump_call(root, name, success=False)
             return _result({"success": False, "error": f"exec failed: {exc}", "command": cmd})
@@ -639,7 +639,7 @@ def _make_call(org_lib_dir: Path, exec_client: Any, label: str):
 
 # --- public builder ---------------------------------------------------------
 
-def build_dynamic_tools(org_lib_dir: Path, exec_client: Any) -> list[StructuredTool]:
+def build_dynamic_tools(org_lib_dir: Path, sandbox: Any) -> list[StructuredTool]:
     """Synthesize the four ``pux_dyn_*`` StructuredTools for an org's ``lib/``.
 
     ``org_lib_dir`` is the host path to ``orgs/<org>/lib`` (resolved by the
@@ -692,6 +692,6 @@ def build_dynamic_tools(org_lib_dir: Path, exec_client: Any) -> list[StructuredT
                 "out of your context, only its return value comes back)."
             ),
             args_schema=_call_args_model(),
-            func=_make_call(org_lib_dir, exec_client, label),
+            func=_make_call(org_lib_dir, sandbox, label),
         ),
     ]

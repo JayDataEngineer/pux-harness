@@ -18,13 +18,16 @@ Two complementary lock-ins (both ``verify-or-die``):
 The tripwire resolves relative imports to absolute first, so a within-kit
 ``from .loaders import ...`` (resolves to ``pux_harness.kit.loaders``) is NOT a
 false positive.
+
+The tripwire lives in ``tests/harness/tripwire_checks.py`` — the TEST half of
+the former ``pux_harness/agent/contract.py`` (a permanent, repo-wide gate that
+is optional and never deployed). Being imported by this suite IS its
+registration: there is no runtime global gate anymore.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-from pux_harness.agent import contract
-from pux_harness.agent.contract import (
+from tests.harness.tripwire_checks import (
+    _HEAVY_MODULE_ROOTS,
     _kit_import_isolation,
     _scan_for_heavy_imports,
 )
@@ -39,19 +42,6 @@ def test_tripwire_green_on_real_kit():
     """The real ``pux_harness/kit/**`` + top-level ``__init__.py`` import nothing
     heavy — the tripwire is clean on the shipped source."""
     assert _kit_import_isolation() == [], _kit_import_isolation()
-
-
-def test_tripwire_registered_in_global_gate():
-    """``kit-import-isolation`` runs as part of ``check_harness()`` (it's not a
-    standalone helper someone could forget to call)."""
-    ids = {v.rule for v in contract.check_harness()}
-    # It's green today, so it won't appear in the violation list — register the
-    # hook by asserting the helper is wired in (the function exists + is called
-    # by check_harness). Drive the helper directly to confirm it produces the
-    # rule id on a provocation.
-    Path(__file__)  # any real file; overwritten below via tmp
-    assert callable(_kit_import_isolation)
-    assert "kit-import-isolation" not in ids  # green → no violation emitted
 
 
 # --- provocation: heavy module import trips --------------------------------
@@ -93,7 +83,7 @@ def test_trips_on_lazy_import_inside_function(tmp_path):
 
 def test_trips_on_every_declared_heavy_root(tmp_path):
     """Every root in ``_HEAVY_MODULE_ROOTS`` is rejected — none can sneak in."""
-    for root in contract._HEAVY_MODULE_ROOTS:
+    for root in _HEAVY_MODULE_ROOTS:
         src = tmp_path / f"{root}_probe.py"
         src.write_text(f"import {root}\n")
         vs = _scan_for_heavy_imports(src, KIT_PKG)

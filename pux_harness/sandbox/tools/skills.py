@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, SKILL_FILE, _result, _skills_dirs, _NoArgs
+from ._shared import _result, _NoArgs
+from ._pux import SKILL_FILE, _skills_dirs
 
 
 def _parse_skill(raw: str) -> tuple[str, str]:
@@ -50,7 +51,7 @@ _LIST_SKILLS_DESC = (
 )
 
 
-def _list_skills_tool(org: str | None = None) -> StructuredTool:
+def _list_skills_tool(sandbox=None, org: str | None = None) -> StructuredTool:
     def _run() -> str:
         items: list[dict] = []
         seen: set[str] = set()
@@ -67,6 +68,6 @@ def _list_skills_tool(org: str | None = None) -> StructuredTool:
         return _result({"skills": items, "count": len(items)})
 
     return StructuredTool(
-        name=PUX_PREFIX + "list_skills", description=_LIST_SKILLS_DESC,
+        name="list_skills", description=_LIST_SKILLS_DESC,
         args_schema=_NoArgs, func=_run,
     )

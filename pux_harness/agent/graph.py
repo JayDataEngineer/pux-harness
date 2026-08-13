@@ -41,7 +41,7 @@ from pux_harness.sandbox.exec import (
     shared_backend as _shared_backend,
     shared_exec as _shared_exec,
 )
-from pux_harness.sandbox.tools import build_native_specialists
+from pux_harness.sandbox.tools import make_specialist_tools
 
 
 def shared_exec() -> ExecClient:
@@ -99,9 +99,8 @@ def build_graph(
     # base. An explicit pin disables the tier's ``base_fallbacks`` (see
     # ``resolve_model_id``), matching the frontmatter/org/env override stack.
     base_model = get_model(role="base", org=org, model=base_model_override)
-    specialists = build_native_specialists(
-        shared_exec(), vision_model=get_model(role="multimodal", org=org), org=org,
-        backend=shared_backend(),
+    specialists = make_specialist_tools(
+        shared_backend(), vision_model=get_model(role="multimodal", org=org), org=org,
     )
     cfg = load_profile(org)
     gate = load_rubric_gate(org)

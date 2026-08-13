@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from deepagents.backends.sandbox import BaseSandbox
+
 import shlex
 
 from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.exec import ExecClient
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, _result
+from ._shared import _result, _exec
 
 
 class _PythonArgs(BaseModel):
@@ -23,16 +24,16 @@ _PYTHON_DESC = (
 )
 
 
-def _python_tool(exec_client: ExecClient) -> StructuredTool:
+def _python_tool(sandbox: BaseSandbox) -> StructuredTool:
     def _run(code: str) -> str:
         if not code:
             return _result({"success": False, "error": "no code provided"})
-        out, exit_code = exec_client.exec(f"python3 -c {shlex.quote(code)}")
+        out, exit_code = _exec(sandbox, f"python3 -c {shlex.quote(code)}")
         if exit_code != 0:
             return _result({"success": False, "error": f"python exited {exit_code}", "output": out})
         return _result({"success": True, "output": out})
 
     return StructuredTool(
-        name=PUX_PREFIX + "python", description=_PYTHON_DESC,
+        name="python", description=_PYTHON_DESC,
         args_schema=_PythonArgs, func=_run,
     )

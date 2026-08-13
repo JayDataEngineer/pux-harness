@@ -36,7 +36,7 @@ from pux_harness.agent.orgs import _org_path, _orgs_dir, supervisor_skills_roots
 from pux_harness.agent.profile import load_dynamic_tools_enabled
 from pux_harness.kit._paths import project_root
 from pux_harness.sandbox import policy as policy_mod
-from pux_harness.sandbox.tools._shared import PUX_PREFIX
+from pux_harness.sandbox.tools._pux import PUX_PREFIX
 from pux_harness.sandbox.tools.declared import build_declared_tools, declared_tool_names
 from pux_harness.sandbox.tools.dynamic import (
     PUX_DYN_PREFIX,

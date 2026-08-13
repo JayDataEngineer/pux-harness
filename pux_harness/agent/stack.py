@@ -117,7 +117,7 @@ from pux_harness.context.web_router import WebRouterMiddleware
 from pux_harness.agent.capabilities import CapabilityResolver
 from pux_harness.sandbox.policy import NoPolicy, load as _load_policy, resolve_tool_allowlist as _resolve_tool_allowlist
 from pux_harness.sandbox.tools import build_grader_tools, SPECIALISTS
-from pux_harness.sandbox.tools._shared import PUX_PREFIX
+from pux_harness.sandbox.tools._pux import PUX_PREFIX
 from pux_harness.sandbox.tools.declared import (
     build_script_redirects,
     load_declared_specs,

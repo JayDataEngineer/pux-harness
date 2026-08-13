@@ -3,7 +3,7 @@
 A per-org ``sandbox/tools/tools.yaml`` DECLARES tools (name + description +
 script + typed args). This module synthesizes langchain ``StructuredTool``s
 from those declarations: the model calls ``pux_sandbox_<name>(...)`` directly,
-and the tool's ``func`` exec's the script IN-CONTAINER via ``ExecClient``
+and the tool's ``func`` exec's the script IN-CONTAINER via ``BaseSandbox``
 (typed ergonomics for the model; in-container execution preserved).
 
 This is the declarative, per-org, no-library-edit equivalent of a REGISTRY
@@ -44,7 +44,8 @@ from pydantic import Field, create_model
 
 from pux_harness.kit._paths import project_root
 from pux_harness.sandbox.exec import WORKSPACE_ROOT
-from pux_harness.sandbox.tools._shared import PUX_PREFIX, _result, _tail
+from ._shared import _result, _tail, _exec
+from ._pux import PUX_PREFIX
 from pux_harness.sandbox.tools.registry import (
     LEGACY_TOOL_NAMES,
     NATIVE_FS_TOOLS,
@@ -224,10 +225,10 @@ def _build_command(spec: DeclaredToolSpec, container_dir: Path, kwargs: dict[str
     return " ".join(parts)
 
 
-def _make_runner(spec: DeclaredToolSpec, exec_client: Any, container_dir: Path):
+def _make_runner(spec: DeclaredToolSpec, sandbox: Any, container_dir: Path):
     def _run(**kwargs: Any) -> str:
         cmd = _build_command(spec, container_dir, kwargs)
-        out, exit_code = exec_client.exec(cmd, timeout=spec.timeout)
+        out, exit_code = _exec(sandbox, cmd, timeout=spec.timeout)
         if exit_code != 0:
             return _result({
                 "success": False,
@@ -251,7 +252,7 @@ def _make_runner(spec: DeclaredToolSpec, exec_client: Any, container_dir: Path):
     return _run
 
 
-def build_declared_tools(org_sandbox_dir: Path, exec_client: Any) -> list[StructuredTool]:
+def build_declared_tools(org_sandbox_dir: Path, sandbox: Any) -> list[StructuredTool]:
     """Synthesize a ``StructuredTool`` per declared tool. Empty list when the org
     declares none (byte-identical stack for orgs without ``tools.yaml``)."""
     specs = load_declared_specs(org_sandbox_dir)
@@ -264,7 +265,7 @@ def build_declared_tools(org_sandbox_dir: Path, exec_client: Any) -> list[Struct
             name=PUX_PREFIX + spec.name,
             description=spec.description or f"Run the sandbox script {spec.script!r}.",
             args_schema=_build_args_model(spec),
-            func=_make_runner(spec, exec_client, container_dir),
+            func=_make_runner(spec, sandbox, container_dir),
         ))
     return tools
 
@@ -279,7 +280,7 @@ def build_declared_tools(org_sandbox_dir: Path, exec_client: Any) -> list[Struct
 # ``RoutingMiddleware`` matches intercepted ``execute``/bash commands against —
 # a match returns a redirect ``ToolMessage`` naming the typed tool WITHOUT
 # running the command. The declared tool's OWN ``func`` calls
-# ``exec_client.exec(cmd)`` directly (not a tool call), so it is never
+# ``_exec(sandbox, cmd)`` directly (not a tool call), so it is never
 # intercepted: agent-via-``execute`` → blocked; declared-tool-internal-exec →
 # runs in-container. That distinction is the seam, and it is free at the
 # middleware layer (verified by reading ``_make_runner``).
@@ -323,7 +324,7 @@ def build_script_redirects(
     return redirects
 
 
-# --- validation (offline contract body; no exec_client) --------------------
+# --- validation (offline contract body; no sandbox) --------------------
 
 def _name_taken(full_name: str) -> bool:
     """Does ``full_name`` (a ``pux_sandbox_*`` name) collide with the REGISTRY
@@ -334,7 +335,7 @@ def _name_taken(full_name: str) -> bool:
 
 def validate_declared_tools(org_sandbox_dir: Path) -> list[str]:
     """Offline validation of an org's declared tools. Returns a list of
-    human-readable error strings (empty = clean). No exec_client, no container.
+    human-readable error strings (empty = clean). No sandbox, no container.
 
     Checks: yaml parses + schema; each name is snake_case, not reserved
     (``config``/``runtime``), not a native/grader slug, not ``mcp__``-prefixed,

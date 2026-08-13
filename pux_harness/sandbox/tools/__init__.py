@@ -12,18 +12,19 @@ each tool group lives in its own module:
 - ``desktop.py``       — all ``pux_sandbox_desktop_*`` tools (xdotool + Xvfb)
 - ``grader.py``        — ``pux_grader_*`` evidence-gathering factory functions
 - ``registry.py``      — the single ``REGISTRY`` of ``ToolSpec`` + derived
-  surface sets + ``build_native_specialists`` / ``build_grader_tools``.
+  surface sets + ``make_specialist_tools`` / ``build_grader_tools``.
 
 Two "private" modules provide shared infrastructure:
-- ``_shared.py`` — leaf-level constants (``PUX_PREFIX``, ``PUX_GRADER_PREFIX``,
-  ``PROJECT_ROOT``, ``SKILL_FILE``) and pure helpers (``_tail``, ``_result``,
-  ``_NoArgs``, ``_skills_dirs``).
+- ``_shared.py`` — ZERO-pux-import generic helpers (``_exec``, ``_tail``, ``_result``,
+  ``_NoArgs``). Portable alongside the specialist tools.
+- ``_pux.py`` — pux-specific constants (``PUX_PREFIX``, ``PUX_GRADER_PREFIX``,
+  ``SKILL_FILE``, ``_skills_dirs``) for the org-coupled tools.
 - ``_media.py`` — shared media-acquisition + ONNX-inference plumbing (consumed
   by ``describe_image`` and ``multimodal``).
 
 Public API
 ----------
-``build_native_specialists`` — the main function ``graph.py`` calls.
+``make_specialist_tools`` — the main function ``graph.py`` calls.
 ``build_grader_tools`` — the three ``pux_grader_*`` evidence tools.
 ``REGISTRY`` / ``ToolSpec`` / ``Category`` / ``Requirements`` — the declarative
 tool surface (single source of truth; everything below derives from it).
@@ -45,7 +46,7 @@ from pux_harness.sandbox.tools.registry import (
     TOOL_GROUP_TOOLS,
     ToolSpec,
     build_grader_tools,
-    build_native_specialists,
+    make_specialist_tools,
     classify_slug,
     prefixed,
     resolve_tool_allowlist,
@@ -71,7 +72,7 @@ __all__ = [
     "TOOL_GROUP_TOOLS",
     "ToolSpec",
     "build_grader_tools",
-    "build_native_specialists",
+    "make_specialist_tools",
     "classify_slug",
     "prefixed",
     "resolve_tool_allowlist",

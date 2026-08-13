@@ -55,6 +55,16 @@ class ExecClient:
             else self._backend.execute(command)
         return r.output, r.exit_code
 
+    def execute(self, command: str, *, timeout: int | None = None):
+        """Delegate to BaseSandbox.execute() — duck-type compat.
+
+        Lets callers that still pass ExecClient where BaseSandbox is expected
+        work unchanged. The specialist tools call sandbox.execute() (the
+        standard BaseSandbox API); this bridges the adapter."""
+        if timeout is not None:
+            return self._backend.execute(command, timeout=timeout)
+        return self._backend.execute(command)
+
     def upload_file(self, path: str, data: bytes) -> None:
         self._backend.upload_files([(path, data)])
 

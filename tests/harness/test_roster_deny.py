@@ -23,10 +23,11 @@ import pathlib
 
 import pytest
 
-from pux_harness.agent.contract import check_org
+from pux_harness.agent import profile
+from pux_harness.agent import org_validation as ov
 
 
-# ``check_org`` resolves orgs through ``kit._paths.project_root()``, which is
+# ``audit_org`` resolves orgs through ``kit._paths.project_root()``, which is
 # ``$PUX_PROJECT_ROOT`` if set, else the CWD. When pytest runs inside the
 # ``pux-harness`` submodule (no ``orgs/`` dir), the CWD fallback can't find the
 # org under test. ``bin/pux`` sets ``PUX_PROJECT_ROOT`` in production; mirror
@@ -41,7 +42,7 @@ def _seed_project_root(monkeypatch):
 
 
 def _violation_rules(org: str) -> list[str]:
-    return [v.rule for v in check_org(org)]
+    return [v.rule for v in ov.audit_org(org)]
 
 
 def test_coder_passes_with_data_driven_deny():
@@ -60,7 +61,6 @@ def test_roster_deny_enforced_fires_when_denied_slug_in_roster(monkeypatch):
     the effective roster) to inject a denied slug for coder. The checker then
     sees ``general-purpose`` in coder's roster AND in ``roster_deny`` → fires.
     """
-    import pux_harness.agent.contract as ct
 
     def _fake_slugs(name):
         if name == "coder":
@@ -68,8 +68,8 @@ def test_roster_deny_enforced_fires_when_denied_slug_in_roster(monkeypatch):
             return ["coder-explorer", "code-worker", "web-agent", "general-purpose"]
         return _orig_slugs(name)
 
-    _orig_slugs = ct.org_agent_slugs
-    monkeypatch.setattr(ct, "org_agent_slugs", _fake_slugs)
+    _orig_slugs = ov.org_agent_slugs
+    monkeypatch.setattr(ov, "org_agent_slugs", _fake_slugs)
     codes = _violation_rules("coder")
     assert "roster-deny-enforced" in codes, (
         f"roster-deny-enforced must fire when a denied slug is in the roster; "
@@ -84,16 +84,15 @@ def test_roster_deny_disables_gp_fires_when_profile_missing_disabled(monkeypatch
     We monkeypatch ``load_profile`` to return a real config whose GP block is
     None (mimicking a profile that dropped the disabled declaration)."""
     import dataclasses
-    import pux_harness.agent.contract as ct
 
-    _orig_load = ct.profile_mod.load_profile
+    _orig_load = profile.load_profile
 
     def _fake_load(name):
         cfg = _orig_load(name)
         # Strip the GP-disabled declaration — mimic an org that dropped it.
         return dataclasses.replace(cfg, general_purpose_subagent=None)
 
-    monkeypatch.setattr(ct.profile_mod, "load_profile", _fake_load)
+    monkeypatch.setattr(profile, "load_profile", _fake_load)
     rules = _violation_rules("coder")
     assert "roster-deny-disables-general-purpose" in rules, (
         f"roster-deny-disables-general-purpose must fire when GP is denied but "
@@ -109,9 +108,7 @@ def test_no_org_name_literals_in_checker_branches():
 
     This is a structural guard against regression — a future hard-coded branch
     would re-introduce the exact dupe pattern the user asked to eliminate."""
-    import pux_harness.agent.contract as ct
-
-    src = pathlib.Path(ct.__file__).read_text(encoding="utf-8")
+    src = pathlib.Path(ov.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     forbidden_orgs = {
         "coder", "orchestrator", "deep-research-engine", "game-studio",
@@ -132,6 +129,6 @@ def test_no_org_name_literals_in_checker_branches():
             if node.left.value in forbidden_orgs:
                 violations.append(f"line {node.lineno}: compare against {node.left.value!r}")
     assert not violations, (
-        "hard-coded org-name compare re-introduced in contract.py "
+        "hard-coded org-name compare re-introduced in org_validation.py "
         "(must be DATA on the org, not a branch): " + "; ".join(violations)
     )

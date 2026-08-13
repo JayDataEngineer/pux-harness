@@ -15,9 +15,8 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
-from pux_harness.sandbox.exec import ExecClient, ExecTimeout
 from deepagents.backends.sandbox import BaseSandbox
-from pux_harness.sandbox.tools._shared import _tail
+from ._shared import _tail, _exec
 
 log = logging.getLogger(__name__)
 
@@ -81,22 +80,21 @@ def _default_media_prompt(kind: str) -> str:
 
 
 def _read_media(
-    backend: BaseSandbox,
-    exec_client: ExecClient,
+    sandbox: BaseSandbox,
     path: str | None,
     url: str | None,
 ) -> tuple[str, str]:
-    """Acquire media bytes → ``(base64, mime)``. Uses ``backend.read()`` for
+    """Acquire media bytes → ``(base64, mime)``. Uses ``sandbox.read()`` for
     sandbox paths and curl for URLs (sandbox egress policy applies)."""
     if path:
-        rr = backend.read(path)
+        rr = sandbox.read(path)
         if rr.error:
             raise RuntimeError(rr.error)
         if rr.file_data is None:
             raise RuntimeError(f"no data for {path}")
         return rr.file_data["content"], _guess_mime(path)
     cmd = f"curl -s -L --max-time 30 {shlex.quote(url or '')} | base64 -w0"
-    out, exit_code = exec_client.exec(cmd, timeout=_IMAGE_FETCH_TIMEOUT)
+    out, exit_code = _exec(sandbox, cmd, timeout=_IMAGE_FETCH_TIMEOUT)
     b64 = (out or "").strip()
     if exit_code != 0 or not b64:
         raise RuntimeError(f"url fetch exit {exit_code}: {_tail(out, 200)}")
@@ -208,7 +206,7 @@ def _invoke_primary_media(
 
 
 def _onnx_describe(
-    exec_client: ExecClient, *,
+    sandbox: BaseSandbox, *,
     image_path: str | None, image_url: str | None,
     prompt: str | None, primary_error: str | None = None,
 ) -> dict:
@@ -228,11 +226,7 @@ def _onnx_describe(
         parts += ["--prompt", shlex.quote(prompt)]
     cmd = " ".join(parts)
     try:
-        out, exit_code = exec_client.exec(cmd, timeout=_DESCRIBE_IMAGE_TIMEOUT)
-    except ExecTimeout:
-        return {"success": False, "reason": "timeout",
-                "error": f"describe_image timed out after {_DESCRIBE_IMAGE_TIMEOUT}s",
-                **pe}
+        out, exit_code = _exec(sandbox, cmd, timeout=_DESCRIBE_IMAGE_TIMEOUT)
     except Exception as exc:  # container vanished / docker API error
         return {"success": False, "reason": "exec_failed", "error": str(exc), **pe}
     if exit_code == 0:
@@ -257,16 +251,16 @@ def _onnx_describe(
 
 
 def _extract_video_keyframes(
-    exec_client: ExecClient, video_path: str, n: int = _VIDEO_KEYFRAMES,
+    sandbox: BaseSandbox, video_path: str, n: int = _VIDEO_KEYFRAMES,
 ) -> tuple[list[str], str | None]:
     """Probe ``video_path`` (in-sandbox) and extract up to ``n`` evenly-spaced
     frames to ``/tmp/pux_multimodal_kf/kf_*.png`` via ffmpeg. Returns
     ``(frame_paths, None)`` on success or ``([], reason)`` on failure."""
     kf_dir = "/tmp/pux_multimodal_kf"
-    exec_client.exec(f"rm -rf {kf_dir} && mkdir -p {kf_dir}", timeout=30)
+    _exec(sandbox, f"rm -rf {kf_dir} && mkdir -p {kf_dir}", timeout=30)
     probe = ("ffprobe -v error -show_entries format=duration "
              "-of default=noprint_wrappers=1:nokey=1 " + shlex.quote(video_path))
-    out, exit_code = exec_client.exec(probe, timeout=_KEYFRAME_TIMEOUT)
+    out, exit_code = _exec(sandbox, probe, timeout=_KEYFRAME_TIMEOUT)
     if exit_code != 0:
         return [], "ffmpeg_missing" if exit_code == 127 else f"ffprobe_failed: {_tail(out, 200)}"
     try:
@@ -280,10 +274,10 @@ def _extract_video_keyframes(
         f"ffmpeg -hide_banner -loglevel error -i {shlex.quote(video_path)} "
         f"-vf fps={1 / interval:.4f} -frames:v {n} -y {kf_dir}/kf_%03d.png"
     )
-    out, exit_code = exec_client.exec(extract, timeout=_KEYFRAME_TIMEOUT)
+    out, exit_code = _exec(sandbox, extract, timeout=_KEYFRAME_TIMEOUT)
     if exit_code != 0:
         return [], "ffmpeg_extract_failed" if exit_code == 127 else f"ffmpeg_extract_failed: {_tail(out, 200)}"
-    ls, _ = exec_client.exec(f"ls -1 {kf_dir}/*.png 2>/dev/null | sort", timeout=30)
+    ls, _ = _exec(sandbox, f"ls -1 {kf_dir}/*.png 2>/dev/null | sort", timeout=30)
     frames = [ln.strip() for ln in (ls or "").splitlines() if ln.strip()]
     if not frames:
         return [], "no_keyframes_extracted"

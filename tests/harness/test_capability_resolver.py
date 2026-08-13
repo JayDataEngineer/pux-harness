@@ -26,7 +26,7 @@ from langchain_core.tools import StructuredTool
 
 import pux_harness.agent.capabilities as caps_mod
 import pux_harness.agent.orgs as orgs_mod
-import pux_harness.sandbox.tools._shared as shared_mod
+import pux_harness.sandbox.tools._pux as pux_tools_mod
 import pux_harness.sandbox.tools.declared as declared_mod
 import pux_harness.sandbox.tools.dynamic as dynamic_mod
 from pux_harness.agent.capabilities import (
@@ -44,10 +44,15 @@ _ORG = "captest"
 
 
 class _FakeExec:
-    """Stand-in for ``DockerExecClient`` — never invoked at build time."""
+    """Stand-in for ``BaseSandbox`` — never invoked at build time.
 
-    def exec(self, command: str, *, timeout: int | None = None) -> tuple[str, int]:
-        return ("ok\n", 0)
+    Implements ``execute()`` (the standard ``BaseSandbox`` surface) so the
+    specialist tools' ``_exec(sandbox, cmd)`` helper can call it unchanged.
+    """
+
+    def execute(self, command: str, *, timeout: int | None = None):
+        from collections import namedtuple
+        return namedtuple("_Resp", ["output", "exit_code", "truncated"])("ok\n", 0, False)
 
 
 def _tool(name: str) -> StructuredTool:
@@ -71,7 +76,7 @@ def org_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ``kit._paths``), so the patch is applied to every consumer module that the
     leaf resolvers look up — the same pattern as ``tests/harness/test_dynamic.py``.
     """
-    for mod in (orgs_mod, declared_mod, dynamic_mod, shared_mod):
+    for mod in (orgs_mod, declared_mod, dynamic_mod, pux_tools_mod):
         monkeypatch.setattr(mod, "project_root", lambda: tmp_path)
     base = tmp_path / "orgs" / "specialists" / _ORG
     base.mkdir(parents=True)

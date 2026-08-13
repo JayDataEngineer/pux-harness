@@ -36,16 +36,18 @@ from pux_harness.sandbox.tools._shared import _NoArgs
 # --- fakes -----------------------------------------------------------------
 
 class _FakeExec:
-    """Records exec(command, timeout); returns a canned (stdout, exit_code)."""
+    """Records execute(command, timeout); returns a canned ExecuteResponse-like."""
 
     def __init__(self, out: str = "", exit_code: int = 0):
         self.calls: list[tuple[str, Any]] = []
         self._out = out
         self._exit = exit_code
 
-    def exec(self, command: str, *, timeout: int | None = None) -> tuple[str, int]:
+    def execute(self, command: str, *, timeout: int | None = None):
+        from collections import namedtuple
         self.calls.append((command, timeout))
-        return (self._out, self._exit)
+        _Resp = namedtuple("_Resp", ["output", "exit_code", "truncated"])
+        return _Resp(self._out, self._exit, False)
 
 
 _GOOD = "def run(**kwargs):\n    return sum(kwargs['nums'])\n"
