@@ -754,7 +754,7 @@ class _RegisteringAgentServerACP(AgentServerACP):
                 # ``False`` → unrecoverable exception that bailed after 1
                 # attempt; ``True`` → stall that exhausted
                 # ``_PROMPT_MAX_ATTEMPTS`` retries.
-                from pux_harness.sandbox.docker_exec import (
+                from pux_harness.sandbox.exec import (
                     ExecTimeout as _SandboxExecTimeout,
                 )
                 if isinstance(exc, _SandboxExecTimeout):
@@ -819,7 +819,7 @@ class _RegisteringAgentServerACP(AgentServerACP):
         for orgs without browser tools. Never raises."""
         try:
             from pux_harness.sandbox.tools.browser import warmup_ephemeral_browser
-            from pux_harness.sandbox.docker_exec import shared_exec
+            from pux_harness.sandbox.exec import shared_exec
             warmup_ephemeral_browser(shared_exec())
         except Exception:  # noqa: BLE001 — warmup must never break the agent
             pass

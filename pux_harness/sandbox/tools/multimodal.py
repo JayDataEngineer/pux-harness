@@ -9,8 +9,8 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.docker_exec import DockerExecClient
-from pux_harness.sandbox.backend import PuxSandboxBackend
+from pux_harness.sandbox.exec import ExecClient
+from deepagents.backends.sandbox import BaseSandbox
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result
 from pux_harness.sandbox.tools._media import (
     _read_media, _invoke_primary_media, _onnx_describe,
@@ -90,8 +90,8 @@ def _multimodal_unsupported(name: str) -> dict:
 
 
 def _multimodal_tool(
-    backend: PuxSandboxBackend,
-    exec_client: DockerExecClient,
+    backend: BaseSandbox,
+    exec_client: ExecClient,
     vision_model: object | None = None,
 ) -> StructuredTool:
     def _run(
@@ -144,8 +144,8 @@ def _multimodal_tool(
 
 
 def _multimodal_mega_tool(
-    backend: PuxSandboxBackend,
-    exec_client: DockerExecClient,
+    backend: BaseSandbox,
+    exec_client: ExecClient,
     vision_model: object | None = None,
 ) -> StructuredTool:
     def _run(

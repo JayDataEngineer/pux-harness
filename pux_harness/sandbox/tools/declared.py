@@ -3,7 +3,7 @@
 A per-org ``sandbox/tools/tools.yaml`` DECLARES tools (name + description +
 script + typed args). This module synthesizes langchain ``StructuredTool``s
 from those declarations: the model calls ``pux_sandbox_<name>(...)`` directly,
-and the tool's ``func`` exec's the script IN-CONTAINER via ``DockerExecClient``
+and the tool's ``func`` exec's the script IN-CONTAINER via ``ExecClient``
 (typed ergonomics for the model; in-container execution preserved).
 
 This is the declarative, per-org, no-library-edit equivalent of a REGISTRY
@@ -23,7 +23,7 @@ Contract-enforced (``validate_declared_tools``) + auto-audited
 declared tools are audited for free).
 
 Layering: this module stays agent-free (``sandbox/tools`` is a lower layer than
-``agent/``). Callers in ``agent/stack.py`` + ``agent/contract.py`` resolve the
+``agent/``). Callers in ``agent/stack.py`` + ``agent/org_validation.py`` resolve the
 org's sandbox dir via ``_org_path`` and pass it in; the container path is
 derived from ``project_root()`` + ``WORKSPACE_ROOT`` (both sandbox/kit-layer).
 """
@@ -43,7 +43,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import Field, create_model
 
 from pux_harness.kit._paths import project_root
-from pux_harness.sandbox.backend import WORKSPACE_ROOT
+from pux_harness.sandbox.exec import WORKSPACE_ROOT
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, _result, _tail
 from pux_harness.sandbox.tools.registry import (
     LEGACY_TOOL_NAMES,

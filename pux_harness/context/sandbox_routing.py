@@ -15,7 +15,7 @@ Intercepts tool calls and enforces routing rules:
 - Configurable per-org via profile.yaml ``routing:`` block
 
 Our sandbox IS Docker, so the "sandboxed subprocess" aspect is already
-handled by PuxSandboxBackend.  This middleware adds the *routing
+handled by BaseSandbox.  This middleware adds the *routing
 enforcement* layer — denying commands that bypass the sandbox or produce
 excessive output.
 

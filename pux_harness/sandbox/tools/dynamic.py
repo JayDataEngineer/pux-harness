@@ -9,7 +9,7 @@ result + an index entry, never the function body — the real lever for a
 low-power model. See ``docs/dynamic-tools-and-packaging.md`` Part 1.
 
 Rhymes with ``declared.py``: synthesizes langchain ``StructuredTool``s whose
-``func`` exec's IN-CONTAINER via the same ``DockerExecClient``. The split that
+``func`` exec's IN-CONTAINER via the same ``ExecClient``. The split that
 matters:
 
 * **Authoring is HOST-side** (``pathlib`` writes to
@@ -64,7 +64,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import Field, create_model
 
 from pux_harness.kit._paths import project_root
-from pux_harness.sandbox.backend import WORKSPACE_ROOT
+from pux_harness.sandbox.exec import WORKSPACE_ROOT
 from pux_harness.sandbox.tools._shared import _NoArgs, _result, _tail
 
 log = logging.getLogger(__name__)

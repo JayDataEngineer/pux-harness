@@ -1,6 +1,6 @@
 """Exec-dependent context tools — the gap-1 + gap-2 surface.
 
-Four tools that need a ``DockerExecClient`` (the sandbox bridge) and are only
+Four tools that need a ``ExecClient`` (the sandbox bridge) and are only
 built when ``build_context_tools`` receives one. They close the parity gap with
 context-mode's ctx_execute / ctx_execute_file / ctx_batch_execute /
 ctx_fetch_and_index.
@@ -30,7 +30,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from pux_harness.context.events import EventStore
-from pux_harness.sandbox.docker_exec import ExecTimeout
+from pux_harness.sandbox.exec import ExecTimeout
 
 
 # -- language → command maps (pure, testable without Docker) -----------------
@@ -255,7 +255,7 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
     Only built when ``build_context_tools`` receives a non-None exec_client —
     tests that pass exec_client=None get the 6 base tools only (no Docker
     dependency). The exec_client must have an ``exec(command: str) ->
-    tuple[str, int]`` method (the ``DockerExecClient`` contract).
+    tuple[str, int]`` method (the ``ExecClient`` contract).
     """
 
     def _execute(language: str, code: str) -> str:

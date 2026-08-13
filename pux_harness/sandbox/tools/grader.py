@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.docker_exec import DockerExecClient
+from pux_harness.sandbox.exec import ExecClient
 from pux_harness.sandbox.tools._shared import PUX_GRADER_PREFIX, _result
 
 
@@ -28,7 +28,7 @@ _GRADER_EXECUTE_DESC = (
 )
 
 
-def _grader_execute_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _grader_execute_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(command: str) -> str:
         if not command:
             return _result({"success": False, "error": "no command provided"})
@@ -59,7 +59,7 @@ _GRADER_READ_FILE_DESC = (
 )
 
 
-def _grader_read_file_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _grader_read_file_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(path: str) -> str:
         if not path:
             return _result({"success": False, "error": "no path provided"})
@@ -94,7 +94,7 @@ _GRADER_GREP_DESC = (
 )
 
 
-def _grader_grep_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _grader_grep_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(pattern: str, path: str = "/sandbox/workspace",
              include: str | None = None) -> str:
         if not pattern:

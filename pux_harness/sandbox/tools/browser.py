@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
+from pux_harness.sandbox.exec import ExecClient, ExecTimeout
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result, _NoArgs
 
 
@@ -45,7 +45,7 @@ _process_http_port: int | None = None  # cached for this process lifetime
 _SUPERVISORD_SB_PORT = 9876
 
 
-def _supervisord_browser_ready(exec_client: DockerExecClient) -> bool:
+def _supervisord_browser_ready(exec_client: ExecClient) -> bool:
     """Is the supervisord-managed default sb_server up AND Chrome alive?
 
     Checks BOTH ``ok`` (sb_server process) AND ``alive`` (Chrome attached) in
@@ -109,7 +109,7 @@ def _alloc_port_pair() -> tuple[int, int]:
     return _EPHEMERAL_HTTP_BASE + offset, _EPHEMERAL_CDP_BASE + offset
 
 
-def _is_server_alive(exec_client: DockerExecClient, http_port: int) -> bool:
+def _is_server_alive(exec_client: ExecClient, http_port: int) -> bool:
     out, _ = exec_client.exec(
         f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 "
         f"http://127.0.0.1:{http_port}/status 2>/dev/null || true"
@@ -136,7 +136,7 @@ _KILL_STALE_TEMPLATE = (
 )
 
 
-def _spawn_one_attempt(exec_client: DockerExecClient, http_port: int, cdp_port: int) -> bool:
+def _spawn_one_attempt(exec_client: ExecClient, http_port: int, cdp_port: int) -> bool:
     """One spawn attempt: kill stale, launch sb_server, poll for ready.
 
     Returns True on ready, False on timeout. Single-attempt; the caller
@@ -187,7 +187,7 @@ def _spawn_one_attempt(exec_client: DockerExecClient, http_port: int, cdp_port: 
 _BROWSER_SPAWN_ATTEMPTS = int(os.environ.get("PUX_BROWSER_SPAWN_ATTEMPTS", "3"))
 
 
-def _ensure_ephemeral_server(exec_client: DockerExecClient) -> int:
+def _ensure_ephemeral_server(exec_client: ExecClient) -> int:
     """Ensure THIS PROCESS has its own ephemeral sb_server running. Returns HTTP port.
 
     On first browser tool call in the process:
@@ -261,7 +261,7 @@ def _ensure_ephemeral_server(exec_client: DockerExecClient) -> int:
     )
 
 
-def warmup_ephemeral_browser(exec_client: DockerExecClient) -> None:
+def warmup_ephemeral_browser(exec_client: ExecClient) -> None:
     """Kick off the ephemeral browser spawn in a BACKGROUND thread.
 
     Called at graph-build time (before the agent loop starts) so Chrome is
@@ -293,7 +293,7 @@ def warmup_ephemeral_browser(exec_client: DockerExecClient) -> None:
     t.start()
 
 
-def _restore_session_cookies(exec_client: DockerExecClient, http_port: int) -> None:
+def _restore_session_cookies(exec_client: ExecClient, http_port: int) -> None:
     """Restore saved session cookies to the ephemeral browser if a file exists.
 
     Ephemeral browsers start with a fresh profile — no cookies. If the org
@@ -313,7 +313,7 @@ def _restore_session_cookies(exec_client: DockerExecClient, http_port: int) -> N
             break  # one session file per browser
 
 
-def _sb_post(exec_client: DockerExecClient, endpoint: str, body_obj: dict | None,
+def _sb_post(exec_client: ExecClient, endpoint: str, body_obj: dict | None,
              *, timeout: int = _BROWSER_TIMEOUT) -> str:
     """POST ``body_obj`` to THIS PROCESS's ephemeral sb_server endpoint, return the
     parsed JSON re-serialized via ``_result``.
@@ -375,7 +375,7 @@ class _BrowserNavigateArgs(BaseModel):
     url: str = Field(..., description="Absolute URL including scheme (https://example.com)")
 
 
-def _browser_navigate_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_navigate_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(url: str) -> str:
         if not url:
             return _result({"success": False, "error": "url is required"})
@@ -400,7 +400,7 @@ class _BrowserClickArgs(BaseModel):
     trusted: bool = Field(False, description="Drive the real cursor via CDP (isTrusted=true). Use when a normal click silently no-ops on anti-bot sites.")
 
 
-def _browser_click_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_click_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None,
              trusted: bool = False) -> str:
         body: dict = {}
@@ -432,7 +432,7 @@ class _BrowserTypeArgs(BaseModel):
     trusted: bool = Field(False, description="Type via CDP Input.insertText (isTrusted events). Use for keystroke-fingerprinting defenses.")
 
 
-def _browser_type_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_type_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(text: str, index: int | None = None, selector: str | None = None,
              trusted: bool = False) -> str:
         if not text:
@@ -461,7 +461,7 @@ _BROWSER_SCREENSHOT_DESC = (
 )
 
 
-def _browser_screenshot_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_screenshot_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/read", {})
 
@@ -485,7 +485,7 @@ class _BrowserEvaluateArgs(BaseModel):
     )
 
 
-def _browser_evaluate_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_evaluate_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(code: str) -> str:
         if not code:
             return _result({"success": False, "error": "code is required"})
@@ -508,7 +508,7 @@ class _BrowserSearchArgs(BaseModel):
     query: str = Field(..., description="Natural-language search query (the engine URL-encodes it)")
 
 
-def _browser_search_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_search_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(query: str) -> str:
         if not query:
             return _result({"success": False, "error": "query is required"})
@@ -532,7 +532,7 @@ class _BrowserScrollArgs(BaseModel):
     amount: int = Field(0, description="Pixel count to scroll (sign follows direction). 0 = use direction for a viewport jump.")
 
 
-def _browser_scroll_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_scroll_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(direction: str = "down", amount: int = 0) -> str:
         return _sb_post(exec_client, "/scroll", {"direction": direction, "amount": amount})
 
@@ -549,7 +549,7 @@ _BROWSER_GO_BACK_DESC = (
 )
 
 
-def _browser_go_back_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_go_back_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/go_back", {})
 
@@ -570,7 +570,7 @@ class _BrowserWaitArgs(BaseModel):
     seconds: int = Field(2, description="How long to wait; server clamps to 30")
 
 
-def _browser_wait_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_wait_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(seconds: int = 2) -> str:
         return _sb_post(exec_client, "/wait", {"seconds": seconds})
 
@@ -591,7 +591,7 @@ class _BrowserFindTextArgs(BaseModel):
     text: str = Field(..., description="Substring to locate on the page")
 
 
-def _browser_find_text_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_find_text_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(text: str) -> str:
         if not text:
             return _result({"success": False, "error": "text is required"})
@@ -614,7 +614,7 @@ class _BrowserExtractArgs(BaseModel):
     query: str = Field("extract all text content", description="Free-text note of what you want (the engine extracts the same DOM structures regardless)")
 
 
-def _browser_extract_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_extract_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(query: str = "extract all text content") -> str:
         return _sb_post(exec_client, "/extract", {"query": query})
 
@@ -631,7 +631,7 @@ _BROWSER_EXTRACT_IMAGES_DESC = (
 )
 
 
-def _browser_extract_images_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_extract_images_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/extract_images", {})
 
@@ -652,7 +652,7 @@ class _BrowserSaveScreenshotArgs(BaseModel):
     path: str | None = Field(None, description="Absolute sandbox path incl. .png extension. If omitted the engine generates one and returns it.")
 
 
-def _browser_save_screenshot_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_save_screenshot_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(path: str | None = None) -> str:
         body: dict = {}
         if path:
@@ -677,7 +677,7 @@ class _BrowserDownloadArgs(BaseModel):
     path: str = Field(..., description="Absolute sandbox output path (incl. extension)")
 
 
-def _browser_download_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_download_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(url: str, path: str) -> str:
         if not url or not path:
             return _result({"success": False, "error": "url and path are both required"})
@@ -701,7 +701,7 @@ class _BrowserUploadArgs(BaseModel):
     file_path: str = Field(..., description="Absolute sandbox path of the file to upload (must exist)")
 
 
-def _browser_upload_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_upload_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(selector: str, file_path: str) -> str:
         if not selector or not file_path:
             return _result({"success": False, "error": "selector and file_path are both required"})
@@ -720,7 +720,7 @@ _BROWSER_TABS_DESC = (
 )
 
 
-def _browser_tabs_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_tabs_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/tabs", {})
 
@@ -741,7 +741,7 @@ class _BrowserNewTabArgs(BaseModel):
     url: str = Field("about:blank", description="URL to open in the new tab")
 
 
-def _browser_new_tab_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_new_tab_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(url: str = "about:blank") -> str:
         return _sb_post(exec_client, "/new_tab", {"url": url})
 
@@ -762,7 +762,7 @@ class _BrowserSwitchTabArgs(BaseModel):
     index: int = Field(0, description="0-based tab index (see browser_tabs)")
 
 
-def _browser_switch_tab_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_switch_tab_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(index: int = 0) -> str:
         return _sb_post(exec_client, "/switch_tab", {"index": index})
 
@@ -779,7 +779,7 @@ _BROWSER_CLOSE_TAB_DESC = (
 )
 
 
-def _browser_close_tab_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_close_tab_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/close_tab", {})
 
@@ -801,7 +801,7 @@ class _BrowserDropdownOptionsArgs(BaseModel):
     selector: str | None = Field(None, description="CSS selector of the <select> element")
 
 
-def _browser_dropdown_options_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_dropdown_options_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None) -> str:
         if index is None and not selector:
             return _result({"success": False, "error": "either index or selector is required"})
@@ -832,7 +832,7 @@ class _BrowserSelectDropdownArgs(BaseModel):
     text: str | None = Field(None, description="Visible text of the option to select (use XOR with value)")
 
 
-def _browser_select_dropdown_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_select_dropdown_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None,
              value: str | None = None, text: str | None = None) -> str:
         if index is None and not selector:
@@ -867,7 +867,7 @@ class _BrowserSaveSessionArgs(BaseModel):
     path: str = Field("/tmp/browser-session.json", description="Absolute sandbox path to write the session JSON")
 
 
-def _browser_save_session_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_save_session_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(path: str = "/tmp/browser-session.json") -> str:
         return _sb_post(exec_client, "/save_session", {"path": path})
 
@@ -888,7 +888,7 @@ class _BrowserRestoreSessionArgs(BaseModel):
     path: str = Field("/tmp/browser-session.json", description="Absolute sandbox path of a session JSON written by browser_save_session")
 
 
-def _browser_restore_session_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_restore_session_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(path: str = "/tmp/browser-session.json") -> str:
         return _sb_post(exec_client, "/restore_session", {"path": path})
 
@@ -920,7 +920,7 @@ class _BrowserDragArgs(BaseModel):
     steps: int = Field(25, description="mouse-move interpolation steps for the physics path (ignored by html5)")
 
 
-def _browser_drag_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_drag_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(from_index: int | None = None, from_selector: str | None = None,
              from_x: float | None = None, from_y: float | None = None,
              to_index: int | None = None, to_selector: str | None = None,
@@ -977,7 +977,7 @@ class _BrowserHoverArgs(BaseModel):
     y: float | None = Field(None, description="y coord to hover")
 
 
-def _browser_hover_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_hover_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None,
              x: float | None = None, y: float | None = None) -> str:
         has_el = index is not None or selector
@@ -1013,7 +1013,7 @@ class _BrowserPressArgs(BaseModel):
     selector: str | None = Field(None, description="CSS selector of the element to focus before pressing")
 
 
-def _browser_press_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_press_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(keys: str, index: int | None = None, selector: str | None = None) -> str:
         if not keys:
             return _result({"success": False, "error": "keys is required"})
@@ -1048,7 +1048,7 @@ class _BrowserClickAtArgs(BaseModel):
     trusted: bool = Field(False, description="Drive the real cursor via CDP (isTrusted=true). Use for anti-bot sites.")
 
 
-def _browser_click_at_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_click_at_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(x: float | None = None, y: float | None = None,
              index: int | None = None, selector: str | None = None,
              button: int = 0, double: bool = False, right: bool = False,
@@ -1087,7 +1087,7 @@ class _BrowserScrollIntoViewArgs(BaseModel):
     selector: str | None = Field(None, description="CSS selector of the element to bring into view")
 
 
-def _browser_scroll_into_view_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_scroll_into_view_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(index: int | None = None, selector: str | None = None) -> str:
         if index is None and not selector:
             return _result({"success": False, "error": "either index or selector is required"})
@@ -1111,7 +1111,7 @@ _BROWSER_A11Y_DESC = (
 )
 
 
-def _browser_a11y_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_a11y_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/a11y", {})
 
@@ -1136,7 +1136,7 @@ class _BrowserIframeArgs(BaseModel):
     code: str | None = Field(None, description="action='evaluate': JS to run inside the iframe (use 'return' for a value)")
 
 
-def _browser_iframe_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_iframe_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(action: str = "list", index: int | None = None, selector: str | None = None,
              inner_selector: str | None = None, code: str | None = None) -> str:
         body: dict = {"action": action}
@@ -1177,7 +1177,7 @@ class _BrowserUcArgs(BaseModel):
     cookie_action: str | None = Field("get", description="action=cookies: get|inject_persistent")
 
 
-def _browser_uc_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_uc_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(action: str = "open", url: str | None = None, click_captcha: bool | None = True,
              handoff: bool | None = True, selector: str | None = None, text: str | None = None,
              by: str | None = "css", submit: bool | None = False, clear: bool | None = True,
@@ -1224,7 +1224,7 @@ class _BrowserAcceptCookiesArgs(BaseModel):
     pass
 
 
-def _browser_accept_cookies_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_accept_cookies_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/accept_cookies", {})
     return StructuredTool(
@@ -1269,7 +1269,7 @@ class _BrowserWarmupHistoryArgs(BaseModel):
         return out or None
 
 
-def _browser_warmup_history_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_warmup_history_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(urls: list[str] | None = None, dwell: float | None = 3.0) -> str:
         body: dict = {}
         if urls is not None:
@@ -1296,7 +1296,7 @@ class _BrowserSolveCaptchaArgs(BaseModel):
     pass
 
 
-def _browser_solve_captcha_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_solve_captcha_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/solve_captcha", {})
     return StructuredTool(
@@ -1317,7 +1317,7 @@ class _BrowserResetArgs(BaseModel):
     pass
 
 
-def _browser_reset_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _browser_reset_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         return _sb_post(exec_client, "/reset", {})
     return StructuredTool(

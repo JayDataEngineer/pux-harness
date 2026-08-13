@@ -459,7 +459,7 @@ def resolve_tool_servers(
 def validate_tool_servers(org: str) -> list[str]:
     """Offline contract surface — validates the org's ``tool_servers:``
     declaration WITHOUT live credential resolution. Returns a list of error
-    strings (empty = valid). Called from ``contract.check_org`` so a broken
+    strings (empty = valid). Called from ``org_validation.audit_org`` so a broken
     declaration fails ``--check-contract``.
 
     A ``github:`` release-bootstrap block is structurally validated at parse

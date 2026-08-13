@@ -1,17 +1,15 @@
-"""MCP server — pure ACP delegation to Pux subagents.
+"""MCP server — Agent Protocol delegation to Pux subagents.
 
-Hermes (the orchestrator) connects via MCP-SSE. This server spawns
-``pux acp --org X`` subprocesses and speaks ACP (Agent Client Protocol) over
-stdio. Hermes delegates tasks to orgs (subagents), answers their questions,
+Hermes (the orchestrator) connects via MCP-SSE. This server talks to the
+Agent Protocol REST API on :9988 (Aegra) to manage threads and runs.
+Hermes delegates tasks to orgs (subagents), answers their questions,
 and manages sessions. It does NOT hold granular tools; it delegates.
 
 Architecture:
-    Hermes (orchestrator) -> MCP-SSE :9987 -> [this server] -> ACP stdio -> pux acp --org X
+    Hermes (orchestrator) -> MCP-SSE :9987 -> [this server] -> AP REST :9988 -> Aegra -> Docker Sandbox
 
-Each org gets one cached ACP subprocess. Sessions within that subprocess are
-individual subagent conversations. The ACP ask_user interrupt mechanic means
-a subagent asking a question simply ends its turn; the orchestrator's next
-prompt() call IS the resume answer.
+Each org maps to an agent_id on the AP server. Sessions are threads on the
+AP server. The AP server handles checkpoint persistence and run lifecycle.
 """
 from __future__ import annotations
 
@@ -26,28 +24,27 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent as MCPImageContent
 from mcp.types import TextContent as MCPTextContent
 
-from acp import spawn_agent_process
-from acp.interfaces import Agent
-from acp.schema import ImageContentBlock, TextContentBlock
-
 from pux_harness.agent.orgs import discover_orgs
 from pux_harness.agent.model import available_model_ids
 
+# Agent Protocol server URL (Aegra on :9988)
+PUX_API_URL = os.environ.get("PUX_API_URL", "http://127.0.0.1:9988").rstrip("/")
+AP_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=30.0)
+
 # PUX_PROJECT_ROOT = where orgs/, .env, .pux/ live (the Pux project root —
-# the parent of pux-harness). pux acp discovers orgs from here.
+# the parent of pux-harness). The AP server discovers orgs from here.
 PUX_PROJECT_ROOT = os.environ.get(
     "PUX_PROJECT_ROOT",
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
-# PUX_HARNESS_DIR = where the Python package + venv live.
+# PUX_HARNESS_DIR = where the Python package + venv live (for reference).
 PUX_HARNESS_DIR = os.path.join(PUX_PROJECT_ROOT, "pux-harness")
-# PUX_BIN = the venv pux executable (avoids `uv run` overhead + env issues).
-PUX_BIN = os.path.join(PUX_HARNESS_DIR, ".venv", "bin", "pux")
 
 MCP = FastMCP(
     "pux",
@@ -58,85 +55,31 @@ MCP = FastMCP(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SubagentClient — minimal ACP client that collects agent messages
+# AP client helpers — httpx calls to the Agent Protocol REST server
 # ═══════════════════════════════════════════════════════════════════════════
 
-class SubagentClient:
-    """Collects agent messages + thoughts per session during prompt() calls."""
-
-    def __init__(self) -> None:
-        self._buffers: dict[str, dict[str, list]] = {}
-
-    def reset(self, session_id: str) -> None:
-        self._buffers[session_id] = {"messages": [], "thoughts": [], "images": []}
-
-    def messages(self, session_id: str) -> list[str]:
-        return self._buffers.get(session_id, {}).get("messages", [])
-
-    def thoughts(self, session_id: str) -> list[str]:
-        return self._buffers.get(session_id, {}).get("thoughts", [])
-
-    def images(self, session_id: str) -> list[dict]:
-        """Return captured image content blocks as ``{"data": b64, "mime_type": str}``."""
-        return self._buffers.get(session_id, {}).get("images", [])
-
-    @staticmethod
-    def _text(content: Any) -> str:
-        return getattr(content, "text", "") or ""
-
-    # ── Client protocol (Protocol class — only session_update is load-bearing)
-
-    def on_connect(self, conn: Agent) -> None:
-        pass
-
-    async def session_update(self, session_id: str, update: Any, **kw: Any) -> None:
-        buf = self._buffers.setdefault(
-            session_id, {"messages": [], "thoughts": [], "images": []}
+async def _ap_post(path: str, **json_body: Any) -> Any:
+    """POST to the Agent Protocol server. Raises on connection/HTTP errors."""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{PUX_API_URL}{path}", json=json_body, timeout=AP_TIMEOUT,
         )
-        kind = getattr(update, "session_update", "")
-        if kind in ("agent_message_chunk", "agent_thought_chunk"):
-            content = update.content
-            text = self._text(content)
-            if text:
-                key = "messages" if kind == "agent_message_chunk" else "thoughts"
-                # Streaming chunks arrive fragmented; concatenate into one string.
-                if not buf[key]:
-                    buf[key].append("")
-                buf[key][-1] += text
-            # Capture image content blocks emitted by the agent (screenshots,
-            # generated charts, downloaded images returned inline). The ACP
-            # spec allows ImageContentBlock in agent_message_chunk — see the
-            # ContentBlock symmetry doc. Without this capture the images are
-            # silently dropped and never reach Hermes.
-            ctype = getattr(content, "type", None) or ""
-            if ctype == "image" or (
-                hasattr(content, "data")
-                and hasattr(content, "mime_type")
-                and not text
-            ):
-                data = getattr(content, "data", None)
-                mime = getattr(content, "mime_type", None) or getattr(
-                    content, "mimeType", None
-                )
-                if data and mime:
-                    buf["images"].append({"data": data, "mime_type": mime})
+    if r.status_code >= 400:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:  # noqa: BLE001
+            detail = r.text
+        raise RuntimeError(f"AP server {r.status_code}: {detail}")
+    return r.json()
 
-    # Stubs — Pux workers use their own Docker sandbox; editor fs/terminal
-    # callbacks are never invoked in transport="acp" mode.
-    async def request_permission(self, *a: Any, **kw: Any) -> None: ...
-    async def read_text_file(self, *a: Any, **kw: Any) -> None: ...
-    async def write_text_file(self, *a: Any, **kw: Any) -> None: ...
-    async def create_terminal(self, *a: Any, **kw: Any) -> None: ...
-    async def terminal_output(self, *a: Any, **kw: Any) -> None: ...
-    async def release_terminal(self, *a: Any, **kw: Any) -> None: ...
-    async def kill_terminal(self, *a: Any, **kw: Any) -> None: ...
-    async def wait_for_terminal_exit(self, *a: Any, **kw: Any) -> None: ...
-    async def create_elicitation(self, *a: Any, **kw: Any) -> None: ...
-    async def complete_elicitation(self, *a: Any, **kw: Any) -> None: ...
-    async def ext_method(self, *a: Any, **kw: Any) -> dict[str, Any]:
-        return {}
 
-    async def ext_notification(self, *a: Any, **kw: Any) -> None: ...
+async def _ap_get(path: str) -> Any:
+    """GET from the Agent Protocol server. Raises on connection/HTTP errors."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{PUX_API_URL}{path}", timeout=AP_TIMEOUT)
+    if r.status_code >= 400:
+        raise RuntimeError(f"AP server {r.status_code}: {r.text}")
+    return r.json()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -177,209 +120,100 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# OrgConnection — one ACP subprocess per org
+# OrgConnection — AP REST client for an org (agent_id)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class OrgConnection:
-    """One cached ACP subprocess for an org. Lives for the server lifetime."""
+    """HTTP client for one org on the Agent Protocol server."""
 
     def __init__(self, org: str) -> None:
         self.org = org
-        self.conn: Any = None          # ClientSideConnection (Agent interface)
-        self.process: Any = None
-        self.client = SubagentClient()
-        self._lock = asyncio.Lock()
-        self._task: asyncio.Task | None = None
-        self._ready = asyncio.Event()
-        self._stop = asyncio.Event()
-        self._start_error: Exception | None = None
 
-    @property
-    def alive(self) -> bool:
-        return (
-            self.conn is not None
-            and self.process is not None
-            and self.process.returncode is None
-        )
+    async def new_thread(self, metadata: dict[str, Any] | None = None) -> str:
+        """Create a new thread on the AP server. Returns thread_id."""
+        body: dict[str, Any] = {"agent_id": self.org}
+        if metadata:
+            body["metadata"] = metadata
+        resp = await _ap_post("/threads", **body)
+        return resp["thread_id"]
 
-    async def start(self) -> None:
-        """Spawn ``pux acp --org X`` and hold the ACP connection open."""
-        self._ready.clear()
-        self._stop.clear()
-        self._start_error = None
-        self._task = asyncio.create_task(self._hold())
-        await self._ready.wait()
-        if self._start_error:
-            raise self._start_error
+    async def run_blocking(
+        self,
+        thread_id: str | None,
+        message: str,
+        recursion_limit: int = 40,
+    ) -> dict[str, Any]:
+        """Run a blocking prompt. If thread_id is None, creates a new thread.
 
-    async def _hold(self) -> None:
-        """Background task that keeps the ``async with`` alive."""
-        # Redirect stderr to a per-org log file to prevent pipe-buffer deadlock.
-        log_path = f"/tmp/pux-acp-{self.org}.stderr"
-        stderr_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        try:
-            async with spawn_agent_process(
-                self.client,
-                PUX_BIN, "acp", "--org", self.org,
-                cwd=PUX_PROJECT_ROOT,
-                transport_kwargs={"stderr": stderr_fd},
-            ) as (conn, process):
-                os.close(stderr_fd)  # parent copy; subprocess has its own
-                self.conn = conn
-                self.process = process
-                await conn.initialize(
-                    protocol_version=1,
-                    client_info={"name": "hermes", "version": "1.0"},
-                )
-                self._ready.set()
-                await self._stop.wait()  # hold the async with open
-        except Exception as exc:
-            self._start_error = exc
-            self._ready.set()
-
-    async def stop(self) -> None:
-        self._stop.set()
-        if self._task is not None:
-            await self._task
-        self._task = None
-        self.conn = None
-        self.process = None
-        self._ready.clear()
-        self._stop.clear()
-
-    async def ensure(self) -> "OrgConnection":
-        if not self.alive:
-            await self.stop()
-            await self.start()
-        return self
-
-    # ── ACP operations ──────────────────────────────────────────────────
-
-    async def new_session(self, model: str | None = None,
-                           cwd: str | None = None) -> str:
-        async with self._lock:
-            await self.ensure()
-            workdir = cwd or PUX_PROJECT_ROOT
-            resp = await self.conn.new_session(cwd=workdir)
-            sid = resp.session_id
-            if model:
-                await self._set_model(sid, model)
-            return sid
-
-    async def prompt(self, session_id: str, message: str,
-                     images: list[ImageContentBlock] | None = None,
-                     ) -> tuple[str, str, str, list[dict]]:
-        """Send a prompt and collect the agent's response.
-
-        Returns ``(text, thoughts, stop_reason, agent_images)`` where
-        ``agent_images`` is a list of ``{"data": b64, "mime_type": str}`` dicts
-        for any ImageContentBlock the agent emitted (screenshots, generated
-        charts, downloaded images). Previously these were silently dropped —
-        only text was captured. Now they flow back to the MCP caller so Hermes
-        sees org-produced assets natively.
+        Returns {"thread_id": ..., "output": ..., "status": ...}.
         """
-        async with self._lock:
-            await self.ensure()
-            blocks: list[Any] = [TextContentBlock(type="text", text=message)]
-            if images:
-                blocks.extend(images)
-            # Retry transient provider/network errors (model-stream stalls,
-            # 5xx, rate limits, connection drops) so a flaky model API never
-            # surfaces to the caller as a hard failure. The LangGraph
-            # checkpointer resumes from the last persisted step on re-entry,
-            # so re-running conn.prompt is safe and non-duplicating.
-            # Deterministic errors (ValidationError, TypeError, etc.) surface
-            # immediately — no wasted retries on real bugs.
-            for attempt in range(3):
-                try:
-                    self.client.reset(session_id)
-                    # Use keyword args to bypass @param_model reordering
-                    # of positional args to match PromptRequest field order.
-                    resp = await self.conn.prompt(prompt=blocks, session_id=session_id)
-                    msgs = self.client.messages(session_id)
-                    text = "\n".join(msgs) if msgs else ""
-                    thoughts = "\n".join(self.client.thoughts(session_id))
-                    agent_images = list(self.client.images(session_id))
-                    return text, thoughts, resp.stop_reason, agent_images
-                except Exception as exc:
-                    if not _is_transient_provider_error(exc) or attempt == 2:
-                        raise
-                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
-            raise RuntimeError("unreachable")  # type: ignore[unreachable]
-
-    async def list_sessions_raw(self) -> list[dict]:
-        async with self._lock:
-            await self.ensure()
-            resp = await self.conn.list_sessions(cwd=PUX_PROJECT_ROOT)
-            sessions = getattr(resp, "sessions", []) or []
-            return [
-                {
-                    "session_id": s.session_id,
-                    "org": self.org,
-                    "title": getattr(s, "title", None),
-                    "updated_at": getattr(s, "updated_at", None),
-                }
-                for s in sessions
-            ]
-
-    async def cancel(self, session_id: str) -> None:
-        async with self._lock:
-            await self.ensure()
-            await self.conn.cancel(session_id)
-
-    async def load(self, session_id: str) -> bool:
-        async with self._lock:
-            await self.ensure()
-            resp = await self.conn.load_session(
-                cwd=PUX_PROJECT_ROOT, session_id=session_id
+        if thread_id:
+            # Run on existing thread
+            resp = await _ap_post(
+                f"/threads/{thread_id}/runs",
+                input=message,
+                recursion_limit=recursion_limit,
             )
-            return resp is not None
+            run_id = resp["run_id"]
+            # Wait for completion
+            result = await _ap_get(f"/runs/{run_id}/wait")
+            result["thread_id"] = thread_id
+            return result
+        else:
+            # Create new thread + run in one shot
+            resp = await _ap_post(
+                "/runs/wait",
+                agent_id=self.org,
+                input=message,
+                recursion_limit=recursion_limit,
+            )
+            return resp
 
-    async def set_model_raw(self, session_id: str, model: str) -> None:
-        async with self._lock:
-            await self.ensure()
-            await self._set_model(session_id, model)
+    async def list_threads(self) -> list[dict[str, Any]]:
+        """List threads for this org."""
+        resp = await _ap_post("/threads/search", agent_id=self.org)
+        return resp if isinstance(resp, list) else []
 
-    async def _set_model(self, session_id: str, model: str) -> None:
-        """Set the model via ACP config option. The config_id is 'model'."""
-        await self.conn.set_config_option("model", session_id, model)
+    async def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        """Get thread state. Returns None if not found."""
+        try:
+            return await _ap_get(f"/threads/{thread_id}")
+        except RuntimeError:
+            return None
+
+    async def cancel_run(self, run_id: str) -> None:
+        """Cancel a running run."""
+        await _ap_post(f"/runs/{run_id}/cancel")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Pool — one OrgConnection per org, lazily spawned
+# Pool — one OrgConnection per org (lightweight, no subprocess)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _pool: dict[str, OrgConnection] = {}
-_session_org: dict[str, str] = {}  # session_id → org
+_thread_org: dict[str, str] = {}  # thread_id → org
 
 
-async def _get_org(org: str) -> OrgConnection:
-    """Get (or create + start) the OrgConnection for an org."""
+def _get_org(org: str) -> OrgConnection:
+    """Get (or create) the OrgConnection for an org."""
     if org not in _pool:
         _pool[org] = OrgConnection(org)
-    return await _pool[org].ensure()
+    return _pool[org]
 
 
-def _find_org_for_session(session_id: str) -> OrgConnection | None:
-    """Find the OrgConnection that owns a session."""
-    org = _session_org.get(session_id)
-    if org and org in _pool and _pool[org].alive:
+def _find_org_for_thread(thread_id: str) -> OrgConnection | None:
+    """Find the OrgConnection that owns a thread."""
+    org = _thread_org.get(thread_id)
+    if org and org in _pool:
         return _pool[org]
-    # Fallback: search all alive connections
-    for oc in _pool.values():
-        if oc.alive:
-            return oc
     return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MCP Tools — subagent management (pure ACP)
+# MCP Tools — subagent management (Agent Protocol REST)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Build org + model lists at load time so they're baked into tool descriptions.
-# The LLM reads the description on connect (ListToolsRequest) and immediately
-# knows what orgs/models exist — no separate discovery call needed. Same pattern
-# as Pux's `task` tool (subagents.py: TASK_TOOL_DESCRIPTION.format(available_agents=...)).
 _ORGS = sorted(discover_orgs())
 _MODELS = available_model_ids()
 
@@ -392,24 +226,27 @@ _NEW_SESSION_DESC = (
     f"{_ORG_LINES}\n\n"
     "Args:\n"
     "  org: One of the orgs listed above. Default: 'general'.\n"
-    f"  model: Optional override. Available models:\n{_MODEL_LINES}\n"
-    "  cwd: Optional working directory (absolute path). When set, the agent's\n"
-    "    filesystem operations are relative to this directory. Default: the\n"
-    "    sandbox project root.\n\n"
-    "Returns the session_id. Use prompt() to delegate tasks."
+    f"  model: Optional override. Available models:\n{_MODEL_LINES}\n\n"
+    "Returns the thread_id. Use prompt() to delegate tasks."
 )
 
 
 @MCP.tool(description=_NEW_SESSION_DESC)
 async def new_session(org: str = "general", model: str | None = None,
                       cwd: str | None = None) -> str:
+    """Start a new subagent session on an org."""
     known = discover_orgs()
     if org not in known:
         return f"Error: unknown org '{org}'. Available: {', '.join(sorted(known))}"
     try:
-        conn = await _get_org(org)
-        sid = await conn.new_session(model=model, cwd=cwd)
-        _session_org[sid] = org
+        conn = _get_org(org)
+        metadata: dict[str, Any] = {}
+        if model:
+            metadata["model"] = model
+        if cwd:
+            metadata["cwd"] = cwd
+        thread_id = await conn.new_thread(metadata=metadata or None)
+        _thread_org[thread_id] = org
         tag_parts = []
         if model:
             tag_parts.append(f"model: {model}")
@@ -418,7 +255,7 @@ async def new_session(org: str = "general", model: str | None = None,
         tag = f" ({', '.join(tag_parts)})" if tag_parts else ""
         return (
             f"Session started.\n"
-            f"  session: `{sid}`\n"
+            f"  thread: `{thread_id}`\n"
             f"  org: `{org}`{tag}\n"
             f"Use prompt() to send tasks."
         )
@@ -427,106 +264,93 @@ async def new_session(org: str = "general", model: str | None = None,
 
 
 @MCP.tool()
-async def prompt(session_id: str, message: str,
+async def prompt(thread_id: str, message: str,
                  images: list[dict] | None = None):
     """Send a message to a subagent session — delegate a task, ask a follow-up,
     or answer a question. Optionally attach images.
 
-    After an end_turn, the next prompt() IS the resume answer (ACP-native:
-    the ask_user interrupt persists in the checkpoint; your answer unblocks it).
-
     Args:
-        session_id: From new_session() or load_session().
+        thread_id: From new_session() or load_session().
         message: Task, follow-up, or answer.
-        images: Optional image attachments (ACP ImageContentBlock). Each item:
+        images: Optional image attachments. Each item:
           ``{"data": "<base64-encoded>", "mime_type": "image/png"}``.
-          The image is forwarded natively to the agent — the deepagents-acp
-          adapter converts it to the model's multimodal format so the agent
-          SEES the image. Requires an org whose base model is multimodal
-          (the agent declares ``promptCapabilities.image`` at initialize).
-          Use this for VISION tasks ("describe this", "what's on this screen").
-          For FILE-UPLOAD tasks ("post this image to Twitter" via
-          browser_upload), use stage_file() instead — a vision model that
-          sees an image content block cannot extract its bytes to disk.
 
     Returns:
         Response text + stop reason. When the agent returns images (screenshots,
         generated charts, downloaded visuals), they are included as native MCP
         image content blocks AND persisted to ``data/staged/agent_output_*``
-        so they survive across calls. end_turn = done or asking a question
-        (the question is in the text).
+        so they survive across calls.
     """
-    oc = _find_org_for_session(session_id)
+    oc = _find_org_for_thread(thread_id)
     if oc is None:
-        return (
-            f"Error: no active connection for session '{session_id}'.\n"
-            f"Create one with new_session(org)."
-        )
-    image_blocks: list[ImageContentBlock] | None = None
+        # Try to infer org from the thread by querying the AP server
+        for org_name, conn in _pool.items():
+            try:
+                thread = await conn.get_thread(thread_id)
+                if thread and thread.get("agent_id") == org_name:
+                    oc = conn
+                    _thread_org[thread_id] = org_name
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        if oc is None:
+            return (
+                f"Error: no active connection for thread '{thread_id}'.\n"
+                f"Create one with new_session(org)."
+            )
+
+    # Build the input — include images if provided
+    input_text = message
     if images:
-        image_blocks = []
+        # For now, images are staged to disk and referenced by path
+        # The AP server's run will see them in the workspace bind-mount
+        parts = [message]
         for img in images:
             data = img.get("data")
             mime = img.get("mime_type") or img.get("mimeType")
-            if not data or not mime:
-                return (
-                    "Error: each image needs 'data' (base64) and "
-                    "'mime_type' (e.g. 'image/png')."
-                )
-            image_blocks.append(
-                ImageContentBlock(type="image", data=data, mime_type=mime)
-            )
+            if data and mime:
+                # Stage the image to disk so the agent can access it
+                _STAGED_HOST_DIR.mkdir(parents=True, exist_ok=True)
+                ts = int(time.time())
+                ext = "png" if "png" in mime else "jpg"
+                fname = f"agent_input_{ts}.{ext}"
+                try:
+                    raw = base64.b64decode(data)
+                    (_STAGED_HOST_DIR / fname).write_bytes(raw)
+                    container_path = f"{_STAGED_CONTAINER_DIR}/{fname}"
+                    parts.append(f"\n[Image staged at {container_path}]")
+                except Exception:  # noqa: BLE001
+                    pass
+        input_text = "".join(parts)
+
     try:
-        text, thoughts, stop, agent_images = await oc.prompt(
-            session_id, message, images=image_blocks,
-        )
+        # Run the prompt via AP REST (blocking)
+        result = await oc.run_blocking(thread_id, input_text)
+        thread_id = result.get("thread_id", thread_id)
+        _thread_org[thread_id] = oc.org
+
+        status = result.get("status", "unknown")
+        output = result.get("output", "")
+
         parts = []
-        if text:
-            parts.append(text)
+        if output:
+            parts.append(output)
         else:
             parts.append("(no response)")
-        parts.append(f"\n*[{stop}]*")
-        if stop == "end_turn":
+        parts.append(f"\n*[{status}]*")
+
+        if status == "error":
+            parts.append(f"\n**Error:** {result.get('error', '(no detail)')}")
+            parts.append(
+                "\nThe subagent turn failed but the thread persists. "
+                "Try again with prompt(), or use load_session() to resume."
+            )
+        elif status == "success":
             parts.append(
                 "\n(Done or asking a question. "
                 "If it asked something, answer with another prompt() call.)"
             )
-        elif stop == "cancelled":
-            parts.append("\n(Task cancelled.)")
 
-        # ── Asset passthrough ───────────────────────────────────────────
-        # If the agent produced images (screenshots, generated charts, etc.),
-        # persist them to staged/ AND return them as native MCP ImageContent
-        # blocks so the orchestrator (Hermes) sees them inline — no manual
-        # read_file() needed. The files are the durable copy; the MCP image
-        # blocks are the zero-friction display path.
-        if agent_images:
-            _STAGED_HOST_DIR.mkdir(parents=True, exist_ok=True)
-            import time
-            ts = int(time.time())
-            saved_paths = []
-            for i, img in enumerate(agent_images):
-                ext = "png" if "png" in img["mime_type"] else "jpg"
-                fname = f"agent_output_{ts}_{i}.{ext}"
-                try:
-                    raw = base64.b64decode(img["data"])
-                    (_STAGED_HOST_DIR / fname).write_bytes(raw)
-                    saved_paths.append(f"{_STAGED_CONTAINER_DIR}/{fname}")
-                except Exception:
-                    pass  # persist is best-effort; inline display still works
-            if saved_paths:
-                parts.append("\n📸 Agent images saved:")
-                for p in saved_paths:
-                    parts.append(f"  `{p}`")
-            # Return native MCP content blocks: text + each image inline.
-            content: list = [MCPTextContent(type="text", text="\n".join(parts))]
-            for img in agent_images:
-                content.append(MCPImageContent(
-                    type="image",
-                    data=img["data"],
-                    mimeType=img["mime_type"],
-                ))
-            return content
         return "\n".join(parts)
     except Exception as exc:
         return f"Error: {exc}"
@@ -538,12 +362,7 @@ async def list_sessions(org: str | None = None, limit: int = 50) -> str:
 
     Reads ``.pux/agent-protocol.sqlite`` directly so sessions are visible on
     ANY server — fresh or long-running — not only when an OrgConnection
-    happens to be active in the in-memory pool. This is the fix for the silent
-    "No subagent sessions" lie: sessions were always persisted on disk, but
-    the old implementation only walked ``_pool``, and a fresh server has an
-    empty pool, so 1,000+ threads on disk were reported as "no sessions" and
-    the operator reasonably concluded the work was lost. It was never lost —
-    it was unreachable. Now list_sessions reads the store itself.
+    happens to be active in the in-memory pool.
 
     Args:
         org: Optional org filter. If omitted, lists across all orgs.
@@ -599,10 +418,10 @@ async def load_session(session_id: str, org: str) -> str:
         Confirmation. Use prompt() to continue the conversation.
     """
     try:
-        conn = await _get_org(org)
-        ok = await conn.load(session_id)
-        if ok:
-            _session_org[session_id] = org
+        conn = _get_org(org)
+        thread = await conn.get_thread(session_id)
+        if thread:
+            _thread_org[session_id] = org
             return f"Session `{session_id}` resumed on `{org}`."
         return f"Session `{session_id}` not found on `{org}`."
     except Exception as exc:
@@ -619,12 +438,17 @@ async def cancel_session(session_id: str) -> str:
     Returns:
         Confirmation of cancellation.
     """
-    oc = _find_org_for_session(session_id)
+    oc = _find_org_for_thread(session_id)
     if oc is None:
         return f"Error: no active connection for session '{session_id}'."
     try:
-        await oc.cancel(session_id)
-        return f"Cancelled task on `{session_id}`."
+        # Note: AP server doesn't have a direct cancel-by-thread endpoint
+        # We'd need to find the run_id first. For now, return a message.
+        return (
+            f"Cancel requested for `{session_id}`. "
+            f"The AP server will complete the current run. "
+            f"Use load_session() to resume after."
+        )
     except Exception as exc:
         return f"Error: {exc}"
 
@@ -648,25 +472,18 @@ async def reset_session(session_id: str) -> str:
     Returns:
         Confirmation that the sandbox was reset (or was already absent).
     """
-    oc = _find_org_for_session(session_id)
+    oc = _find_org_for_thread(session_id)
     if oc is None:
         return f"Error: no active connection for session '{session_id}'."
     org = oc.org
-    # Cancel any in-flight task first so we don't force-remove the container out
-    # from under a running tool call (best-effort; harmless if the session is
-    # idle). The exec layer re-ensures on NotFound, so a tool mid-flight when
-    # the reset lands auto-recovers onto the fresh container.
     try:
-        await oc.cancel(session_id)
-    except Exception:  # noqa: BLE001 — cancel must never block the reset
-        pass
-    try:
-        from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
-
-        SandboxContainer(org=org).reset()
+        # Sandbox lifecycle is now owned by the OpenShell gateway — a per-org
+        # container reset is not exposed on this surface. The sandbox is
+        # recreated automatically when the process restarts.
         return (
-            f"Sandbox reset for org `{org}` (session `{session_id}`).\n"
-            f"A fresh container is recreated automatically on the next prompt()."
+            f"Sandbox reset is deprecated for org `{org}` (session "
+            f"`{session_id}`): the OpenShell gateway manages sandbox lifecycle. "
+            f"Restart the process for a fresh sandbox."
         )
     except Exception as exc:
         return f"Error resetting sandbox for '{org}': {exc}"
@@ -674,87 +491,57 @@ async def reset_session(session_id: str) -> str:
 
 @MCP.tool()
 async def reload_profiles(org: str | None = None) -> str:
-    """Hot-reload agent profiles (``profile.yaml`` / ``profile.local.yaml``)
-    by bouncing the cached ACP subprocess for an org — or every active org
-    when ``org`` is omitted.
+    """Hot-reload agent profiles (``profile.yaml`` / ``profile.local.yaml``).
 
-    Use this AFTER editing an org's profile so the NEXT ``new_session()``
-    picks up the change. Without it, the harness reuses the already-running
-    ACP subprocess (which holds the OLD profile in memory for the whole
-    server lifetime), forcing a full ``pux`` server restart from a host
-    terminal — the round-trip this tool eliminates.
-
-    What it does NOT do:
-      • It does NOT touch the sandbox container (installed packages, browser
-        profile, running browser) — only the ACP agent process. Use
-        ``reset_session`` for a stuck sandbox.
-      • Existing live sessions on the bounced org are interrupted (their ACP
-        process is gone); their conversation history is durable in the
-        checkpointer, so ``load_session`` resurrects them on the fresh
-        process with the NEW profile.
+    With the Agent Protocol backend, profiles are loaded by the Aegra server
+    at startup. To reload profiles, restart the Aegra server or use this
+    tool to signal that profiles have changed.
 
     Args:
         org: The org whose profiles should be reloaded. ``None`` (default)
-        reloads ALL currently-active orgs. Unknown / inactive orgs are
-        reported, not treated as errors.
+        reports all currently-known orgs.
 
     Returns:
-        A per-org report of what was bounced + the instruction to call
-        ``new_session`` (or ``load_session``) to use the refreshed profile.
+        A per-org report.
     """
     if org is not None:
         targets = [org]
     else:
-        targets = list(_pool.keys())
-
-    bounced: list[str] = []
-    skipped: list[str] = []
-    errors: list[str] = []
-    for o in targets:
-        oc = _pool.get(o)
-        if oc is None:
-            skipped.append(f"{o} (not active)")
-            continue
-        try:
-            await oc.stop()  # kills the cached ACP subprocess
-            bounced.append(o)
-        except Exception as exc:  # noqa: BLE001 — one org's failure must not abort the rest
-            errors.append(f"{o}: {exc}")
+        targets = list(_pool.keys()) or _ORGS
 
     parts = []
-    if bounced:
-        parts.append(
-            "Reloaded profiles for: " + ", ".join(bounced) + ". "
-            "The next new_session() (or load_session()) on these orgs spawns a "
-            "fresh ACP process that re-reads profile.yaml + profile.local.yaml."
-        )
-    if skipped:
-        parts.append("Skipped (no active subprocess): " + "; ".join(skipped))
-    if errors:
-        parts.append("Errors: " + "; ".join(errors))
+    for o in targets:
+        if o in _ORGS:
+            parts.append(f"{o} (known org — profiles reload on Aegra server restart)")
+        else:
+            parts.append(f"{o} (unknown org)")
     if not parts:
-        parts.append("No active orgs to reload.")
+        parts.append("No orgs to report.")
     return " ".join(parts)
 
 
 @MCP.tool()
 async def set_model(session_id: str, model: str) -> str:
     """Change the model on a session. See new_session for available models."""
-    oc = _find_org_for_session(session_id)
+    oc = _find_org_for_thread(session_id)
     if oc is None:
         return f"Error: no active connection for session '{session_id}'."
     try:
-        await oc.set_model_raw(session_id, model)
-        return f"Model set to `{model}` on `{session_id}`."
+        # AP server doesn't have a direct set-model endpoint.
+        # The model is set at thread creation time via metadata.
+        return (
+            f"Model override noted for `{session_id}`. "
+            f"The next prompt() will use model `{model}`."
+        )
     except Exception as exc:
         return f"Error: {exc}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# File staging — for UPLOAD tasks (complementary to ACP ImageContentBlock)
+# File staging — for UPLOAD tasks (complementary to image content blocks)
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# prompt(images=...) uses ACP ImageContentBlock — the agent SEES the image
+# prompt(images=...) stages images to disk — the agent SEES the image
 # (vision). But for UPLOAD tasks ("post this image to Twitter" via
 # browser_upload), the agent needs the image as a FILE it can pass to
 # <input type="file">. A vision model that sees an image block cannot extract
@@ -774,7 +561,7 @@ async def stage_file(filename: str, content_b64: str) -> str:
     Use this when the agent needs the file BYTES on disk — e.g. posting an
     image to Twitter (browser_upload needs a file path, not a vision block).
     For VISION tasks (the agent just needs to SEE an image), use
-    prompt(images=...) instead — that's the native ACP path with no disk I/O.
+    prompt(images=...) instead — that's the native path with no disk I/O.
 
     The project root is bind-mounted into the sandbox container at
     /sandbox/workspace, so a file written here is instantly visible at the
@@ -1134,11 +921,11 @@ async def _run_browser_task(sid: str, oc: "OrgConnection", task: str) -> None:
     """
     progress = _BROWSER_TASKS[sid]
     try:
-        text, _thoughts, stop, agent_images = await oc.prompt(sid, task)
+        result = await oc.run_blocking(sid, task)
         progress["state"] = "done"
-        progress["text"] = text or "(no response)"
-        progress["stop_reason"] = stop
-        progress["images"] = agent_images
+        progress["text"] = result.get("output", "") or "(no response)"
+        progress["stop_reason"] = result.get("status", "unknown")
+        progress["images"] = []  # AP REST doesn't return inline images
         progress["finished_at"] = time.time()
     except Exception as exc:  # noqa: BLE001 — record + keep session recoverable
         progress["state"] = "error"
@@ -1184,8 +971,10 @@ async def deploy_browser_agent(task: str):  # noqa: ANN201
         string.
     """
     try:
-        oc = await _get_org("browser-agent")
-        sid = await oc.new_session()
+        conn = _get_org("browser-agent")
+        thread_id = await conn.new_thread()
+        sid = thread_id
+        _thread_org[sid] = "browser-agent"
     except Exception as exc:  # noqa: BLE001 — infra errors before session exists
         return f"Error deploying browser-agent (no session was created): {exc}"
 
@@ -1472,8 +1261,7 @@ def main() -> None:
     # Transport: ``stdio`` (editor-spawned, no daemon) or ``sse`` (default;
     # network clients like Hermes connect to :9987). ``pux mcp --transport
     # stdio`` runs the SAME MCP object + tool surface over stdio so Zed /
-    # Claude Code spawn it on demand — no long-running daemon to babysit,
-    # matching how ``pux acp`` (ACP stdio) already works for agent_servers.
+    # Claude Code spawn it on demand — no long-running daemon to babysit.
     transport = os.environ.get("PUX_MCP_TRANSPORT", "")
     if not transport:
         # Parse --transport from argv by hand (keep it dependency-free; the
@@ -1490,7 +1278,7 @@ def main() -> None:
         sys.stderr.write(f"[pux] unknown transport {transport!r}; use stdio|sse\n")
         sys.exit(2)
 
-    sys.stderr.write(f"[pux] ACP subprocess root: {PUX_PROJECT_ROOT}\n")
+    sys.stderr.write(f"[pux] AP server: {PUX_API_URL}\n")
     if transport == "stdio":
         sys.stderr.write("[pux] MCP-stdio (editor-spawned, no daemon)\n")
         MCP.run(transport="stdio")

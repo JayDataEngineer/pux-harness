@@ -247,7 +247,7 @@ class StackCtx:
     org: str
     facts: RuntimeFacts
     rubric_gate: Any | None    # profile.RubricGate | None
-    exec_client: Any           # DockerExecClient — for the grader's evidence tools
+    exec_client: Any           # ExecClient — for the grader's evidence tools
     # Retry-layer configs (profile.ModelRetryConfig / ToolRetryConfig | None).
     # model_retry is default-ON (a present config even when no block is shipped
     # — ``load_model_retry`` returns the shipped default); tool_retry is
@@ -355,7 +355,7 @@ def _build_prepare(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
     not. See ``context/prepare_warmup.py``."""
     if not ctx.facts.prepare_warmup:
         return None
-    from pux_harness.sandbox.container import prepare as _prepare  # noqa: PLC0415
+    from pux_harness.sandbox.exec import prepare as _prepare  # noqa: PLC0415
     return PrepareWarmupMiddleware(
         org=ctx.org,
         universal_warmup=ctx.facts.transport != "direct",

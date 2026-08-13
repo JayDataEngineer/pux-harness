@@ -15,8 +15,8 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
-from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
-from pux_harness.sandbox.backend import PuxSandboxBackend
+from pux_harness.sandbox.exec import ExecClient, ExecTimeout
+from deepagents.backends.sandbox import BaseSandbox
 from pux_harness.sandbox.tools._shared import _tail
 
 log = logging.getLogger(__name__)
@@ -81,8 +81,8 @@ def _default_media_prompt(kind: str) -> str:
 
 
 def _read_media(
-    backend: PuxSandboxBackend,
-    exec_client: DockerExecClient,
+    backend: BaseSandbox,
+    exec_client: ExecClient,
     path: str | None,
     url: str | None,
 ) -> tuple[str, str]:
@@ -208,7 +208,7 @@ def _invoke_primary_media(
 
 
 def _onnx_describe(
-    exec_client: DockerExecClient, *,
+    exec_client: ExecClient, *,
     image_path: str | None, image_url: str | None,
     prompt: str | None, primary_error: str | None = None,
 ) -> dict:
@@ -257,7 +257,7 @@ def _onnx_describe(
 
 
 def _extract_video_keyframes(
-    exec_client: DockerExecClient, video_path: str, n: int = _VIDEO_KEYFRAMES,
+    exec_client: ExecClient, video_path: str, n: int = _VIDEO_KEYFRAMES,
 ) -> tuple[list[str], str | None]:
     """Probe ``video_path`` (in-sandbox) and extract up to ``n`` evenly-spaced
     frames to ``/tmp/pux_multimodal_kf/kf_*.png`` via ffmpeg. Returns

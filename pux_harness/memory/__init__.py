@@ -7,7 +7,7 @@ agent reads memory on startup and can write to it during conversations via
 
 Architecture:
   - ``CompositeBackend`` routes ``/memories/`` to a ``StoreBackend`` (persistent,
-    cross-conversation) and everything else to the existing ``PuxSandboxBackend``.
+    cross-conversation) and everything else to the existing ``BaseSandbox``.
   - ``StoreBackend`` uses LangGraph's ``BaseStore`` with a project-scoped namespace
     (based on the working directory path) — matching Claude's per-project memory
     model. Each working directory gets its own isolated memory store.

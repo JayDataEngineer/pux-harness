@@ -24,7 +24,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
+from pux_harness.sandbox.exec import ExecClient, ExecTimeout
 from pux_harness.sandbox.policy import Policy, job_specs
 
 log = logging.getLogger("pux.jobs")
@@ -40,7 +40,7 @@ class JobResult:
     duration: float = 0.0  # wall-clock seconds
 
 
-def run_jobs(pol: Policy | None, exec_client: DockerExecClient) -> list[JobResult]:
+def run_jobs(pol: Policy | None, exec_client: ExecClient) -> list[JobResult]:
     """Run each declared job in-sandbox. Warn-and-continue on failure.
 
     Returns a list of ``JobResult`` — one per job, in declaration order.

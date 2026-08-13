@@ -75,7 +75,7 @@ def retry_on_stream_stall(exc: BaseException) -> bool:
     # scripts, dynamic tools, browser tools) may still let it escape, and
     # this is the SINGLE classifier — pin it here so the contract holds
     # regardless of which tool raised.
-    from pux_harness.sandbox.docker_exec import ExecTimeout as _SandboxExecTimeout
+    from pux_harness.sandbox.exec import ExecTimeout as _SandboxExecTimeout
     if isinstance(exc, _SandboxExecTimeout):
         return False
 

@@ -3,8 +3,9 @@
 The engine's 44 ``pux_sandbox_*`` specialist tools (python, describe_image,
 multimodal, desktop, browser, etc.) are served via MCP stdio. Each agent
 process that needs file/shell/code/browser tools spawns this server as a
-child subprocess. The server connects to the Docker sandbox via
-DockerExecClient and registers every specialist tool with FastMCP.
+child subprocess. The server connects to the shared sandbox backend
+(``shared_exec`` / ``shared_backend`` — OpenShell by default) and registers
+every specialist tool with FastMCP.
 
 WHY: Phase 1 of the engine simplification plan. Tools move OUT of the engine
 (stack.py / registry.py / ToolDeps / Requirements) into a standalone MCP
@@ -14,14 +15,13 @@ UNCHANGED — ``build_native_specialists`` builds the same StructuredTool
 instances; this server wraps each as an MCP tool.
 
 Architecture (Pattern 2 — one MCP server per agent process):
-    agent framework → stdio → [this server] → DockerExecClient → container
+    agent framework → stdio → [this server] → shared BaseSandbox → OpenShell
 
-The server owns ONE DockerExecClient for its lifetime. When the agent
-disconnects (stdin EOF), the server exits and the client connection closes.
+The server owns ONE ``ExecClient`` for its lifetime. When the agent
+disconnects (stdin EOF), the server exits and the backend connection closes.
 
 Env:
-    PUX_SANDBOX_CONTAINER  — the container name (auto-discovered if unset)
-    PUX_ORG                — the org name (scopes skills tools)
+    PUX_ORG  — the org name (scopes skills tools)
 
 Logging: stdout is RESERVED for MCP JSON-RPC. All logs go to stderr.
 """
@@ -35,8 +35,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from pux_harness.sandbox.docker_exec import DockerExecClient
-from pux_harness.sandbox.backend import PuxSandboxBackend
+from pux_harness.sandbox.exec import shared_backend, shared_exec
 from pux_harness.sandbox.tools import build_native_specialists
 
 # ── logging (stderr only) ────────────────────────────────────────────────────
@@ -125,18 +124,10 @@ def _wrap_structured_tool(tool: Any) -> Any:
 
 # ── bootstrap ────────────────────────────────────────────────────────────────
 
-def _build_client() -> DockerExecClient:
-    """Create + connect the Docker exec client."""
-    container = os.environ.get("PUX_SANDBOX_CONTAINER") or None
-    if container:
-        log.info("using PUX_SANDBOX_CONTAINER=%s", container)
-    return DockerExecClient(container=container)
-
-
 def _register_all() -> int:
     """Build every specialist StructuredTool + register each with FastMCP."""
-    client = _build_client()
-    backend = PuxSandboxBackend(client)
+    client = shared_exec()
+    backend = shared_backend()
     org = os.environ.get("PUX_ORG") or None
 
     tools = build_native_specialists(

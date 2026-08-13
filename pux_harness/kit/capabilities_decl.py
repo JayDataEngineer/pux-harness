@@ -55,7 +55,7 @@ silently skipped (no-legacy-left-behind / no-fallbacks-no-aliases).
 
 This module is PURE DATA — it takes parsed dicts/frontmatter and returns
 desugared data. File I/O stays in the callers (``kit.loaders`` for frontmatter,
-``agent.tool_servers`` / ``agent.contract`` for ``org.yaml``), so it depends only
+``agent.tool_servers`` / ``agent.org_validation`` for ``org.yaml``), so it depends only
 on the stdlib and stays cycle-free at the kit layer.
 """
 from __future__ import annotations

@@ -13,7 +13,7 @@ Why a declarative list and not decorator auto-discovery: the whole surface is
 visible at a glance, there are no import-time side effects, and a stale
 reference fails loud (the contract and the runtime resolver share
 ``classify_slug`` / ``prefixed``, so they can no longer drift — see
-``agent/contract.py`` rule 4 and ``agent/orgs.py`` ``_resolve_tools``).
+``agent/org_validation.py`` rule 4 and ``agent/orgs.py`` ``_resolve_tools``).
 
 Per-tool ``Requirements`` (which Docker client / backend / vision model / org
 scope a factory needs, and which sandbox capabilities — ffmpeg, xdotool — it
@@ -30,8 +30,8 @@ from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.docker_exec import DockerExecClient
-from pux_harness.sandbox.backend import PuxSandboxBackend
+from pux_harness.sandbox.exec import ExecClient
+from deepagents.backends.sandbox import BaseSandbox
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, PUX_GRADER_PREFIX
 from pux_harness.sandbox.tools.python import _python_tool
 from pux_harness.sandbox.tools.skills import _list_skills_tool
@@ -367,8 +367,8 @@ def build_tools(deps: ToolDeps, category: Category) -> list[StructuredTool]:
 
 
 def build_native_specialists(
-    exec_client: DockerExecClient, vision_model: object | None = None,
-    org: str | None = None, backend: PuxSandboxBackend | None = None,
+    exec_client: ExecClient, vision_model: object | None = None,
+    org: str | None = None, backend: BaseSandbox | None = None,
 ) -> list[StructuredTool]:
     """Every native ``pux_sandbox_*`` specialist. Thin category filter over
     ``build_tools`` — signature preserved so ``graph.py`` / ``main.py`` and the
@@ -376,7 +376,7 @@ def build_native_specialists(
 
     ``vision_model`` threads the MULTIMODAL LLM into ``describe_image`` /
     ``multimodal`` / ``multimodal_mega`` (model-primary, ONNX/ffmpeg fallback).
-    ``org`` scopes the skills tools. ``backend`` is the PuxSandboxBackend the
+    ``org`` scopes the skills tools. ``backend`` is the BaseSandbox the
     three media tools read sandbox files through. See each tool's
     ``Requirements`` entry in ``REGISTRY``."""
     return build_tools(
@@ -386,7 +386,7 @@ def build_native_specialists(
     )
 
 
-def build_grader_tools(exec_client: DockerExecClient) -> list[StructuredTool]:
+def build_grader_tools(exec_client: ExecClient) -> list[StructuredTool]:
     """The three ``pux_grader_*`` evidence tools for ``RubricMiddleware``'s
     grader. Relocated here from ``grader.py`` so the registry owns every
     builder (and ``grader.py`` stays a leaf module, avoiding a

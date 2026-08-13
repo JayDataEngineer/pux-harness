@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.docker_exec import DockerExecClient
+from pux_harness.sandbox.exec import ExecClient
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, _result
 
 
@@ -23,7 +23,7 @@ _PYTHON_DESC = (
 )
 
 
-def _python_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _python_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(code: str) -> str:
         if not code:
             return _result({"success": False, "error": "no code provided"})

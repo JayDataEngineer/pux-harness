@@ -1,7 +1,7 @@
 """Pux adapter for ``build_context_layer`` — injects Docker exec tools.
 
 The real implementation lives in ``deepagents_context.layer``. This adapter
-keeps the pux-facing ``exec_client`` parameter (a ``DockerExecClient``) and
+keeps the pux-facing ``exec_client`` parameter (a ``ExecClient``) and
 converts it to ``extra_tools`` for the package version, keeping all existing
 pux call sites unchanged.
 """

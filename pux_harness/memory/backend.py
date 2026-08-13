@@ -1,7 +1,7 @@
 """CompositeBackend instance for memory routing.
 
 Routes ``/memories/*`` to a ``StoreBackend`` (persistent, agent-managed) and
-everything else to the existing ``PuxSandboxBackend`` (sandbox fs/shell).
+everything else to the existing ``BaseSandbox`` (sandbox fs/shell).
 
 ``CompositeBackend`` is built ONCE here (a ``BackendProtocol`` instance) and
 passed as ``backend=`` to ``create_deep_agent()``. ``StoreBackend`` takes the
@@ -20,14 +20,14 @@ from deepagents.backends.composite import CompositeBackend
 if TYPE_CHECKING:
     from langgraph.store.base import BaseStore
 
-    from pux_harness.sandbox.backend import PuxSandboxBackend
+    from deepagents.backends.sandbox import BaseSandbox
 
 from pux_harness.memory.config import memory_namespace
 
 
 def build_memory_backend(
     org: str,
-    default_backend: PuxSandboxBackend,
+    default_backend: BaseSandbox,
     store: BaseStore | None = None,
 ) -> tuple[CompositeBackend, BaseStore]:
     """Build the composite backend and store for memory.

@@ -4,14 +4,15 @@
   uv run pux check                 # docker-exec + native specialist smoke (no tokens)
   uv run pux direct --org general --task "..."   # one-shot run
 
-Proves per-org: deepagents drives the pux sandbox through ``PuxSandboxBackend``
-(native ``ls/read_file/write_file/edit_file/glob/grep/execute`` via docker
-exec), the CTO delegates to its specialist via ``task(subagent_type=...)``, and
+Proves per-org: deepagents drives the pux sandbox through the shared
+``BaseSandbox`` (OpenShell by default — native
+``ls/read_file/write_file/edit_file/glob/grep/execute`` via the sandbox), the CTO delegates to its specialist via ``task(subagent_type=...)``, and
 specialists fall back to those same native tools. The 13 specialist capabilities
 (browser/desktop/vision/skills/python) are native ``pux_sandbox_*`` Python tools
 too — there is no Go bridge. Prints a message trace + token usage so
 cost/output is comparable.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,13 +24,8 @@ import uuid
 from langchain_core.tools import BaseTool
 from langgraph.errors import GraphRecursionError
 
-from pux_harness.agent.contract import (
-    check_all,
-    check_harness,
-    check_skill_roots,
-    has_errors,
-)
-from pux_harness.sandbox.docker_exec import get_exec_client
+from pux_harness.agent.org_validation import audit_org, has_errors
+from pux_harness.sandbox.exec import get_exec_client
 from pux_harness.agent.graph import build_graph, shared_backend, shared_exec
 from pux_harness.agent.observability import build_invoke_config
 from pux_harness.agent.profile import default_rubric
@@ -44,9 +40,6 @@ from pux_harness.agent.orgs import (
     discover_orgs,
     org_agent_slugs,
 )
-from pux_harness.sandbox.backend import PuxSandboxBackend
-
-
 
 
 def _build_agent(
@@ -65,7 +58,8 @@ def _build_agent(
     input is the answer). ``PUX_AUTONOMOUS`` drops ask_user entirely (headless
     batch runs)."""
     agent = build_graph(
-        org, checkpointer=saver,
+        org,
+        checkpointer=saver,
         facts=RuntimeFacts(transport="direct", autonomous=autonomous_from_env()),
         mcp_tools=mcp_tools or (),
     )
@@ -128,8 +122,12 @@ async def _recover_partial(agent, config) -> tuple[list, object]:
 # CLI-hint counterpart: the dispatch/direct output never told the user where
 # their files landed — now it does.
 
+
 def _write_thread_meta(
-    thread_id: str, org: str, task: str, status: str,
+    thread_id: str,
+    org: str,
+    task: str,
+    status: str,
 ) -> None:
     """Write/update the per-thread provenance file.
 
@@ -150,13 +148,15 @@ def _write_thread_meta(
                 existing = json.loads(meta_path.read_text())
             except (json.JSONDecodeError, OSError):
                 existing = {}
-        existing.update({
-            "thread_id": thread_id,
-            "org": org,
-            "task": task,
-            "status": status,
-            f"{status}_at": datetime.now(timezone.utc).isoformat(),
-        })
+        existing.update(
+            {
+                "thread_id": thread_id,
+                "org": org,
+                "task": task,
+                "status": status,
+                f"{status}_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         meta_path.write_text(json.dumps(existing, indent=2))
     except OSError:
         # Best-effort — never block the run on provenance write failure.
@@ -174,10 +174,8 @@ def _print_output_dirs(thread_id: str | None = None, stream=None) -> None:
     stream = stream or sys.stdout
     project = project_root()
     if thread_id:
-        print(f"resume with:   pux direct --thread {thread_id} "
-              f"--task \"<follow-up>\"", file=stream)
-        print(f"               (or: pux run {thread_id} \"<follow-up>\")",
-              file=stream)
+        print(f'resume with:   pux direct --thread {thread_id} --task "<follow-up>"', file=stream)
+        print(f'               (or: pux run {thread_id} "<follow-up>")', file=stream)
     print(f"files under:   {project}", file=stream)
     print("  artifacts/  memos/  .pux/sessions/", file=stream)
 
@@ -190,6 +188,7 @@ async def _run(
     thread: str | None = None,
 ) -> None:
     from pux_harness.agent.mcp_client import open_org_mcp  # noqa: PLC0415
+
     mcp_tools: list[BaseTool] = []
     try:
         mcp_tools = await open_org_mcp(org)
@@ -203,28 +202,30 @@ async def _run(
     _write_thread_meta(thread_id, org, task, status="running")
     async with open_thread_store() as store:
         agent, backend = _build_agent(org, saver=store.saver, mcp_tools=mcp_tools)
-        await store.register_thread(
-            thread_id, org, metadata={"source": "direct", "task": task})
+        await store.register_thread(thread_id, org, metadata={"source": "direct", "task": task})
         print(
-            f"\n[thread] {thread_id}   "
-            f"(resume via: pux show {thread_id} | pux resume)",
+            f"\n[thread] {thread_id}   (resume via: pux show {thread_id} | pux resume)",
             file=sys.stderr,
         )
         _print_output_dirs(thread_id, stream=sys.stderr)
-        # Run prep jobs after container is up, before the agent loop.
-        from pux_harness.sandbox.container import prepare  # noqa: PLC0415
+        # Run prep jobs after the sandbox is up, before the agent loop.
+        from pux_harness.sandbox.exec import prepare  # noqa: PLC0415
+
         job_results = prepare(org, exec_client=shared_exec())
         if job_results:
             failed = [r for r in job_results if r["status"] != "ok"]
             for r in job_results:
                 tag = "ok" if r["status"] == "ok" else "FAIL"
-                print(f"  [job] {r['name']:<24} {tag} {r['duration']}s"
-                      + (f"  {r['error'][:80]}" if r.get("error") else ""))
+                print(
+                    f"  [job] {r['name']:<24} {tag} {r['duration']}s"
+                    + (f"  {r['error'][:80]}" if r.get("error") else "")
+                )
             if failed:
                 print(f"\n  {len(failed)} prep job(s) failed (continuing to agent)")
         # Surface the watchable-desktop URL when sandbox.display.watch is on.
-        from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
-        _watch = SandboxContainer(org=org).watch_url
+        # (OpenShell does not expose a VNC watch URL — this is a no-op stub
+        # retained for prompt-output parity; restore when a watch surface lands.)
+        _watch = None
         if _watch:
             print(f"  [watch] live desktop → {_watch}")
         print(f"[org] {org}   [task] {task}\n")
@@ -239,9 +240,7 @@ async def _run(
             dr = default_rubric(org)
             if dr:
                 state["rubric"] = dr
-        invoke_config = build_invoke_config(
-            thread_id, recursion_limit, org, transport="direct"
-        )
+        invoke_config = build_invoke_config(thread_id, recursion_limit, org, transport="direct")
         try:
             result = await agent.ainvoke(state, config=invoke_config)
         except GraphRecursionError:
@@ -289,7 +288,7 @@ async def _run(
     # hand-maintained copy of either surface here.
     used: set[str] = set()
     for m in messages:
-        for tc in (getattr(m, "tool_calls", None) or []):
+        for tc in getattr(m, "tool_calls", None) or []:
             used.add(tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", ""))
     leaked = used & LEGACY_TOOL_NAMES
     print("\n=== SURFACE CHECK (main agent only) ===")
@@ -308,15 +307,13 @@ async def _run(
     for cmd in backend.execute_log:
         one = " ".join(cmd.split())
         print(f"  $ {one[:140]}")
-    if not backend.execute_log:
+    if not getattr(backend, "execute_log", ()):
         print("  (none — no native fs/shell call was made this run)")
     _write_thread_meta(thread_id, org, task, status="finished")
 
 
 def _jobs_run(org: str, job: str | None) -> int:
-    """Run prep jobs inside the org's sandbox container."""
-    from pux_harness.sandbox.container import SandboxContainer  # noqa: PLC0415
-    from pux_harness.sandbox.docker_exec import DockerExecClient  # noqa: PLC0415
+    """Run prep jobs inside the org's sandbox."""
     from pux_harness.sandbox.jobs import run_jobs  # noqa: PLC0415
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
     from pux_harness.kit._paths import project_root  # noqa: PLC0415
@@ -339,9 +336,7 @@ def _jobs_run(org: str, job: str | None) -> int:
             return 1
 
     print(f"[jobs] {org}: running {len(specs)} job(s)")
-    sb = SandboxContainer(org=org)
-    container_name = sb.ensure()
-    ec = DockerExecClient(container=container_name)
+    ec = shared_exec()
     results = run_jobs(pol, ec)
 
     if job:
@@ -394,8 +389,10 @@ def _check_policy(org: str) -> int:
     try:
         p = policy.load(org, project_root())
     except policy.NoPolicy:
-        print(f"{org}: no policy.yaml — today's behavior "
-              "(full egress, default image/tier, no required creds).")
+        print(
+            f"{org}: no policy.yaml — today's behavior "
+            "(full egress, default image/tier, no required creds)."
+        )
         return 0
 
     print(f"## {org} policy")
@@ -439,80 +436,31 @@ def _check_policy(org: str) -> int:
     return 1 if missing else 0
 
 
-def _sandbox(cmd: str, output: str | None = None, sandbox_id: str | None = None,
-             prune_days: int = 14, dry_run: bool = False) -> int:
-    """Docker sandbox lifecycle, harness-owned. Replaces the Go
-    ``task start/stop/status`` for container boot. ``ensure`` reuses a running
-    container or boots one (the path the exec client takes lazily).
-    ``dump-persist`` streams the named persist volume to a host tarball
-    (gap 5 of the persistence audit — the Chrome profile, apt-install list,
-    and ``/root`` dotfiles stored named-volume-side are otherwise invisible
-    to the host filesystem).
+def _sandbox(
+    cmd: str,
+    output: str | None = None,
+    sandbox_id: str | None = None,
+    prune_days: int = 14,
+    dry_run: bool = False,
+) -> int:
+    """Sandbox-side CLI. Container lifecycle (start/stop/ensure/pause/unpause/
+    status/dump-persist) is now owned by the OpenShell gateway — the sandbox
+    auto-starts on first use, so those subcommands print a pointer instead of
+    managing a Docker container. The two host-side commands survive:
 
-    ``sandbox_id`` overrides the per-project default (container name + persist
-    volume key). Pass None to use the derived default — different projects
-    auto-isolate, so you only need this for two concurrent sessions on ONE
-    project."""
-    from pux_harness.sandbox.container import SandboxContainer, resolve_project_path
+    * ``projects``       — wayfinding: every project path ever bound.
+    * ``prune-sessions`` — bound the inert ``.pux/`` session history.
+    """
+    from pux_harness.sandbox.exec import resolve_project_path
 
-    sb = SandboxContainer(sandbox_id=sandbox_id)
     project = resolve_project_path()
-    org = sb.org or "(none)"
 
-    if cmd == "start":
-        name = sb.ensure()
-        _print_status(sb, name, project, org)
-        return 0
-    if cmd == "ensure":
-        name = sb.ensure()
-        _print_status(sb, name, project, org)
-        return 0
-    if cmd == "stop":
-        sb.destroy()
-        print(f"stopped + removed container for {project}")
-        print("(state preserved: workspace bind-mount, thread sqlite, "
-              "named persist volume — restart with `pux sandbox start`)")
-        return 0
-    if cmd == "pause":
-        sb.pause()
-        print(f"paused container for {project} (processes frozen, memory resident)")
-        print("(resume with: pux sandbox unpause)")
-        return 0
-    if cmd == "unpause":
-        sb.unpause()
-        print(f"resumed container for {project} (processes thawed)")
-        return 0
-    if cmd == "status":
-        from pux_harness.sandbox.docker_exec import _discover  # noqa: PLC0415
-        import docker  # noqa: PLC0415
-
-        name = _discover(docker.from_env(timeout=10), project)
-        if name is None:
-            print(f"not running (no container for {project})")
-            return 1
-        _print_status(sb, name, project, org)
-        return 0
-    if cmd == "dump-persist":
-        import time  # noqa: PLC0415
-
-        out = output or f"sandbox-{sb.sandbox_id}-persist-{int(time.time())}.tgz"
-        sb.dump_persist(out)
-        size = os.path.getsize(out)
-        print(f"persist volume → {out} ({size:,} bytes)")
-        print("(Chrome profile, apt-install list, /root dotfiles)")
-        return 0
     if cmd == "projects":
-        # The wayfinding command: list every project path the harness has ever
-        # bound, newest-first, so a user who launched from the "wrong" dir can
-        # find the previous project's host path + the resume command. Closes the
-        # "I lost all my work" panic — the work is on disk, this names where.
         from pux_harness.sandbox import projects as _projects  # noqa: PLC0415
 
         rows = _projects.list_projects()
         if not rows:
             print("(no projects recorded yet)")
-            print("the registry is populated on the next `pux acp` / "
-                  "`pux sandbox ensure` — re-run from your project dir.")
             return 0
         print(f"  {'last_used (UTC)':<21} {'org':<14} {'sandbox':<14} path")
         for r in rows:
@@ -522,7 +470,6 @@ def _sandbox(cmd: str, output: str | None = None, sandbox_id: str | None = None,
             sid = (r["sandbox_id"] or "-")[:14]
             print(f"{mark} {ts:<21} {org:<14} {sid:<14} {r['path']}")
         print(f"\n{len(rows)} project(s).  (! = host path no longer exists)")
-        # Highlight the most recent project that ISN'T the current bind.
         prev = _projects.previous_project(project)
         if prev:
             print("\nmost recent OTHER project:")
@@ -530,100 +477,39 @@ def _sandbox(cmd: str, output: str | None = None, sandbox_id: str | None = None,
             print("  resume with:")
             print(f"    cd {prev['path']} && pux acp")
         return 0
+
     if cmd == "prune-sessions":
-        # Bound the inert session history under <project>/.pux/: finished-thread
-        # .meta.json files, the append-only run_events.jsonl, and wild-run logs.
-        # None of these are a leak (no live process holds them) but months of
-        # heavy use produces thousands of tiny files / one large JSONL. Default
-        # retention 14d; --dry-run previews; --prune-days N sets the window.
-        # Deliberately does NOT touch agent-protocol.sqlite (live thread store).
         from pux_harness.sandbox.prune import prune_pux_dir, summarize  # noqa: PLC0415
         from pux_harness.kit._paths import project_root  # noqa: PLC0415
 
-        # ``_write_thread_meta`` writes to ``project_root()/.pux/sessions`` (the
-        # harness app root, NOT ``$PUX_PROJECT_PATH``), so all session metadata
-        # accumulates here regardless of which project is edited. Prune the same
-        # dir so we actually hit the accumulation.
         pux_dir = project_root() / ".pux"
         report = prune_pux_dir(pux_dir, days=prune_days, dry_run=dry_run)
         print(summarize(report))
         if dry_run:
             print("\n(re-run without --dry-run to apply)")
         return 0
+
+    if cmd in {"start", "stop", "ensure", "pause", "unpause", "status", "dump-persist"}:
+        print(
+            f"`pux sandbox {cmd}` is deprecated — the OpenShell gateway now "
+            f"manages sandbox lifecycle (the sandbox auto-starts on first use). "
+            f"See ~/.local/share/pux/openshell/README.md."
+        )
+        return 0
+
     raise SystemExit(
-        f"unknown sandbox subcommand {cmd!r}; "
-        f"use: start | stop | status | ensure | pause | unpause | "
-        f"dump-persist | projects | prune-sessions"
+        f"unknown sandbox subcommand {cmd!r}; use: projects | prune-sessions"
     )
-
-
-def _print_status(sb, name: str, project: str, org: str) -> None:
-    import docker  # noqa: PLC0415
-
-    c = docker.from_env(timeout=10).containers.get(name)
-    print("running")
-    print(f"  Container   {name}")
-    print(f"  Image       {c.image.tags[0] if c.image.tags else c.image.id[:19]}")
-    print(f"  Status      {c.status}")
-    print(f"  Project     {project}")
-    print(f"  Org policy  {org}")
-    print(f"  Network     {','.join(c.attrs['NetworkSettings']['Networks'].keys())}")
-    print(f"  Runtime     {c.attrs['HostConfig']['Runtime'] or 'default'}")
-    # Session-preservation surface: sandbox_id (named-volume key) + the volume
-    # itself + thread store location. A user looking at `status` needs to see
-    # whether their session state is actually safe across a stop/start cycle.
-    print(f"  Sandbox ID  {sb.sandbox_id}   (named volume key — "
-          f"DO NOT change PUX_SANDBOX_ID or this volume is orphaned)")
-    persist_name = sb.persist_volume_name()
-    try:
-        vol = docker.from_env(timeout=10).volumes.get(persist_name)
-        # Mountpoint has the on-host path; _vol_size walks it for a byte count.
-        size = _vol_size_bytes(vol.Mountpoint) if hasattr(vol, "Mountpoint") else None
-        size_str = f"  ({_human_bytes(size)})" if size else ""
-        print(f"  Persist     {persist_name}{size_str}")
-    except Exception:  # noqa: BLE001
-        print(f"  Persist     {persist_name} (not yet created — first start populates it)")
-    print(f"  Threads     {project}/.pux/agent-protocol.sqlite  "
-          f"(pux resume to list)")
-    watch = sb.watch_url
-    if watch:
-        print(f"  Watch       {watch}")
-
-
-def _vol_size_bytes(mountpoint: str) -> int:
-    """Walk a Docker volume mountpoint and sum file sizes. Best-effort: any
-    permission error returns 0. The mountpoint is typically
-    ``/var/lib/docker/volumes/<name>/_data`` (root-owned)."""
-    import os  # noqa: PLC0415
-
-    total = 0
-    try:
-        for root, _dirs, files in os.walk(mountpoint):
-            for f in files:
-                try:
-                    total += os.path.getsize(os.path.join(root, f))
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return total
-
-
-def _human_bytes(n: int) -> str:
-    """Render a byte count as a human-readable string (KB/MB/GB)."""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} TB"
 
 
 def _check_contract() -> int:
     """Run the declarative org contract — fully offline (no server, no tokens).
     Rule 4 (tool-resolution) resolves against the static native surface (fs
     tools ∪ the specialist registry), so it runs identically in pytest and
-    here with nothing live."""
-    per_org = check_all()
+    here with nothing live. Per-org audit only: the fleet/AST tripwires live in
+    the pytest suite (``tests/harness/tripwire_checks.py``) — optional, never
+    deployed."""
+    per_org = {org: audit_org(org) for org in discover_orgs()}
     for org in sorted(per_org):
         vs = per_org[org]
         print(f"\n## {org}")
@@ -633,32 +519,12 @@ def _check_contract() -> int:
         else:
             print("  OK")
 
-    harness_vs = check_harness()
-    print("\n## harness (global)")
-    for x in harness_vs:
-        print(f"  {x}")
-    if not harness_vs:
-        print("  OK")
-
-    skill_vs = check_skill_roots()
-    print("\n## skills (global)")
-    for x in skill_vs:
-        print(f"  {x}")
-    if not skill_vs:
-        print("  OK")
-
     n_orgs = len(per_org)
     error_orgs = [o for o, vs in per_org.items() if has_errors(vs)]
-    harness_errors = has_errors(harness_vs)
-    skill_errors = has_errors(skill_vs)
     print(f"\n{n_orgs} orgs checked.")
     if error_orgs:
         print(f"BLOCKING errors in: {error_orgs}")
-    if harness_errors:
-        print("BLOCKING errors in harness (global).")
-    if skill_errors:
-        print("BLOCKING errors in skills (global).")
-    return 1 if (error_orgs or harness_errors or skill_errors) else 0
+    return 1 if error_orgs else 0
 
 
 # --- Public API (called from the unified CLI) ---------------------------------
@@ -690,22 +556,30 @@ def run_list_orgs() -> None:
         print(f"  {org}: {', '.join(org_agent_slugs(org)) or '(no agents)'}")
 
 
-def run_sandbox(cmd: str, output: str | None = None, sandbox_id: str | None = None,
-                prune_days: int = 14, dry_run: bool = False) -> None:
+def run_sandbox(
+    cmd: str,
+    output: str | None = None,
+    sandbox_id: str | None = None,
+    prune_days: int = 14,
+    dry_run: bool = False,
+) -> None:
     """Docker sandbox lifecycle."""
-    raise SystemExit(_sandbox(cmd, output=output, sandbox_id=sandbox_id,
-                              prune_days=prune_days, dry_run=dry_run))
+    raise SystemExit(
+        _sandbox(cmd, output=output, sandbox_id=sandbox_id, prune_days=prune_days, dry_run=dry_run)
+    )
 
 
 def run_check_smoke(org: str = "general") -> None:
-    """docker-exec backend + native specialist smoke test (no model call)."""
-    exec_client = get_exec_client()
-    backend = PuxSandboxBackend(exec_client)
+    """Shared-backend + native specialist smoke test (no model call)."""
+    exec_client = shared_exec()
+    backend = shared_backend()
     specialists = build_native_specialists(exec_client, org=org)
-    print(f"backend(docker exec) OK: {len(specialists)} native pux_sandbox_* specialists + "
-          f"native fs (ls/read_file/write_file/edit_file/glob/grep/execute)")
+    print(
+        f"backend OK: {len(specialists)} native pux_sandbox_* specialists + "
+        f"native fs (ls/read_file/write_file/edit_file/glob/grep/execute)"
+    )
     ex = backend.execute("echo pux-ok")
-    print(f"  backend.execute [docker exec]: exit={ex.exit_code} output={ex.output!r}")
+    print(f"  backend.execute: exit={ex.exit_code} output={ex.output!r}")
     ls = backend.ls("/sandbox/workspace")
     print(f"  backend.ls: {len(ls.entries or [])} entries, error={ls.error}")
 
@@ -734,54 +608,93 @@ def main() -> None:
     """Legacy CLI entry point (argparse). Replaced by ``pux_harness.cli.main``."""
     ap = argparse.ArgumentParser(description="deepagents Pux harness")
     ap.add_argument("--org", default="general", help="org to run (default: general)")
-    ap.add_argument("--task", help="the objective ONLY — never embed data paths here; "
-                                   "use --data for the data folder")
-    ap.add_argument("--data", default=None, metavar="DIR",
-                    help="data folder for the org to process. Sets DATA_DIR "
-                         "(absolute) in the agent's environment so the org's "
-                         "pipeline can preprocess it — the path never enters "
-                         "the task/prompt. This is the structural input hand-off.")
-    ap.add_argument("--rubric", default=None,
-                    help="override the org's shipped rubric (arms the RubricMiddleware "
-                         "verify-gate for an opted-in org). Default: the org's "
-                         "profile.yaml `rubric.default`.")
-    ap.add_argument("--thread", default=None,
-                    help="continue an existing thread id (resume in-process)")
+    ap.add_argument(
+        "--task",
+        help="the objective ONLY — never embed data paths here; use --data for the data folder",
+    )
+    ap.add_argument(
+        "--data",
+        default=None,
+        metavar="DIR",
+        help="data folder for the org to process. Sets DATA_DIR "
+        "(absolute) in the agent's environment so the org's "
+        "pipeline can preprocess it — the path never enters "
+        "the task/prompt. This is the structural input hand-off.",
+    )
+    ap.add_argument(
+        "--rubric",
+        default=None,
+        help="override the org's shipped rubric (arms the RubricMiddleware "
+        "verify-gate for an opted-in org). Default: the org's "
+        "profile.yaml `rubric.default`.",
+    )
+    ap.add_argument(
+        "--thread", default=None, help="continue an existing thread id (resume in-process)"
+    )
     ap.add_argument("--recursion-limit", type=int, default=60)
-    ap.add_argument("--check", action="store_true", help="docker-exec backend + native specialist smoke, no model call")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="docker-exec backend + native specialist smoke, no model call",
+    )
     ap.add_argument("--list", action="store_true", help="list discovered orgs + their agents")
-    ap.add_argument("--check-contract", action="store_true",
-                    help="validate the declarative org contract; exit 1 on error")
-    ap.add_argument("--check-policy", action="store_true",
-                    help="resolve + report this org's policy (mounts/creds/egress/tier); "
-                         "exit 1 if required creds are missing. No model call.")
-    ap.add_argument("--sandbox", metavar="CMD",
-                    help="Docker sandbox lifecycle: start | stop | status | ensure | "
-                         "projects (harness-owned; replaces `task start/stop/status`). "
-                         "Default sandbox_id is now derived from the project path — "
-                         "use --sandbox-id only to override (e.g. two sessions on one project).")
-    ap.add_argument("--sandbox-id", default=None,
-                    help="override the per-project sandbox id (container name + persist "
-                         "volume key). Default: derived from PUX_PROJECT_PATH so different "
-                         "projects never collide. Set this ONLY when running two concurrent "
-                         "sessions against the SAME project.")
-    ap.add_argument("--prune-days", type=int, default=14, metavar="N",
-                    help="with --sandbox prune-sessions: retention window in days "
-                         "(default 14). Entries older than N days are swept. 0 = all.")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="with --sandbox prune-sessions: preview what would be swept "
-                         "without deleting anything.")
-    ap.add_argument("--jobs-run", action="store_true",
-                    help="run prep jobs for this org inside the sandbox")
-    ap.add_argument("--jobs-status", action="store_true",
-                    help="show declared prep jobs for this org")
-    ap.add_argument("--job", default=None,
-                    help="with --jobs-run: run only this named job")
+    ap.add_argument(
+        "--check-contract",
+        action="store_true",
+        help="validate the declarative org contract; exit 1 on error",
+    )
+    ap.add_argument(
+        "--check-policy",
+        action="store_true",
+        help="resolve + report this org's policy (mounts/creds/egress/tier); "
+        "exit 1 if required creds are missing. No model call.",
+    )
+    ap.add_argument(
+        "--sandbox",
+        metavar="CMD",
+        help="Docker sandbox lifecycle: start | stop | status | ensure | "
+        "projects (harness-owned; replaces `task start/stop/status`). "
+        "Default sandbox_id is now derived from the project path — "
+        "use --sandbox-id only to override (e.g. two sessions on one project).",
+    )
+    ap.add_argument(
+        "--sandbox-id",
+        default=None,
+        help="override the per-project sandbox id (container name + persist "
+        "volume key). Default: derived from PUX_PROJECT_PATH so different "
+        "projects never collide. Set this ONLY when running two concurrent "
+        "sessions against the SAME project.",
+    )
+    ap.add_argument(
+        "--prune-days",
+        type=int,
+        default=14,
+        metavar="N",
+        help="with --sandbox prune-sessions: retention window in days "
+        "(default 14). Entries older than N days are swept. 0 = all.",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --sandbox prune-sessions: preview what would be swept "
+        "without deleting anything.",
+    )
+    ap.add_argument(
+        "--jobs-run", action="store_true", help="run prep jobs for this org inside the sandbox"
+    )
+    ap.add_argument(
+        "--jobs-status", action="store_true", help="show declared prep jobs for this org"
+    )
+    ap.add_argument("--job", default=None, help="with --jobs-run: run only this named job")
     args = ap.parse_args()
 
     if args.sandbox is not None:
-        run_sandbox(args.sandbox, sandbox_id=args.sandbox_id,
-                    prune_days=args.prune_days, dry_run=args.dry_run)
+        run_sandbox(
+            args.sandbox,
+            sandbox_id=args.sandbox_id,
+            prune_days=args.prune_days,
+            dry_run=args.dry_run,
+        )
 
     if args.jobs_run:
         run_jobs(args.org, args.job)

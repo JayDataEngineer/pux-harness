@@ -2,13 +2,14 @@
 (``main.py``) and the Agent Protocol server (Aegra / ``langgraph-api`` in prod;
 ``langgraph dev`` / ``aegra dev`` in dev).
 
-One ``DockerExecClient`` + one ``PuxSandboxBackend`` serve the whole process
-(the client is a thin Docker SDK wrapper; the backend is stateless apart from
-an observation log). Per-org compiled graphs are built lazily and cached by
-the caller — building is expensive (model init + subagent assembly) and the
-only per-org variation is system_prompt + subagents + the specialist-tool
-whitelist. All 13 specialists are native Python tools (the Go
-bridge that used to supply them over MCP was deleted).
+One ``BaseSandbox`` + one ``ExecClient`` adapter serve the whole process
+(constructed in ``sandbox.exec`` — OpenShell by default, local-filesystem
+fallback). Per-org compiled graphs are built lazily and cached by the caller —
+building is expensive (model init + subagent assembly) and the only per-org
+variation is system_prompt + subagents + the specialist-tool whitelist. All 13
+specialists are native Python tools (the Go bridge that used to supply them
+over MCP was deleted; the in-process Docker reimplementation was deleted in
+favor of the upstream OpenShell ``BaseSandbox``).
 
 **This module is THIN.** It owns the runtime DEPS (the model, the
 specialist tools, the loaded profile + rubric gate, the memory backend, the
@@ -29,32 +30,28 @@ from deepagents import create_deep_agent
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
+from deepagents.backends.sandbox import BaseSandbox
+
 from pux_harness.agent.model import get_model
 from pux_harness.agent.profile import load_profile, load_rubric_gate
 from pux_harness.agent.stack import RuntimeFacts, build_stack
 from pux_harness.memory import MEMORY_SOURCES, build_memory_backend
-from pux_harness.sandbox.backend import PuxSandboxBackend
-from pux_harness.sandbox.docker_exec import DockerExecClient, get_exec_client
+from pux_harness.sandbox.exec import (
+    ExecClient,
+    shared_backend as _shared_backend,
+    shared_exec as _shared_exec,
+)
 from pux_harness.sandbox.tools import build_native_specialists
 
-_exec: DockerExecClient | None = None  # direct docker exec — fs/shell + specialists
-_backend: PuxSandboxBackend | None = None
+
+def shared_exec() -> ExecClient:
+    """One exec client for the process (lazy — backed by the shared BaseSandbox)."""
+    return _shared_exec()
 
 
-def shared_exec() -> DockerExecClient:
-    """One docker-exec client for the process (lazy — discovery hits Docker)."""
-    global _exec
-    if _exec is None:
-        _exec = get_exec_client()
-    return _exec
-
-
-def shared_backend() -> PuxSandboxBackend:
-    """One sandbox backend over the shared docker-exec client."""
-    global _backend
-    if _backend is None:
-        _backend = PuxSandboxBackend(shared_exec())
-    return _backend
+def shared_backend() -> BaseSandbox:
+    """One sandbox backend for the process (lazy — OpenShell or local)."""
+    return _shared_backend()
 
 
 def build_graph(

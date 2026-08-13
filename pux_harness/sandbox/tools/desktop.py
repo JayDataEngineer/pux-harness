@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import StructuredTool
 
-from pux_harness.sandbox.docker_exec import DockerExecClient, ExecTimeout
+from pux_harness.sandbox.exec import ExecClient, ExecTimeout
 from pux_harness.sandbox.tools._shared import PUX_PREFIX, _tail, _result, _NoArgs
 
 
@@ -18,7 +18,7 @@ _DESKTOP_TIMEOUT = 15
 _DESKTOP_OBSERVE = "/usr/local/bin/desktop_observe.py"
 
 
-def _exec_desktop(exec_client: DockerExecClient, op: str, cmd: str,
+def _exec_desktop(exec_client: ExecClient, op: str, cmd: str,
                   *, timeout: int = _DESKTOP_TIMEOUT):
     """Run a desktop command; return ``(error_envelope | None, out, exit_code)``.
     On timeout / docker failure / non-zero exit, ``error_envelope`` is a
@@ -49,7 +49,7 @@ _DESKTOP_SCREENSHOT_DESC = (
 )
 
 
-def _desktop_screenshot_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _desktop_screenshot_tool(exec_client: ExecClient) -> StructuredTool:
     def _run() -> str:
         cmd = f"{_DISPLAY_ENV} python3 {_DESKTOP_OBSERVE}"
         err, out, _ = _exec_desktop(exec_client, "screenshot", cmd)
@@ -85,7 +85,7 @@ class _DesktopClickArgs(BaseModel):
     button: int = Field(1, description="Mouse button: 1=left (default), 2=middle, 3=right")
 
 
-def _desktop_click_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _desktop_click_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(x: int, y: int, button: int = 1) -> str:
         if button < 1 or button > 3:
             return _result({"success": False, "error": "button must be 1, 2, or 3"})
@@ -115,7 +115,7 @@ class _DesktopTypeArgs(BaseModel):
     clear: bool = Field(True, description="Clear field first (default true)")
 
 
-def _desktop_type_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _desktop_type_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(text: str, clear: bool = True) -> str:
         if not text:
             return _result({"success": False, "error": "text is required"})
@@ -148,7 +148,7 @@ class _DesktopKeyArgs(BaseModel):
     keys: str = Field(..., description="xdotool key combo (e.g. 'Return', 'ctrl+c', 'alt+Tab')")
 
 
-def _desktop_key_tool(exec_client: DockerExecClient) -> StructuredTool:
+def _desktop_key_tool(exec_client: ExecClient) -> StructuredTool:
     def _run(keys: str) -> str:
         if not keys:
             return _result({"success": False, "error": "keys is required"})
