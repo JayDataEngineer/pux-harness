@@ -4,7 +4,7 @@ The engine's 44 ``pux_sandbox_*`` specialist tools (python, describe_image,
 multimodal, desktop, browser, etc.) are served via MCP stdio. Each agent
 process that needs file/shell/code/browser tools spawns this server as a
 child subprocess. The server connects to the shared sandbox backend
-(``shared_exec`` / ``shared_backend`` — OpenShell by default) and registers
+(``shared_backend`` — OpenShell by default) and registers
 every specialist tool with FastMCP.
 
 WHY: Phase 1 of the engine simplification plan. Tools move OUT of the engine
@@ -17,7 +17,7 @@ instances; this server wraps each as an MCP tool.
 Architecture (Pattern 2 — one MCP server per agent process):
     agent framework → stdio → [this server] → shared BaseSandbox → OpenShell
 
-The server owns ONE ``ExecClient`` for its lifetime. When the agent
+The server owns ONE ``BaseSandbox`` for its lifetime. When the agent
 disconnects (stdin EOF), the server exits and the backend connection closes.
 
 Env:
@@ -35,7 +35,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from pux_harness.sandbox.exec import shared_backend, shared_exec
+from pux_harness.sandbox.exec import shared_backend
 from pux_harness.sandbox.tools import make_specialist_tools
 
 # ── logging (stderr only) ────────────────────────────────────────────────────

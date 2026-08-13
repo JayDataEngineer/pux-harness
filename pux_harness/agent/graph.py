@@ -2,7 +2,7 @@
 (``main.py``) and the Agent Protocol server (Aegra / ``langgraph-api`` in prod;
 ``langgraph dev`` / ``aegra dev`` in dev).
 
-One ``BaseSandbox`` + one ``ExecClient`` adapter serve the whole process
+One ``BaseSandbox`` serves the whole process
 (constructed in ``sandbox.exec`` — OpenShell by default, local-filesystem
 fallback). Per-org compiled graphs are built lazily and cached by the caller —
 building is expensive (model init + subagent assembly) and the only per-org
@@ -36,17 +36,9 @@ from pux_harness.agent.model import get_model
 from pux_harness.agent.profile import load_profile, load_rubric_gate
 from pux_harness.agent.stack import RuntimeFacts, build_stack
 from pux_harness.memory import MEMORY_SOURCES, build_memory_backend
-from pux_harness.sandbox.exec import (
-    ExecClient,
-    shared_backend as _shared_backend,
-    shared_exec as _shared_exec,
-)
+from pux_harness.sandbox.exec import shared_backend as _shared_backend
 from pux_harness.sandbox.tools import make_specialist_tools
 
-
-def shared_exec() -> ExecClient:
-    """One exec client for the process (lazy — backed by the shared BaseSandbox)."""
-    return _shared_exec()
 
 
 def shared_backend() -> BaseSandbox:
@@ -113,7 +105,7 @@ def build_graph(
         specialists=specialists,
         profile=cfg,
         rubric_gate=gate,
-        exec_client=shared_exec(),
+        sandbox=shared_backend(),
         facts=facts,
         mcp_tools=mcp_tools,
     )

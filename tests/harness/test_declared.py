@@ -386,13 +386,13 @@ def test_exec_guard_contract_rule_fires_only_when_tools_declared_and_routing_rem
 
 # --- command serialization (the crux) --------------------------------------
 
-def _runner_tool(spec: DeclaredToolSpec, exec_client: _FakeExec) -> StructuredTool:
+def _runner_tool(spec: DeclaredToolSpec, sandbox: _FakeExec) -> StructuredTool:
     """Build a tool with a fixed container dir (bypasses project_root resolution
     so command-shape tests need no monkeypatch)."""
     container = Path("/sandbox/workspace/orgs/x/sandbox")
     return StructuredTool(
         name=PUX_PREFIX + spec.name, description=spec.description or "d",
-        args_schema=D._build_args_model(spec), func=D._make_runner(spec, exec_client, container),
+        args_schema=D._build_args_model(spec), func=D._make_runner(spec, sandbox, container),
     )
 
 

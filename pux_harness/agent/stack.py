@@ -247,7 +247,7 @@ class StackCtx:
     org: str
     facts: RuntimeFacts
     rubric_gate: Any | None    # profile.RubricGate | None
-    exec_client: Any           # ExecClient — for the grader's evidence tools
+    sandbox: Any               # BaseSandbox — for the grader's evidence tools + context layer
     # Retry-layer configs (profile.ModelRetryConfig / ToolRetryConfig | None).
     # model_retry is default-ON (a present config even when no block is shipped
     # — ``load_model_retry`` returns the shipped default); tool_retry is
@@ -383,11 +383,11 @@ def _build_context(ctx: StackCtx, scope: Scope) -> AgentMiddleware:
     shared store, two scope-local instances. Byte-identical to the pre-factory
     build (which called ``build_context_layer`` once per scope).
 
-    ``exec_client`` is threaded in so the 4 exec-dependent tools
+    ``sandbox`` is threaded in so the 4 exec-dependent tools
     (ctx_execute / ctx_execute_file / ctx_batch_execute / ctx_fetch_and_index)
     are built with the same Docker bridge the sandbox tools use — parity with
     context-mode's sandbox + fetch surface."""
-    mw, tools = build_context_layer(exec_client=ctx.exec_client)
+    mw, tools = build_context_layer(sandbox=ctx.sandbox)
     if scope is Scope.SUPERVISOR:
         ctx.emitted_tools_supervisor.extend(tools)
     return mw
@@ -421,7 +421,7 @@ def _build_browser_vision(ctx: StackCtx, scope: Scope) -> AgentMiddleware | None
         return None
     role = "base" if scope is Scope.SUPERVISOR else "worker"
     return BrowserVisionMiddleware(
-        ctx.exec_client,
+        ctx.sandbox,
         multimodal_driver=driver_multimodal(role=role, org=ctx.org),
     )
 
@@ -482,7 +482,7 @@ def _log_rubric_evaluation(ev: dict) -> None:
     verdict so the gate is OBSERVABLE in the run trace.
 
     The grader runs through ``RubricMiddleware`` calling the ``pux_grader_*``
-    tools, which exercise ``exec_client`` directly and so bypass
+    tools, which exercise ``sandbox`` directly and so bypass
     ``backend.execute_log``. Without this hook the gate firing (verdict +
     explanation + per-criterion) is invisible to the operator — and an invisible
     gate can't be told from a decorative one. Exceptions are suppressed upstream
@@ -527,7 +527,7 @@ def _build_rubric(ctx: StackCtx, _scope: Scope) -> AgentMiddleware | None:
         return None
     return RubricMiddleware(
         model=get_model(role="grader", org=ctx.org),
-        tools=build_grader_tools(ctx.exec_client),
+        tools=build_grader_tools(ctx.sandbox),
         max_iterations=gate.max_iterations,
         on_evaluation=_log_rubric_evaluation,
     )
@@ -1173,7 +1173,7 @@ def build_stack(
     specialists: list[BaseTool],
     profile: HarnessProfileConfig | None,
     rubric_gate: Any | None,
-    exec_client: Any,
+    sandbox: Any,
     facts: RuntimeFacts | None = None,
     mcp_tools: Sequence[BaseTool] = (),
 ) -> StackPlan:
@@ -1195,7 +1195,7 @@ def build_stack(
         org=org,
         facts=facts,
         rubric_gate=rubric_gate,
-        exec_client=exec_client,
+        sandbox=sandbox,
         model_retry_cfg=load_model_retry(org),
         tool_retry_cfg=load_tool_retry(org),
         mcp_tools=mcp_tools,
@@ -1238,7 +1238,7 @@ def build_stack(
     # same ``tool_map`` and resolve through the same agent ``tools:`` allowlist
     # as REGISTRY specialists. See ``capabilities.py`` +
     # ``docs/capability-unification.md``.
-    caps = CapabilityResolver(exec_client).resolve(
+    caps = CapabilityResolver(sandbox).resolve(
         org, specialists=specialists, mcp_tools=mcp_tools,
     )
 

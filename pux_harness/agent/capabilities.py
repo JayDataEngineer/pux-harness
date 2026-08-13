@@ -146,7 +146,7 @@ def _index(
 class CapabilityResolver:
     """ONE front-door for resolving an org's model add-on channels.
 
-    Stateless except for the ``exec_client`` the leaf tool builders
+    Stateless except for the ``sandbox`` the leaf tool builders
     (``build_declared_tools`` / ``build_dynamic_tools``) need to synthesize
     in-container-exec'ing ``StructuredTool``s. Dispatches by ``kind`` to the
     unchanged leaf resolvers; records the unified ``Capability`` index.
@@ -156,8 +156,8 @@ class CapabilityResolver:
     call — "one way" to resolve an org's capabilities.
     """
 
-    def __init__(self, exec_client: Any) -> None:
-        self._exec_client = exec_client
+    def __init__(self, sandbox: Any) -> None:
+        self._sandbox = sandbox
 
     def resolve(
         self,
@@ -166,12 +166,12 @@ class CapabilityResolver:
         specialists: Sequence[BaseTool] = (),
         mcp_tools: Sequence[BaseTool] = (),
     ) -> ResolvedCapabilities:
-        declared = build_declared_tools(_org_path(org) / "sandbox", self._exec_client)
+        declared = build_declared_tools(_org_path(org) / "sandbox", self._sandbox)
         # Dynamic (level c) tools — opt-in via ``sandbox.dynamic_tools: true``.
         # Byte-identical ([]) for orgs that do not opt in.
         lib_dir = _org_path(org) / "lib"
         if load_dynamic_tools_enabled(org):
-            dynamic = build_dynamic_tools(lib_dir, self._exec_client)
+            dynamic = build_dynamic_tools(lib_dir, self._sandbox)
         else:
             dynamic = []
             # No silent gap: an org may ship ``lib/*.py`` helper modules
@@ -238,7 +238,7 @@ class CapabilityIndex:
       functions (tool/dynamic, when opted in), the org's skill roots
       (skill/authored), and its ``jobs:`` schedule (job).
 
-    Docker-free: every leaf is a spec/declaration loader (no exec_client, no
+    Docker-free: every leaf is a spec/declaration loader (no sandbox exec, no
     transport session). Best-effort on the shared catalogs (a missing or
     malformed catalog yields no rows — the contract checker owns the
     structural error there); the org channels are read directly.

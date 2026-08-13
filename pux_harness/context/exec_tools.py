@@ -1,6 +1,6 @@
 """Exec-dependent context tools — the gap-1 + gap-2 surface.
 
-Four tools that need a ``ExecClient`` (the sandbox bridge) and are only
+Four tools that need a ``BaseSandbox`` (the sandbox bridge) and are only
 built when ``build_context_tools`` receives one. They close the parity gap with
 context-mode's ctx_execute / ctx_execute_file / ctx_batch_execute /
 ctx_fetch_and_index.
@@ -8,11 +8,11 @@ ctx_fetch_and_index.
 The command-building logic is split into PURE functions (``_build_exec_command``,
 ``_build_file_command``, ``_HTML_TO_TEXT_CODE``) so tests can verify the exact
 shell string generated for each language WITHOUT a running Docker container.
-The tool closures call these builders then hand the command to ``exec_client``.
+The tool closures call these builders then hand the command to ``sandbox``.
 
 Design rules (no hacks):
 - No shelling out to the host — every command runs inside the sandbox container
-  via ``exec_client.exec()``.
+  via ``sandbox.execute()``.
 - No HTML parser dependency — the HTML-to-text converter is stdlib-only
   (``html.parser``) and runs as ``python3 -c`` INSIDE the container, piped from
   curl. The host process never touches network.
@@ -29,8 +29,10 @@ import uuid
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+import subprocess
+
 from pux_harness.context.events import EventStore
-from pux_harness.sandbox.exec import ExecTimeout
+from deepagents.backends.sandbox import BaseSandbox
 
 
 # -- language → command maps (pure, testable without Docker) -----------------
@@ -223,10 +225,10 @@ class _FetchArgs(BaseModel):
 
 # -- tool builder ------------------------------------------------------------
 
-def _timeout_envelope(tool: str, exc: ExecTimeout, cmd: str) -> str:
-    """Render an ExecTimeout as a clean tool-result string the agent can act on.
+def _timeout_envelope(tool: str, exc: Exception, cmd: str) -> str:
+    """Render a timeout as a clean tool-result string the agent can act on.
 
-    Without this, ExecTimeout walks out of the StructuredTool, through
+    Without this, the timeout walks out of the StructuredTool, through
     langgraph's ToolNode (whose default ``_handle_tool_errors`` re-raises
     anything that isn't a ``ToolInvocationError``), up to the model node —
     where ``retry_on_stream_stall`` matches the words "timed out" / "timeout"
@@ -249,13 +251,14 @@ def _timeout_envelope(tool: str, exc: ExecTimeout, cmd: str) -> str:
         f"across separate tool calls — do NOT wrap the wait in one exec."
     )
 
-def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredTool]:
-    """The 4 exec-dependent context tools, bound to ``store`` + ``exec_client``.
+def build_exec_tools(store: EventStore, sandbox: BaseSandbox) -> list[StructuredTool]:
+    """The 4 exec-dependent context tools, bound to ``store`` + ``sandbox``.
 
-    Only built when ``build_context_tools`` receives a non-None exec_client —
-    tests that pass exec_client=None get the 6 base tools only (no Docker
-    dependency). The exec_client must have an ``exec(command: str) ->
-    tuple[str, int]`` method (the ``ExecClient`` contract).
+    Only built when ``build_context_tools`` receives a non-None sandbox —
+    tests that pass sandbox=None get the 6 base tools only (no sandbox
+    dependency). The sandbox must be a ``BaseSandbox`` (the standard
+    ``deepagents.backends.sandbox`` contract — ``execute(command, *, timeout)
+    -> ExecuteResponse``).
     """
 
     def _execute(language: str, code: str) -> str:
@@ -264,12 +267,12 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
         except ValueError as e:
             return str(e)
         try:
-            out, exit_code = exec_client.exec(cmd)
-        except ExecTimeout as exc:
+            r = sandbox.execute(cmd)
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
             return _timeout_envelope("ctx_execute", exc, cmd)
-        if exit_code != 0:
-            return f"[ctx_execute] exit {exit_code}\n{out}"
-        return out
+        if r.exit_code != 0:
+            return f"[ctx_execute] exit {r.exit_code}\n{r.output}"
+        return r.output
 
     def _execute_file(path: str, language: str, code: str) -> str:
         try:
@@ -277,8 +280,8 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
         except ValueError as e:
             return str(e)
         try:
-            out, exit_code = exec_client.exec(cmd)
-        except ExecTimeout as exc:
+            r = sandbox.execute(cmd)
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
             return _timeout_envelope("ctx_execute_file", exc, cmd)
         if exit_code != 0:
             return f"[ctx_execute_file] exit {exit_code}\n{out}"
@@ -303,13 +306,13 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
             # whole loop on a single timeout would lose partial progress and
             # hide which commands actually completed.
             try:
-                out, exit_code = exec_client.exec(command)
-            except ExecTimeout as exc:
+                r = sandbox.execute(command)
+            except (TimeoutError, subprocess.TimeoutExpired) as exc:
                 sections.append(f"- {label}: TIMEOUT — {exc}")
                 continue
-            stash = store.stash_blob(out, tool=f"ctx_batch:{label}")
+            stash = store.stash_blob(r.output, tool=f"ctx_batch:{label}")
             sections.append(
-                f"- {label}: exit={exit_code}, {len(out)} chars, handle {stash.handle}"
+                f"- {label}: exit={r.exit_code}, {len(r.output)} chars, handle {stash.handle}"
             )
         store.flush()
 
@@ -347,8 +350,8 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
         # Fetch + convert HTML→text inside the container (one exec call).
         cmd = _build_fetch_command(url)
         try:
-            out, exit_code = exec_client.exec(cmd)
-        except ExecTimeout as exc:
+            r = sandbox.execute(cmd)
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
             return _timeout_envelope("ctx_fetch_and_index", exc, cmd)
         if exit_code != 0:
             return f"[ctx_fetch_and_index] fetch failed (exit {exit_code}):\n{out[:300]}"
@@ -357,9 +360,9 @@ def build_exec_tools(store: EventStore, exec_client: object) -> list[StructuredT
         tag = f"ctx_fetch:{source or url}" if source else cache_tag
         stash = store.stash_blob(out, tool=tag)
         store.flush()
-        preview = out[:200].replace("\n", " ")
+        preview = r.output[:200].replace("\n", " ")
         return (
-            f"Fetched {len(out)} chars from {url}. Indexed under {stash.handle}. "
+            f"Fetched {len(r.output)} chars from {url}. Indexed under {stash.handle}. "
             f"Preview: {preview}... "
             f"Search via ctx_search(<phrase>); full text via ctx_recall({stash.handle!r})."
         )

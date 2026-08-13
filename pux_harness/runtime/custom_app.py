@@ -163,7 +163,7 @@ def _jobs_run_sync(org: str, job: str | None) -> dict[str, Any]:
     if org not in discover_orgs():
         raise HTTPException(status_code=404, detail=f"unknown org {org!r}")
 
-    from pux_harness.sandbox.exec import shared_exec  # noqa: PLC0415
+    from pux_harness.sandbox.exec import shared_backend  # noqa: PLC0415
     from pux_harness.sandbox.jobs import run_jobs  # noqa: PLC0415
     from pux_harness.sandbox import policy as policy_mod  # noqa: PLC0415
     from pux_harness.kit._paths import project_root  # noqa: PLC0415
@@ -183,9 +183,9 @@ def _jobs_run_sync(org: str, job: str | None) -> dict[str, Any]:
         if not specs:
             raise HTTPException(status_code=404, detail=f"no job named {job!r}")
 
-    # The shared exec client auto-starts the sandbox on first use (OpenShell).
-    ec = shared_exec()
-    results = run_jobs(pol, ec)
+    # The shared backend auto-starts the sandbox on first use (OpenShell).
+    backend = shared_backend()
+    results = run_jobs(pol, backend)
     # Filter results if specific job requested
     if job:
         results = [r for r in results if r.name == job]

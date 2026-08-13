@@ -112,18 +112,18 @@ def test_resolver_channels_equal_leaf_resolvers(org_root: Path) -> None:
     bit-equal to calling the leaves directly; specialists + mcp are threaded
     through unchanged (identity). This IS the CU-1 contract: zero behavior
     change, or the facade is wrong."""
-    exec_client = _FakeExec()
+    sandbox = _FakeExec()
     specialists = [_tool("execute"), _tool("read_file")]
     mcp_tools = [_tool("mcp_equibles_filings")]
 
-    resolved = CapabilityResolver(exec_client).resolve(
+    resolved = CapabilityResolver(sandbox).resolve(
         _ORG, specialists=specialists, mcp_tools=mcp_tools,
     )
     assert isinstance(resolved, ResolvedCapabilities)
 
     # Leaves called directly == the legacy inline path build_stack used to run.
     assert _names(resolved.declared) == _names(
-        build_declared_tools(_org_path(_ORG) / "sandbox", exec_client)
+        build_declared_tools(_org_path(_ORG) / "sandbox", sandbox)
     )
     # dynamic gated OFF by default (no policy.yaml -> NoPolicy -> False). The
     # leaf builder itself always emits the 4 tools; the resolver's gate is what
@@ -140,9 +140,9 @@ def test_tools_surface_preserves_order_and_composition(org_root: Path) -> None:
     declared, then dynamic — byte-identical to the legacy
     ``[*specialists, *declared, *dynamic]``. Order is load-bearing (subagent
     ``tools:`` allowlists resolve names against this list)."""
-    exec_client = _FakeExec()
+    sandbox = _FakeExec()
     s1 = _tool("execute")
-    resolved = CapabilityResolver(exec_client).resolve(_ORG, specialists=[s1])
+    resolved = CapabilityResolver(sandbox).resolve(_ORG, specialists=[s1])
     assert resolved.tools_surface == [s1, *resolved.declared, *resolved.dynamic]
     # specialists precede declared precede (empty) dynamic
     assert _names(resolved.tools_surface)[:1] == ["execute"]
@@ -155,10 +155,10 @@ def test_resolver_dynamic_on_when_enabled(
     ``pux_dyn_*`` tools — the legacy gated build. Monkeypatching the flag
     isolates the resolver's gating branch from policy parsing."""
     monkeypatch.setattr(caps_mod, "load_dynamic_tools_enabled", lambda org: True)
-    exec_client = _FakeExec()
-    resolved = CapabilityResolver(exec_client).resolve(_ORG)
+    sandbox = _FakeExec()
+    resolved = CapabilityResolver(sandbox).resolve(_ORG)
     assert _names(resolved.dynamic) == _names(
-        build_dynamic_tools(_org_path(_ORG) / "lib", exec_client)
+        build_dynamic_tools(_org_path(_ORG) / "lib", sandbox)
     )
     assert len(resolved.dynamic) == 4
     # dynamic tools surface AFTER specialists + declared
@@ -227,10 +227,10 @@ def test_capability_index_covers_every_channel_member(org_root: Path) -> None:
     """The ``Capability`` audit index has ONE row per channel member, tagged by
     ``kind`` + ``provenance`` — no drops, no dupes. CU-2's CLI + CU-5's MDA
     exporter read this; it must faithfully mirror the resolved channels."""
-    exec_client = _FakeExec()
+    sandbox = _FakeExec()
     specialists = [_tool("execute")]
     mcp_tools = [_tool("mcp_x_y")]
-    resolved = CapabilityResolver(exec_client).resolve(
+    resolved = CapabilityResolver(sandbox).resolve(
         _ORG, specialists=specialists, mcp_tools=mcp_tools,
     )
     rows = resolved.capabilities
@@ -285,7 +285,7 @@ def test_capability_index_merges_fleet_and_org_channels(org_root: Path) -> None:
     DISPATCH + the org-local channels + the prefixed ``ref`` naming that keeps
     the catalog coherent with the runtime resolver index (``_index``).
 
-    Docker-free: every leaf is a spec/declaration loader — no exec_client."""
+    Docker-free: every leaf is a spec/declaration loader — no sandbox."""
     rows = CapabilityIndex.load(_ORG)
     assert rows  # non-empty
     assert all(isinstance(r, Capability) for r in rows)

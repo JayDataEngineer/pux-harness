@@ -2,7 +2,7 @@
 
 Runs declared ``jobs:`` from ``policy.yaml`` INSIDE the container (after
 ``create()``, before the agent loop). Each job executes a Python script via
-``exec_client.exec()`` — scripts reach external services over the existing
+``sandbox.execute()`` — scripts reach external services over the existing
 egress allowlist (no new network surface).
 
 Failure semantics: **warn-and-continue**. One bad file doesn't kill 500.
@@ -24,7 +24,10 @@ import logging
 import time
 from dataclasses import dataclass
 
-from pux_harness.sandbox.exec import ExecClient, ExecTimeout
+import subprocess
+
+from deepagents.backends.sandbox import BaseSandbox
+
 from pux_harness.sandbox.policy import Policy, job_specs
 
 log = logging.getLogger("pux.jobs")
@@ -40,7 +43,7 @@ class JobResult:
     duration: float = 0.0  # wall-clock seconds
 
 
-def run_jobs(pol: Policy | None, exec_client: ExecClient) -> list[JobResult]:
+def run_jobs(pol: Policy | None, sandbox: BaseSandbox) -> list[JobResult]:
     """Run each declared job in-sandbox. Warn-and-continue on failure.
 
     Returns a list of ``JobResult`` — one per job, in declaration order.
@@ -69,7 +72,7 @@ def run_jobs(pol: Policy | None, exec_client: ExecClient) -> list[JobResult]:
         # absent input => silent skip, never a noisy failure.
         if spec.when:
             try:
-                _, gate_rc = exec_client.exec(spec.when, timeout=10)
+                gate_rc = sandbox.execute(spec.when, timeout=10).exit_code
             except Exception as exc:  # pragma: no cover - exec infra failure
                 log.warning("job %s: when-predicate errored (%s); running", spec.name, exc)
                 gate_rc = 0
@@ -84,9 +87,10 @@ def run_jobs(pol: Policy | None, exec_client: ExecClient) -> list[JobResult]:
 
         t0 = time.monotonic()
         try:
-            output, exit_code = exec_client.exec(
+            r = sandbox.execute(
                 cmd, timeout=spec.timeout if spec.timeout > 0 else None
             )
+            output, exit_code = r.output, r.exit_code
             if exit_code == 0:
                 status = "ok"
                 error = None
@@ -94,7 +98,7 @@ def run_jobs(pol: Policy | None, exec_client: ExecClient) -> list[JobResult]:
                 status = "failed"
                 # Last 500 chars of output for diagnostics
                 error = output[-500:] if output else f"exit code {exit_code}"
-        except ExecTimeout:
+        except (TimeoutError, subprocess.TimeoutExpired):
             status = "timeout"
             error = f"exceeded {spec.timeout}s"
         except Exception as exc:

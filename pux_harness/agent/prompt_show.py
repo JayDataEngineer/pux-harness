@@ -4,7 +4,7 @@ Walks the SAME part registries (``SUPERVISOR_PROMPT_PARTS`` /
 ``SUBAGENT_PROMPT_PARTS``) that ``assemble_prompt`` uses at runtime, but labels
 each part with its source, condition, and active/inactive state. This gives
 experimenters a provenance-tagged view of the EXACT assembly without needing
-Docker / exec_client / resolved specialists.
+Sandbox / resolved specialists.
 
 The conditional flags (``ask_user_active``, ``interpreter_mounted``) depend on
 runtime state (transport, resolved middleware) that a static view can't fully

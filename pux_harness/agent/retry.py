@@ -60,23 +60,23 @@ def retry_on_stream_stall(exc: BaseException) -> bool:
     (the prompt-boundary fallback) and the LangGraph ``RetryPolicy(retry_on=...)``
     on the model node use this exact predicate.
     """
-    # Tool-side timeouts are deterministic — NEVER retry. The sandbox's
-    # ``ExecTimeout`` is raised when a single tool command exceeds the 120s
-    # wall-clock budget. Its message ("exec timed out after 120s: ...")
-    # contains both "timed out" and "timeout", which the substring fallback
-    # at the bottom of this predicate would otherwise match — sending
-    # LangGraph into 4 × 120s of useless retries on the SAME tool call
-    # before surfacing the misleading "⚠️ model stream stalled" banner.
+    # Tool-side timeouts are deterministic — NEVER retry. ``BaseSandbox.execute()``
+    # raises ``TimeoutError`` / ``subprocess.TimeoutExpired`` when a single
+    # command exceeds its wall-clock budget. Their messages contain both
+    # "timed out" and "timeout", which the substring fallback at the bottom
+    # of this predicate would otherwise match — sending LangGraph into
+    # 4 × 120s of useless retries on the SAME tool call before surfacing
+    # the misleading "⚠️ model stream stalled" banner.
     #
     # Defense-in-depth: ``ctx_execute`` / ``ctx_execute_file`` /
-    # ``ctx_batch_execute`` / ``ctx_fetch_and_index`` all catch ExecTimeout
+    # ``ctx_batch_execute`` / ``ctx_fetch_and_index`` all catch the timeout
     # at the tool boundary and convert it to a result envelope, so this
     # branch should never fire for those. But other surfaces (raw fs
     # scripts, dynamic tools, browser tools) may still let it escape, and
     # this is the SINGLE classifier — pin it here so the contract holds
     # regardless of which tool raised.
-    from pux_harness.sandbox.exec import ExecTimeout as _SandboxExecTimeout
-    if isinstance(exc, _SandboxExecTimeout):
+    import subprocess  # noqa: PLC0415
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
         return False
 
     # ``StreamChunkTimeoutError`` (langchain-openai) subclasses

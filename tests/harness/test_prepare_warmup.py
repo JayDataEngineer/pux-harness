@@ -58,7 +58,7 @@ def _ctx(facts: RuntimeFacts) -> StackCtx:
         org="coder",
         facts=facts,
         rubric_gate=None,
-        exec_client=None,
+        sandbox=None,
         model_retry_cfg=None,
         tool_retry_cfg=None,
         emitted_tools_supervisor=[],
@@ -73,7 +73,7 @@ def record_prepare():
     """
     calls: list[dict[str, Any]] = []
 
-    def _fake_prepare(org, project_path=None, exec_client=None, universal_warmup=False):
+    def _fake_prepare(org, project_path=None, sandbox=None, universal_warmup=False):
         calls.append({"org": org, "universal_warmup": universal_warmup})
         return [{"name": "warmup_browser", "status": "ok", "error": None, "duration": 0.1}]
 

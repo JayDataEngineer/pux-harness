@@ -52,7 +52,7 @@ def _ctx() -> StackCtx:
         org="general",
         facts=RuntimeFacts(),
         rubric_gate=None,
-        exec_client=None,
+        sandbox=None,
         model_retry_cfg=None,
         tool_retry_cfg=None,
         emitted_tools_supervisor=[],

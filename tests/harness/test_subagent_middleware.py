@@ -23,13 +23,13 @@ from pux_harness.context.middleware import ContextMiddleware
 
 def _ctx() -> stack.StackCtx:
     """A minimal StackCtx — enough for the SUBAGENT specs (``context`` +
-    ``audit``) to build. ``rubric_gate``/``exec_client`` are unused in this
+    ``audit``) to build. ``rubric_gate``/``sandbox`` are unused in this
     scope; ``context`` reads nothing off ctx, ``audit`` reads only ``org``."""
     return stack.StackCtx(
         org="test-org",
         facts=stack.RuntimeFacts(),
         rubric_gate=None,
-        exec_client=None,
+        sandbox=None,
     )
 
 
@@ -109,7 +109,7 @@ def test_builder_adds_rubric_on_subagent_when_gate_armed(monkeypatch):
         org="test-org",
         facts=stack.RuntimeFacts(),
         rubric_gate=profile.RubricGate(enabled=True, max_iterations=3),
-        exec_client="EXEC",
+        sandbox="EXEC",
     )
     monkeypatch.setattr(stack, "get_model", lambda **kw: "GRADER-MODEL")
     monkeypatch.setattr(stack, "build_grader_tools", lambda _ec: ["t0", "t1", "t2"])

@@ -1,4 +1,4 @@
-"""The thin exec seam — one ``BaseSandbox`` + one ``ExecClient`` adapter.
+"""The thin exec seam — one ``BaseSandbox`` for the process.
 
 Replaces the old Docker plumbing (``container.py`` + ``docker_exec.py`` +
 ``backend.py`` + ``host_setup.py``, ~2,600 LOC) with an upstream
@@ -10,10 +10,8 @@ Replaces the old Docker plumbing (``container.py`` + ``docker_exec.py`` +
 * ``PUX_SANDBOX=local`` → a host-filesystem backend (deepagents ships one;
   no container required — used by tests / ``kit compile``).
 
-The 13 specialist tools (browser/desktop/grader/python/…) were written against
-``DockerExecClient.exec(cmd, timeout) -> (output, exit_code)``. Rather than
-retarget every call site, ``ExecClient`` adapts that tuple API onto
-``BaseSandbox.execute()`` (``-> ExecuteResponse``). The tools run unchanged.
+The 13 specialist tools (browser/desktop/grader/python/…) now take
+``BaseSandbox`` directly — the portable langchain tool contract. No adapter.
 """
 from __future__ import annotations
 
@@ -28,45 +26,6 @@ from deepagents.backends.sandbox import BaseSandbox
 # Kept as a constant because a handful of specialist tools (declared/dynamic)
 # + grader descriptions reference it for in-sandbox path wayfinding.
 WORKSPACE_ROOT = "/sandbox/workspace"
-
-
-class ExecTimeout(Exception):
-    """A sandbox command exceeded its wall-clock budget."""
-
-
-# --- the adapter -----------------------------------------------------------
-
-class ExecClient:
-    """Exposes the legacy ``.exec()`` tuple API over any ``BaseSandbox``.
-
-    Specialist tools call ``exec_client.exec(cmd, timeout=N)`` and unpack
-    ``(output, exit_code)``. This adapter forwards to ``BaseSandbox.execute()``
-    so the same tools run over OpenShell (or any backend) with no per-tool
-    retarget. ``upload_file`` + ``container`` are kept for the few callers that
-    still reach for them (the MCP server, grader bookkeeping)."""
-
-    def __init__(self, backend: BaseSandbox):
-        self._backend = backend
-        # Surface a container-ish id for logging; the real id lives on the backend.
-        self.container: str = getattr(backend, "id", "sandbox")
-
-    def exec(self, command: str, timeout: int | None = None) -> tuple[str, int]:
-        r = self._backend.execute(command, timeout=timeout) if timeout is not None \
-            else self._backend.execute(command)
-        return r.output, r.exit_code
-
-    def execute(self, command: str, *, timeout: int | None = None):
-        """Delegate to BaseSandbox.execute() — duck-type compat.
-
-        Lets callers that still pass ExecClient where BaseSandbox is expected
-        work unchanged. The specialist tools call sandbox.execute() (the
-        standard BaseSandbox API); this bridges the adapter."""
-        if timeout is not None:
-            return self._backend.execute(command, timeout=timeout)
-        return self._backend.execute(command)
-
-    def upload_file(self, path: str, data: bytes) -> None:
-        self._backend.upload_files([(path, data)])
 
 
 # --- project wayfinding (host-side, no docker) -----------------------------
@@ -94,7 +53,7 @@ def resolve_project_path() -> str:
 def prepare(
     org: str,
     project_path: str | None = None,
-    exec_client: Any | None = None,
+    sandbox: BaseSandbox | None = None,
     universal_warmup: bool = False,
 ) -> list[dict[str, Any]]:
     """Run declared ``jobs:`` from ``policy.yaml`` inside the sandbox, before
@@ -109,8 +68,8 @@ def prepare(
 
     if not project_path:
         project_path = resolve_project_path()
-    if exec_client is None:
-        exec_client = shared_exec()
+    if sandbox is None:
+        sandbox = shared_backend()
 
     try:
         pol = _policy.load(org, project_path)
@@ -121,14 +80,15 @@ def prepare(
     if not specs and not universal_warmup:
         return []
 
-    results: list[JobResult] = list(run_jobs(pol, exec_client)) if specs else []
+    results: list[JobResult] = list(run_jobs(pol, sandbox)) if specs else []
 
     if universal_warmup:
         t0 = time.monotonic()
         try:
-            out, rc = exec_client.exec(
+            _r = sandbox.execute(
                 "python3 orgs/_shared/sandbox/warmup_webhook.py", timeout=30
             )
+            out, rc = _r.output, _r.exit_code
             results.append(JobResult(
                 name="warmup_webhook",
                 status="ok" if rc == 0 else "failed",
@@ -148,10 +108,9 @@ def prepare(
     ]
 
 
-# --- process singletons ----------------------------------------------------
+# --- process singletons ---------------------------------------------------
 
 _backend: BaseSandbox | None = None
-_exec: ExecClient | None = None
 # Hold the entered openshell.Sandbox so it isn't GC'd (its __exit__ tears down
 # the sandbox). Lives at module scope for the process lifetime.
 _openshell_sb: Any = None
@@ -163,19 +122,6 @@ def shared_backend() -> BaseSandbox:
     if _backend is None:
         _backend = _make_backend()
     return _backend
-
-
-def shared_exec() -> ExecClient:
-    """One ``ExecClient`` adapter over ``shared_backend()``."""
-    global _exec
-    if _exec is None:
-        _exec = ExecClient(shared_backend())
-    return _exec
-
-
-def get_exec_client() -> ExecClient:
-    """Lazy constructor (name preserved for ``main.py`` / ``acp.py``)."""
-    return shared_exec()
 
 
 def _make_backend() -> BaseSandbox:

@@ -11,7 +11,7 @@ warn-and-continue: a failed job is logged, never blocks the run.
 
 Historically the two HTTP/CLI entry points called it themselves:
 
-* ``main.py`` (``pux direct``) — ``prepare(org, exec_client=shared_exec())``
+* ``main.py`` (``pux direct``) — ``prepare(org, sandbox=shared_backend())``
   before ``agent.ainvoke()``.
 * the now-retired ``server.py`` (formerly ``pux serve``) used to call
   ``prepare(org, universal_warmup=True)`` offloaded to a worker thread inside

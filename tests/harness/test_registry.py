@@ -32,7 +32,7 @@ from pux_harness.sandbox.tools import (
 )
 from pux_harness.sandbox.tools._pux import PUX_GRADER_PREFIX, PUX_PREFIX
 
-# A sentinel exec_client — factories bind it at build time and only USE it at
+# A sentinel sandbox — factories bind it at build time and only USE it at
 # tool-invocation time, so any object builds fine (mirrors test_browser_tools).
 _EXEC = "DUMMY-EXEC"
 

@@ -20,7 +20,7 @@ enforcement* layer — denying commands that bypass the sandbox or produce
 excessive output.
 
 The exec-guard seam: agent-via-``execute`` is a TOOL CALL (intercepted here);
-a declared tool's own ``func`` calls ``exec_client.exec(cmd)`` DIRECTLY (not a
+a declared tool's own ``func`` calls ``sandbox.execute(cmd)`` DIRECTLY (not a
 tool call, never seen here). So redirecting declared-script exec does NOT
 break the declared tool's own in-container execution.
 """

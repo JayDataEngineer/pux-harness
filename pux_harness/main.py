@@ -25,8 +25,7 @@ from langchain_core.tools import BaseTool
 from langgraph.errors import GraphRecursionError
 
 from pux_harness.agent.org_validation import audit_org, has_errors
-from pux_harness.sandbox.exec import get_exec_client
-from pux_harness.agent.graph import build_graph, shared_backend, shared_exec
+from pux_harness.agent.graph import build_graph, shared_backend
 from pux_harness.agent.observability import build_invoke_config
 from pux_harness.agent.profile import default_rubric
 from pux_harness.agent.stack import RuntimeFacts, autonomous_from_env
@@ -211,7 +210,7 @@ async def _run(
         # Run prep jobs after the sandbox is up, before the agent loop.
         from pux_harness.sandbox.exec import prepare  # noqa: PLC0415
 
-        job_results = prepare(org, exec_client=shared_exec())
+        job_results = prepare(org, sandbox=shared_backend())
         if job_results:
             failed = [r for r in job_results if r["status"] != "ok"]
             for r in job_results:
@@ -336,8 +335,7 @@ def _jobs_run(org: str, job: str | None) -> int:
             return 1
 
     print(f"[jobs] {org}: running {len(specs)} job(s)")
-    ec = shared_exec()
-    results = run_jobs(pol, ec)
+    results = run_jobs(pol, shared_backend())
 
     if job:
         results = [r for r in results if r.name == job]
@@ -571,7 +569,6 @@ def run_sandbox(
 
 def run_check_smoke(org: str = "general") -> None:
     """Shared-backend + native specialist smoke test (no model call)."""
-    exec_client = shared_exec()
     backend = shared_backend()
     specialists = make_specialist_tools(shared_backend(), org=org)
     print(

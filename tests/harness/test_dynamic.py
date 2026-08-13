@@ -65,8 +65,8 @@ def org_lib(tmp_path: Path, monkeypatch) -> Path:
     return lib
 
 
-def _tools(lib: Path, exec_client: _FakeExec | None = None) -> dict[str, Any]:
-    return {t.name: t for t in D.build_dynamic_tools(lib, exec_client or _FakeExec())}
+def _tools(lib: Path, sandbox: _FakeExec | None = None) -> dict[str, Any]:
+    return {t.name: t for t in D.build_dynamic_tools(lib, sandbox or _FakeExec())}
 
 
 def _invoke(tool, **kw) -> dict:

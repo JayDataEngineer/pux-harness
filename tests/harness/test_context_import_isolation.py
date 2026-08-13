@@ -26,10 +26,12 @@ _CONTEXT_DIR = (
 # pux-application-layer modules the context cluster must not reach.
 _FORBIDDEN_PREFIXES = ("pux_harness.kit", "pux_harness.agent", "pux_harness.sandbox")
 
-# Files still carrying a pux-application import (pending extraction).
-_ALLOWLIST: dict[str, set[str]] = {
-    "exec_tools.py": {"pux_harness.sandbox.exec"},
-}
+# The cluster is FULLY PURE — no module under context/ imports anything
+# from kit / agent / sandbox. The former exec_tools.py allowlist (it imported
+# pux_harness.sandbox.exec for ExecTimeout) was dropped when exec_tools.py was
+# retargeted to BaseSandbox.execute() + standard TimeoutError. If a new
+# pux-application import appears, this test fails loud.
+_ALLOWLIST: dict[str, set[str]] = {}
 
 
 def _pux_imports(tree: ast.AST) -> set[str]:
