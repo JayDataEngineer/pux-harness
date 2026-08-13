@@ -576,82 +576,11 @@ def load(org_name: str, project_root: str | Path) -> Policy:
     return pol
 
 
-# --- protocols ----------------------------------------------------------------
-
-
-def resolve_protocols(pol: Policy) -> list[str]:
-    """The surfaces an org actually exposes. Declared non-empty -> as-is (a
-    NARROWED set, e.g. ``[acp]`` for a coding org that should not mount AG-UI);
-    absent/empty -> :data:`DEFAULT_PROTOCOLS` (both surfaces)."""
-    return list(pol.protocols) if pol.protocols else list(DEFAULT_PROTOCOLS)
-
-
 # --- credentials --------------------------------------------------------------
 
 
 def _env(env: Mapping[str, str] | None) -> Mapping[str, str]:
     return os.environ if env is None else env
-
-
-def validate_env(p: Policy | None, env: Mapping[str, str] | None = None) -> None:
-    """Raise ``MissingCreds`` if any required credential is absent from env.
-    Optional creds are not checked (absence is silent). No-op if ``p`` is None.
-    Empty-string values count as absent, like Go's ``os.Getenv``."""
-    if p is None:
-        return
-    e = _env(env)
-    missing = [n for n in p.credentials.required if not e.get(n, "")]
-    if missing:
-        raise MissingCreds(missing)
-
-
-def env_vars(p: Policy | None, env: Mapping[str, str] | None = None) -> list[str]:
-    """``KEY=VALUE`` strings to inject into the container env. Required creds
-    always (ValidateEnv proved them set); optional creds only when present;
-    browser cookies value + ``SEED_COOKIES_ENV=<name>`` pointer when the
-    cookies var is set."""
-    if p is None:
-        return []
-    e = _env(env)
-    out: list[str] = []
-    for name in p.credentials.required:
-        out.append(f"{name}={e.get(name, '')}")
-    for name in p.credentials.optional:
-        v = e.get(name, "")
-        if v:
-            out.append(f"{name}={v}")
-    if p.browser.cookies_env:
-        v = e.get(p.browser.cookies_env, "")
-        if v:
-            # Avoid duplicate: if cookies_env is already in credentials.required,
-            # it was injected above — only add the SEED_COOKIES_ENV pointer here.
-            if p.browser.cookies_env not in p.credentials.required:
-                out.append(f"{p.browser.cookies_env}={v}")
-            out.append(f"SEED_COOKIES_ENV={p.browser.cookies_env}")
-    if p.browser.proxy:
-        out.append(f"SB_SERVER_PROXY={p.browser.proxy}")
-    # ``sandbox.llm``: resolve the model tier (models.yaml) and inject
-    # ``LLM_API_URL`` / ``LLM_MODEL`` / ``LLM_API_KEY`` so sandbox scripts are
-    # dumb consumers. The key is looked up from the provider's ``api_key_env``
-    # in the host env — the org does NOT declare the credential (the harness
-    # resolves the env-var NAME from models.yaml too). Appended BEFORE
-    # ``sandbox.env`` so an explicit ``LLM_API_URL`` override in the env block
-    # still wins (the escape hatch).
-    if p.sandbox.llm:
-        r = _resolve_llm_endpoint(p.sandbox.llm)
-        out.append(f"LLM_API_URL={r.api_url}")
-        out.append(f"LLM_MODEL={r.model_id}")
-        api_key = e.get(r.api_key_env, "")
-        if api_key:
-            out.append(f"LLM_API_KEY={api_key}")
-    # Static (non-secret) config values from ``sandbox.env``. These are the
-    # service URLs / config knobs the sandbox needs to reach host-side infra
-    # (SurrealDB, media-mcp, etc.). Not credentials — they live in the policy
-    # file, not the operator's env. Appended AFTER creds so a cred with the
-    # same name wins (unlikely, but last-wins is Docker's semantics).
-    for k, v in p.sandbox.env.items():
-        out.append(f"{k}={v}")
-    return out
 
 
 # --- mounts -------------------------------------------------------------------
