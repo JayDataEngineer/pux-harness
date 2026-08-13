@@ -6,7 +6,7 @@ its own cluster (``pux_harness.context.*``). No ``kit`` / ``agent`` / ``sandbox`
 imports — those couple the cluster to the pux application layer and block
 extraction into a standalone ``deepagents-context`` package.
 
-The ONE exception is ``exec_tools.py`` (imports ``sandbox.docker_exec`` for
+The ONE exception is ``exec_tools.py`` (imports ``sandbox.exec`` for
 ``ExecTimeout``); it is pending extraction to the pux side. When it moves, the
 allowlist shrinks to empty and the cluster is fully pure.
 
@@ -28,7 +28,7 @@ _FORBIDDEN_PREFIXES = ("pux_harness.kit", "pux_harness.agent", "pux_harness.sand
 
 # Files still carrying a pux-application import (pending extraction).
 _ALLOWLIST: dict[str, set[str]] = {
-    "exec_tools.py": {"pux_harness.sandbox.docker_exec"},
+    "exec_tools.py": {"pux_harness.sandbox.exec"},
 }
 
 
